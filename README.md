@@ -47,6 +47,74 @@ Traditional cache-compression schemes, tuned for long *prompts*, tumble on these
 
 
 
+## Setup
+
+### Install Dependencies
+Use the following command to install the minimal required dependencies:
+```bash
+pip install -r requirements.txt
+```
+
+### Install FlashAttention
+If you're using Hugging Face, we default to flash attention to speed up attention computation:
+
+```python
+model = AutoModelForCausalLM.from_pretrained(
+    "model_name_or_path",
+    attn_implementation="flash_attention_2",
+)
+```
+
+## Quick Start
+Before running the scripts, you need to build the rkv package:
+```bash
+pip install -e .
+```
+
+Use the following command to run R1-like models with R1-KV on math benchmarks:
+```bash
+bash examples/run.sh
+```
+
+Or you could use the code scripts:
+
+```bash
+export CUDA_VISIBLE_DEVICES=0
+
+python3 ./run_math.py \
+--dataset_path ./data/aime24.jsonl \
+--save_path ./outputs/output.jsonl \
+--model_path deepseek-ai/DeepSeek-R1-Distill-Llama-8B \
+--max_length 16484 \
+--eval_batch_size 1 \
+--method rkv \
+--kv_budget 128
+
+```
+
+To evaluate benchmark results, simply run:
+```bash
+bash examples/eval.sh
+```
+The results will be saved in the `outputs` directory.
+
+### Evaluation
+
+You need to build the dependencies of the evaluation toolkit separately:
+```bash
+cd evaluation/latex2sympy
+pip install -e .
+cd ..
+pip install -r requirements.txt
+```
+
+## Visualization
+
+We implement visualization functions to help illustrate the multi-step token eviction pattern.
+
+Run `analysis_scripts/analysis.ipynb` to see which tokens are kept at each compression step.
+
+
 ## Motivation
 
 Chain-of-thought (CoT) and self-reflection unlock impressive reasoning, but they **explode the key–value (KV) cache**.  
@@ -57,7 +125,6 @@ A single DeepSeek-R1-Distill-8B run on a tough math problem can:
 * Allocate **4.1 GB** of KV just to remember its own musings
 
 Existing compression tools focus on *long prompts* and falter on *long generations*—often pruning the wrong tokens because redundant self-checks still attend heavily to themselves.
-
 
 
 
@@ -267,10 +334,6 @@ We measured both memory savings and end-to-end throughput (see **Table&nbsp;`eff
 * **Tiny attention window** → lower FLOPs despite a lightweight scoring pass.  
 * **Bigger batches** → up to **13 ×** more sequences in parallel and **9 ×** higher tokens/s than FullKV.
 
-
-
-
-
 ## 🔍 R-KV vs. SnapKV: Token-Selection Comparison
 
 > The figure below shows which tokens are picked by **R-KV** and the pure-attention baseline **SnapKV** at the same decoding step.  
@@ -296,72 +359,3 @@ By combining **attention strength with redundancy filtering**, **R-KV** retains 
 In this example, the pure attention strategy of **SnapKV** fails due to limited coverage and excess redundancy.
 
 > For additional experiments and implementation details, see [docs/RKV_details.md](./docs/RKV_details.md).
-
-
-## Setup
-
-### Install Dependencies
-Use the following command to install the minimal required dependencies:
-```bash
-pip install -r requirements.txt
-```
-
-### Install FlashAttention
-If you're using Hugging Face, we default to flash attention to speed up attention computation:
-
-```python
-model = AutoModelForCausalLM.from_pretrained(
-    "model_name_or_path",
-    attn_implementation="flash_attention_2",
-)
-```
-
-### Evaluation
-
-You need to build the dependencies of the evaluation toolkit separately:
-```bash
-cd evaluation/latex2sympy
-pip install -e .
-cd ..
-pip install -r requirements.txt
-```
-
-## Quick Start
-Before running the scripts, you need to build the rkv package:
-```bash
-pip install -e .
-```
-
-Use the following command to run R1-like models with R1-KV on math benchmarks:
-```bash
-bash examples/run.sh
-```
-
-Or you could use the code scripts:
-
-```bash
-export CUDA_VISIBLE_DEVICES=0
-
-python3 ./run_math.py \
---dataset_path ./data/aime24.jsonl \
---save_path ./outputs/output.jsonl \
---model_path deepseek-ai/DeepSeek-R1-Distill-Llama-8B \
---max_length 16484 \
---eval_batch_size 1 \
---method rkv \
---kv_budget 128
-
-```
-
-To evaluate benchmark results, simply run:
-```bash
-bash examples/eval.sh
-```
-The results will be saved in the `outputs` directory.
-
-## Visualization
-
-We implement visualization functions to help illustrate the multi-step token eviction pattern.
-
-Run `analysis_scripts/analysis.ipynb` to see which tokens are kept at each compression step.
-
