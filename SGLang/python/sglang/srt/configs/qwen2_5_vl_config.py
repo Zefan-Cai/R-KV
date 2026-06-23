@@ -18,8 +18,6 @@ from typing import Any, Dict, Iterable, List, Optional, Union
 
 import numpy as np
 from transformers import (
-    AutoImageProcessor,
-    AutoProcessor,
     BaseImageProcessor,
     BatchFeature,
     PretrainedConfig,
@@ -1016,7 +1014,12 @@ def _register_auto_processor_once(registry, config_cls, processor_cls):
             raise
 
 
-_register_auto_processor_once(
-    AutoImageProcessor, Qwen2_5_VLConfig, Qwen2_5_VLImageProcessor
-)
-_register_auto_processor_once(AutoProcessor, Qwen2_5_VLConfig, Qwen2_5_VLProcessor)
+try:
+    from transformers import AutoImageProcessor, AutoProcessor
+
+    _register_auto_processor_once(
+        AutoImageProcessor, Qwen2_5_VLConfig, Qwen2_5_VLImageProcessor
+    )
+    _register_auto_processor_once(AutoProcessor, Qwen2_5_VLConfig, Qwen2_5_VLProcessor)
+except Exception:
+    pass
