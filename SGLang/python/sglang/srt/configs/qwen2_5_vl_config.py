@@ -51,7 +51,13 @@ try:
 except ImportError:
     VideoInput = Any
 from transformers.modeling_rope_utils import rope_config_validation
-from transformers.models.mllama.image_processing_mllama import is_valid_list_of_images
+try:
+    from transformers.models.mllama.image_processing_mllama import is_valid_list_of_images
+except ImportError:
+    def is_valid_list_of_images(images):
+        return isinstance(images, (list, tuple)) and all(
+            is_valid_image(image) for image in images
+        )
 from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
 from transformers.processing_utils import ProcessingKwargs, Unpack, VideosKwargs
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
