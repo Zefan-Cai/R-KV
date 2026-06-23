@@ -113,9 +113,13 @@ all touched files succeeds. Open items:
   Engine when `rkv_enabled=True`.
 - [x] `AttentionLayer.forward` calls `update_query_buffer` /
   `maybe_compress` with the last-layer guard on `device_len`.
+- [x] Hook `ctx.rkv.drop_request(uid)` into the scheduler's
+  finished-request path (`Scheduler._free_req_resources`) so the
+  per-(uid, layer_id) query buffer can't leak.
+- [x] Offline R-KV benchmark script at
+  `benchmark/offline/bench_rkv.py` that flips R-KV on through the
+  `LLM(...)` constructor kwargs.
 - [ ] Smoke-test on an H100 with `Qwen3-0.6B` and a long-CoT prompt.
-- [ ] Hook `ctx.rkv.drop_request(uid)` into the scheduler's
-  finished-request path so the query buffer can't leak.
 - [ ] Confirm the offline `LLM` constructor surfaces `rkv_enabled`
   through `**kwargs` (it should — `SchedulerConfig(EngineConfig)`
   inherits the new fields).
