@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Qwen2VL model configuration"""
-from typing import Dict, Iterable, List, Optional, Union
+from typing import Any, Dict, Iterable, List, Optional, Union
 
 import numpy as np
 from transformers import (
@@ -37,7 +37,6 @@ from transformers.image_utils import (
     ChannelDimension,
     ImageInput,
     PILImageResampling,
-    VideoInput,
     get_image_size,
     infer_channel_dimension_format,
     is_pil_image,
@@ -47,6 +46,10 @@ from transformers.image_utils import (
     valid_images,
     validate_preprocess_arguments,
 )
+try:
+    from transformers.image_utils import VideoInput
+except ImportError:
+    VideoInput = Any
 from transformers.modeling_rope_utils import rope_config_validation
 from transformers.models.mllama.image_processing_mllama import is_valid_list_of_images
 from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
