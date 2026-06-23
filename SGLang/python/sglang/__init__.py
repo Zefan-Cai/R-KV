@@ -1,3 +1,27 @@
+import ctypes
+import os
+import sysconfig
+
+
+def _preload_pip_nvidia_runtime_libs():
+    platlib = sysconfig.get_paths().get("platlib")
+    if not platlib:
+        return
+
+    lib_paths = [
+        os.path.join(platlib, "nvidia", "cuda_nvrtc", "lib", "libnvrtc.so.12"),
+        os.path.join(platlib, "nvidia", "cuda_runtime", "lib", "libcudart.so.12"),
+    ]
+    for lib_path in lib_paths:
+        if os.path.exists(lib_path):
+            try:
+                ctypes.CDLL(lib_path, mode=ctypes.RTLD_GLOBAL)
+            except OSError:
+                pass
+
+
+_preload_pip_nvidia_runtime_libs()
+
 # SGLang public APIs
 
 # Frontend Language APIs
