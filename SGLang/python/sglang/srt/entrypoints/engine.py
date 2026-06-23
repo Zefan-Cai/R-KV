@@ -391,6 +391,7 @@ def _launch_subprocesses(server_args: ServerArgs) -> Tuple[TokenizerManager, Dic
             )
             with memory_saver_adapter.configure_subprocess():
                 proc.start()
+            writer.close()
             scheduler_procs.append(proc)
             scheduler_pipe_readers.append(reader)
     else:
@@ -402,6 +403,7 @@ def _launch_subprocesses(server_args: ServerArgs) -> Tuple[TokenizerManager, Dic
             args=(server_args, port_args, writer),
         )
         proc.start()
+        writer.close()
         scheduler_procs.append(proc)
 
     if server_args.node_rank >= 1:
@@ -446,6 +448,13 @@ def _launch_subprocesses(server_args: ServerArgs) -> Tuple[TokenizerManager, Dic
     scheduler_infos = []
     for i in range(len(scheduler_pipe_readers)):
         try:
+            while not scheduler_pipe_readers[i].poll(1):
+                if not scheduler_procs[i].is_alive():
+                    scheduler_procs[i].join()
+                    raise RuntimeError(
+                        f"Rank {i} scheduler terminated before ready "
+                        f"with exit code {scheduler_procs[i].exitcode}."
+                    )
             data = scheduler_pipe_readers[i].recv()
         except EOFError:
             logger.error(
