@@ -510,14 +510,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.input_batch.num_computed_tokens_cpu
             - self.input_batch.num_dropped_tokens_list_cpu
         )[:num_reqs]
-        total_num_kv_cache_tokens = num_kv_cache_tokens.sum()
+        num_live_kv_cache_tokens = num_kv_cache_tokens + num_scheduled_tokens
+        total_num_kv_cache_tokens = num_live_kv_cache_tokens.sum()
 
         # Get request indices.
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
         req_indices = np.repeat(self.arange_np[:num_reqs],
                                 num_scheduled_tokens)
         occupied_indices = np.repeat(self.arange_np[:num_reqs],
-                                num_kv_cache_tokens)
+                                num_live_kv_cache_tokens)
 
         # Get batched arange.
         # E.g., [2, 5, 3] -> [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
@@ -525,12 +526,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # np.concatenate([np.arange(n) for n in num_scheduled_tokens])
         # Step 1. [2, 5, 3] -> [2, 7, 10]
         cu_num_tokens = np.cumsum(num_scheduled_tokens)
-        occupied_cu_num_tokens = np.cumsum(num_kv_cache_tokens)
+        occupied_cu_num_tokens = np.cumsum(num_live_kv_cache_tokens)
         # Step 2. [2, 7, 10] -> [0, 0, 2, 2, 2, 2, 2, 7, 7, 7]
         cumsums_offsets = np.repeat(cu_num_tokens - num_scheduled_tokens,
                                     num_scheduled_tokens)
-        occupied_cumsums_offsets = np.repeat(occupied_cu_num_tokens - num_kv_cache_tokens,
-                                    num_kv_cache_tokens)
+        occupied_cumsums_offsets = np.repeat(occupied_cu_num_tokens - num_live_kv_cache_tokens,
+                                    num_live_kv_cache_tokens)
         # Step 3. [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
         arange = self.arange_np[:total_num_scheduled_tokens] - cumsums_offsets
         occupied_positions_np = self.arange_np[:total_num_kv_cache_tokens] - occupied_cumsums_offsets
@@ -620,7 +621,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 scheduler_output.num_common_prefix_blocks,
             )
 
-        should_compress_list = tuple(self.input_batch.should_compress_list)
+        should_compress_list = tuple(
+            self.input_batch.should_compress_list[:num_reqs]
+        )
         attn_metadata = self.attn_metadata_builder.build(
             num_reqs=num_reqs,
             num_actual_tokens=total_num_scheduled_tokens,

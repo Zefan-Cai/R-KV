@@ -6,8 +6,6 @@ from typing import TYPE_CHECKING, Any, Optional
 import numpy as np
 import torch
 
-from rkv.modeling import R1KV
-
 from vllm import _custom_ops as ops
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionMetadata, AttentionType,
@@ -539,23 +537,29 @@ class FlashAttentionImpl(AttentionImpl):
                 k_descale=layer._k_scale.expand(descale_shape),
                 v_descale=layer._v_scale.expand(descale_shape),
             )
-            seq_starts_ends_indices = torch.concat(
-                (torch.tensor([0], dtype=torch.int32, device=attn_metadata.seq_lens.device),
-                 torch.cumsum(attn_metadata.seq_lens, dim=0) - 1),
-                dim=0
-            )
+            if not any(attn_metadata.should_compress_list[:attn_metadata.num_reqs]):
+                return output
+
+            seq_ends = torch.cumsum(attn_metadata.seq_lens, dim=0)
+            seq_starts = seq_ends - attn_metadata.seq_lens
             for i in range(attn_metadata.num_reqs):
-                if attn_metadata.seq_lens[i].cpu().item() < VLLM_V1_R_KV_BUDGET + VLLM_V1_R_KV_BUFFER:
+                if not attn_metadata.should_compress_list[i]:
                     continue
+                if attn_metadata.seq_lens[i].item() < VLLM_V1_R_KV_BUDGET + VLLM_V1_R_KV_BUFFER:
+                    continue
+                kv_start = seq_starts[i].item()
+                kv_end = seq_ends[i].item()
                 current_key_cache = key_cache.view(-1, key_cache.size(-2), key_cache.size(-1))[
-                    attn_metadata.occupied_slot_mapping[seq_starts_ends_indices[i]:seq_starts_ends_indices[i + 1]], ...
+                    attn_metadata.occupied_slot_mapping[kv_start:kv_end], ...
                 ]
                 current_value_cache = value_cache.view(-1, value_cache.size(-2), value_cache.size(-1))[
-                    attn_metadata.occupied_slot_mapping[seq_starts_ends_indices[i]:seq_starts_ends_indices[i + 1]], ...
+                    attn_metadata.occupied_slot_mapping[kv_start:kv_end], ...
                 ]
 
                 # [num_heads, num_tokens, head_dim]
-                current_query = query.transpose(0, 1)
+                q_start = attn_metadata.query_start_loc[i].item()
+                q_end = attn_metadata.query_start_loc[i + 1].item()
+                current_query = query[q_start:q_end].transpose(0, 1)
                 current_key_cache = current_key_cache.transpose(0, 1)
                 current_value_cache = current_value_cache.transpose(0, 1)
 
@@ -576,10 +580,10 @@ class FlashAttentionImpl(AttentionImpl):
                 # overwrite key_cache and value_cache
                 compressed_kv_len = compressed_key_cache.size(1)
                 key_cache.view(-1, key_cache.size(-2), key_cache.size(-1))[
-                    attn_metadata.occupied_slot_mapping[seq_starts_ends_indices[i]:seq_starts_ends_indices[i]+compressed_kv_len], ...
+                    attn_metadata.occupied_slot_mapping[kv_start:kv_start + compressed_kv_len], ...
                 ] = compressed_key_cache.transpose(0, 1)
                 value_cache.view(-1, value_cache.size(-2), value_cache.size(-1))[
-                    attn_metadata.occupied_slot_mapping[seq_starts_ends_indices[i]:seq_starts_ends_indices[i]+compressed_kv_len], ...
+                    attn_metadata.occupied_slot_mapping[kv_start:kv_start + compressed_kv_len], ...
                 ] = compressed_value_cache.transpose(0, 1)
 
                 num_dropped_tokens_i = current_kv_len - compressed_kv_len

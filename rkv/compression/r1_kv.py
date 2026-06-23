@@ -70,7 +70,7 @@ class R1KV:
                 key_states,
                 retain_ratio=self.retain_ratio,
                 retain_direction=self.retain_direction,
-            )[:, : -self.window_size]
+            )[:, :, : -self.window_size]
 
             final_score = attn_cache * self.mix_lambda - similarity_cos * (
                 1 - self.mix_lambda

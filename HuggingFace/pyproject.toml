@@ -9,5 +9,6 @@ requires-python = ">=3.9"
 description = "R-KV is the first production-level KV Cache Compression Method for serving R1-like models."
 readme = "README.md"
 
-[tool.setuptools]
-packages = ["rkv"]
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["rkv*"]

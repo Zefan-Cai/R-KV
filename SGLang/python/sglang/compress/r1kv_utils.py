@@ -1,4 +1,3 @@
-from matplotlib.mlab import window_none
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
@@ -172,7 +171,7 @@ class KVCluster:
                         retain_num=self.retain_num,
                         retain_ratio=self.retain_ratio,
                         retain_direction=self.retain_direction,
-                    )[:, : -self.window_size]
+                    )[:, :, : -self.window_size]
                 elif self.similarity_method == "value":
                     similarity_cos = cal_similarity(
                         value_states,
@@ -182,7 +181,7 @@ class KVCluster:
                         retain_num=self.retain_num,
                         retain_ratio=self.retain_ratio,
                         retain_direction=self.retain_direction,
-                    )[:, : -self.window_size]
+                    )[:, :, : -self.window_size]
                 final_score = attn_cache * self.mix_alpha - similarity_cos * (
                     1 - self.mix_alpha
                 )
@@ -195,8 +194,8 @@ class KVCluster:
                     retain_num=self.retain_num,
                     retain_ratio=self.retain_ratio,
                     retain_direction=self.retain_direction,
-                )[:, : -self.window_size]
-                final_score = -similarity_cos.unsqueeze(0)
+                )[:, :, : -self.window_size]
+                final_score = -similarity_cos
             elif (
                 self.compress_method == "snapkv"
                 or self.compress_method == "h2o"
@@ -290,14 +289,12 @@ def cal_similarity(
     retain_ratio=None,
     retain_direction="last",
 ):
-    k = key_cache[0]
-    num_heads = k.shape[0]
+    _, _, seq_len, _ = key_cache.shape
 
-    k_norm = k / (k.norm(dim=-1, keepdim=True) + 1e-8)
+    k_norm = key_cache / (key_cache.norm(dim=-1, keepdim=True) + 1e-8)
     similarity_cos = torch.matmul(k_norm, k_norm.transpose(-1, -2))
-
-    for h in range(num_heads):
-        similarity_cos[h].fill_diagonal_(0.0)
+    diag = torch.eye(seq_len, dtype=torch.bool, device=key_cache.device)
+    similarity_cos.masked_fill_(diag.view(1, 1, seq_len, seq_len), 0.0)
 
     # shape: [num_heads, seq_len, seq_len]
     similarity_mask = similarity_cos > threshold
@@ -307,14 +304,13 @@ def cal_similarity(
     if retain_ratio is None and retain_num is None:
         raise ValueError("retain_ratio or retain_num must be provided")
     if retain_num is not None:
-        k = retain_num if retain_num is not None else 1
+        k = max(1, retain_num if retain_num is not None else 1)
     else:
-        seq_len = similarity_mask.size(-1)
-        k = int(seq_len * retain_ratio)  # 改为直接使用比例
+        k = max(1, int(seq_len * retain_ratio))
 
     indices = torch.where(
         similarity_mask,
-        torch.arange(similarity_mask.size(-1), device=similarity_mask.device),
+        torch.arange(seq_len, device=similarity_mask.device).view(1, 1, 1, seq_len),
         torch.zeros_like(similarity_mask, dtype=torch.long),
     )
 
@@ -325,25 +321,17 @@ def cal_similarity(
         # find the first True index in each row
         similarity_retain = torch.min(indices, dim=-1)[0]
     elif retain_direction == "last_percent":
-        # 保留位置在后百分比的元素
         similarity_retain = torch.topk(indices, k=k, dim=-1)[0][:, :, 0]
     elif retain_direction == "first_percent":
-        # 保留位置在前百分比的元素
         similarity_retain = torch.topk(indices, k=k, dim=-1, largest=False)[0][:, :, -1]
 
-    # create indices for zeroing
-    batch_idx = (
-        torch.arange(num_heads).unsqueeze(1).repeat(1, similarity_retain.size(1))
-    )
-    seq_idx = torch.arange(similarity_retain.size(1)).unsqueeze(0).repeat(num_heads, 1)
-
     # zero the specified positions in similarity_cos
-    similarity_cos[batch_idx, seq_idx, similarity_retain] = 0
+    similarity_cos.scatter_(-1, similarity_retain.unsqueeze(-1), 0)
 
     if aggregation == "mean":
-        similarity_cos = similarity_cos.mean(dim=1)
+        similarity_cos = similarity_cos.mean(dim=-2)
     elif aggregation == "max":
-        similarity_cos = similarity_cos.max(dim=1).values
+        similarity_cos = similarity_cos.max(dim=-2).values
 
     if normalization:
         similarity_cos = similarity_cos.softmax(dim=-1)

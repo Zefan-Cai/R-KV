@@ -45,24 +45,21 @@ def cal_similarity(
     retain_ratio=0.2,
     retain_direction="last",
 ):
-    k = key_states[0]
-    num_heads = k.shape[0]
+    _, _, seq_len, _ = key_states.shape
 
-    k_norm = k / (k.norm(dim=-1, keepdim=True) + 1e-8)
+    k_norm = key_states / (key_states.norm(dim=-1, keepdim=True) + 1e-8)
     similarity_cos = torch.matmul(k_norm, k_norm.transpose(-1, -2))
-
-    for h in range(num_heads):
-        similarity_cos[h].fill_diagonal_(0.0)
+    diag = torch.eye(seq_len, dtype=torch.bool, device=key_states.device)
+    similarity_cos.masked_fill_(diag.view(1, 1, seq_len, seq_len), 0.0)
 
     # shape: [num_heads, seq_len, seq_len]
     similarity_mask = similarity_cos > threshold
 
-    seq_len = similarity_mask.size(-1)
-    k = int(seq_len * retain_ratio)
+    k = max(1, int(seq_len * retain_ratio))
 
     indices = torch.where(
         similarity_mask,
-        torch.arange(similarity_mask.size(-1), device=similarity_mask.device),
+        torch.arange(seq_len, device=similarity_mask.device).view(1, 1, 1, seq_len),
         torch.zeros_like(similarity_mask, dtype=torch.long),
     )
 
@@ -83,15 +80,10 @@ def cal_similarity(
         similarity_retain = torch.topk(indices, k=k, dim=-1, largest=False)[0][:, :, -1]
 
     # create indices for zeroing
-    batch_idx = (
-        torch.arange(num_heads).unsqueeze(1).repeat(1, similarity_retain.size(1))
-    )
-    seq_idx = torch.arange(similarity_retain.size(1)).unsqueeze(0).repeat(num_heads, 1)
-
     # zero the specified positions in similarity_cos
-    similarity_cos[batch_idx, seq_idx, similarity_retain] = 0
+    similarity_cos.scatter_(-1, similarity_retain.unsqueeze(-1), 0)
 
-    return similarity_cos.mean(dim=1).softmax(dim=-1)
+    return similarity_cos.mean(dim=-2).softmax(dim=-1)
 
 
 #################################################################
