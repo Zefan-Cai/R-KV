@@ -12,6 +12,15 @@ It extends Sglang with support for **R-KV compression clusters**, enabling exper
 Follow the [Sglang v0.4.3 installation guideline](https://github.com/sgl-project/sglang/tree/v0.4.3#installation).  
 After installing Sglang, clone this repository and use the modified modules as described below.
 
+For a concrete starting environment, install the pinned R-KV dependency set:
+
+```bash
+pip install -r requirements-rkv.txt
+pip install -e python
+```
+
+The checked-in SGLang package is `0.4.3.post1`; the requirements file keeps `vllm`, `sgl-kernel`, `flashinfer-python`, `torch`, and `triton` in the version range expected by this tree.
+
 ---
 
 ## 🚀 Getting Started

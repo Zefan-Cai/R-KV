@@ -26,10 +26,12 @@
 ## Setup
 
 ### Install Dependencies
-Use the following command to install the minimal required dependencies:
+Use the following command to install the minimal required dependencies for the HuggingFace implementation:
 ```bash
 pip install -r requirements.txt
 ```
+
+For the SGLang implementation, use the pinned environment note in `SGLang/requirements-rkv.txt`.
 
 ### Install FlashAttention
 If you're using Hugging Face, we default to flash attention to speed up attention computation:
@@ -45,6 +47,7 @@ model = AutoModelForCausalLM.from_pretrained(
 
 You need to build the dependencies of the evaluation toolkit separately:
 ```bash
+cd HuggingFace
 cd evaluation/latex2sympy
 pip install -e .
 cd ..
@@ -54,6 +57,8 @@ pip install -r requirements.txt
 ## Quick Start
 Before running the scripts, you need to build the rkv package:
 ```bash
+cd HuggingFace
+pip install -r requirements.txt
 pip install -e .
 ```
 
@@ -66,17 +71,27 @@ Or you could use the code scripts:
 
 ```bash
 export CUDA_VISIBLE_DEVICES=0
+cd HuggingFace
 
 python3 ./run_math.py \
 --dataset_path ./data/aime24.jsonl \
 --save_path ./outputs/output.jsonl \
 --model_path deepseek-ai/DeepSeek-R1-Distill-Llama-8B \
---max_length 16384 \
+--max_length 32768 \
 --eval_batch_size 1 \
 --method rkv \
---kv_budget 128
+--kv_budget 1024 \
+--window_size 8 \
+--mix_lambda 0.1 \
+--divide_method step_length \
+--divide_length 128 \
+--do_sample \
+--temperature 0.6 \
+--top_p 0.95
 
 ```
+
+For paper-style candidate generation, additionally set `--num_return_sequences 64`.
 
 To evaluate benchmark results, simply run:
 ```bash
@@ -182,6 +197,10 @@ We benchmark two distilled DeepSeek-R1 variants:
 | `λ` | importance / redundancy trade-off | **0.1** (see § λ-sweep) |
 
 Sampling: *temperature 0.6*, *top-p 0.95*, *64 candidates* per problem; we report **pass@1**.
+
+For the HuggingFace runner, `B_buffer = 128` maps to `--divide_method step_length --divide_length 128`. `--kv_budget` is the retained KV budget (`B_budget`). `divide_method=newline` is a convenience heuristic and was not the fixed-buffer setting used for the main reported results.
+
+The released HuggingFace implementation performs decoding-time compression. It should not be used as a prefill-stage long-prompt compressor or TTFT optimization without adding a separate prefill compression pass.
 
 ### Baselines
 * **FullKV** – no compression, upper-bound quality.  
@@ -352,4 +371,3 @@ If you find R-KV useful in your research, please cite us:
   year={2025}
 }
 ```
-

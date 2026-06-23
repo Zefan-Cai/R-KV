@@ -17,8 +17,8 @@ dataset2key = {
 
 dataset2max_length = {
     "gsm8k": 8192,
-    "aime24": 16384,
-    "math": 8192,
+    "aime24": 32768,
+    "math": 16384,
 }
 
 
@@ -66,47 +66,65 @@ def main(args):
         ).to("cuda")
 
         prefill_lengths = tokenized_prompts["attention_mask"].sum(dim=1).tolist()
+        prompt_sequence_length = tokenized_prompts.input_ids.shape[1]
+
+        generation_kwargs = {
+            "max_length": args.max_length,
+            "do_sample": args.do_sample,
+            "num_beams": 1,
+            "num_return_sequences": args.num_return_sequences,
+        }
+        if args.do_sample:
+            generation_kwargs.update(
+                {
+                    "temperature": args.temperature,
+                    "top_p": args.top_p,
+                }
+            )
 
         output = model.generate(
             **tokenized_prompts,
-            max_length=args.max_length,
-            do_sample=False,
-            num_beams=1,
+            **generation_kwargs,
         )
 
         batch_token_stats = []
         for j in range(output.size(0)):
-            total_tokens = int((output[j] != tokenizer.pad_token_id).sum().item())
-
-            prefill = prefill_lengths[j]
-            output_tokens = total_tokens - prefill
+            prompt_idx = j // args.num_return_sequences
+            prefill = prefill_lengths[prompt_idx]
+            generated_ids = output[j][prompt_sequence_length:]
+            output_tokens = int((generated_ids != tokenizer.pad_token_id).sum().item())
+            total_tokens = prefill + output_tokens
 
             batch_token_stats.append(
                 {
-                    "sample_idx": i + j,
+                    "sample_idx": i + prompt_idx,
+                    "candidate_idx": j % args.num_return_sequences,
                     "prefill_tokens": prefill,
                     "output_tokens": output_tokens,
                     "total_tokens": total_tokens,
                 }
             )
 
-        batch_outputs = tokenizer.batch_decode(
-            [output[j][prefill_lengths[j] :] for j in range(output.size(0))],
-            skip_special_tokens=True,
-        )
+        batch_outputs = [
+            tokenizer.decode(output[j][prompt_sequence_length:], skip_special_tokens=True)
+            for j in range(output.size(0))
+        ]
 
         torch.cuda.empty_cache()
 
         for j in range(len(batch_outputs)):
             sample_idx = batch_token_stats[j]["sample_idx"]
-            test_data[sample_idx]["prompt"] = batch_prompts[j]
-            test_data[sample_idx]["output"] = batch_outputs[j]
-            test_data[sample_idx]["prefill_tokens"] = batch_token_stats[j]["prefill_tokens"]
-            test_data[sample_idx]["output_tokens"] = batch_token_stats[j]["output_tokens"]
-            test_data[sample_idx]["total_tokens"] = batch_token_stats[j]["total_tokens"]
-            test_data[sample_idx]["sample_idx"] = batch_token_stats[j]["sample_idx"]
+            prompt_idx = sample_idx - i
+            result = dict(test_data[sample_idx])
+            result["prompt"] = batch_prompts[prompt_idx]
+            result["output"] = batch_outputs[j]
+            result["prefill_tokens"] = batch_token_stats[j]["prefill_tokens"]
+            result["output_tokens"] = batch_token_stats[j]["output_tokens"]
+            result["total_tokens"] = batch_token_stats[j]["total_tokens"]
+            result["sample_idx"] = batch_token_stats[j]["sample_idx"]
+            result["candidate_idx"] = batch_token_stats[j]["candidate_idx"]
 
-            fout.write(json.dumps(test_data[sample_idx], ensure_ascii=False) + "\n")
+            fout.write(json.dumps(result, ensure_ascii=False) + "\n")
 
     fout.close()
 
@@ -137,7 +155,7 @@ def parse_arguments():
     parser.add_argument("--kv_budget", type=int, default=None)
     parser.add_argument("--window_size", type=int, default=8)
     parser.add_argument("--first_tokens", type=int, default=4)
-    parser.add_argument("--mix_lambda", type=float, default=0.07)
+    parser.add_argument("--mix_lambda", type=float, default=0.1)
     parser.add_argument("--retain_ratio", type=float, default=0.2)
     parser.add_argument("--update_kv", type=bool, default=True)
     parser.add_argument(
@@ -159,12 +177,22 @@ def parse_arguments():
         choices=["think", "all"],
         help="whether to compress the whole model output or only the think part",
     )
+    parser.add_argument(
+        "--do_sample",
+        action="store_true",
+        help="enable sampling; paper-style reproduction uses this with temperature 0.6 and top_p 0.95",
+    )
+    parser.add_argument("--temperature", type=float, default=0.6)
+    parser.add_argument("--top_p", type=float, default=0.95)
+    parser.add_argument("--num_return_sequences", type=int, default=1)
 
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_arguments()
+    if args.num_return_sequences > 1 and not args.do_sample:
+        raise ValueError("--num_return_sequences > 1 requires --do_sample")
     set_seed(args.seed)
 
     args.dataset_name = args.dataset_path.split("/")[-1].split(".")[0]
