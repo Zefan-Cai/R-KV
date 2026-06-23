@@ -13,10 +13,10 @@
 ## TODO
 - Apply R-KV in GPT-OSS
 - Integrate R-KV with VeRL
-- Finish R-KV in vLLM, Nano-vLLM and SGLang
+- Harden R-KV benchmark coverage in vLLM, Nano-vLLM and SGLang
 - Extend dataset to GPQA, liveCodeBench
 - Apply R-KV in QwQ
-- Apply R-KV in Qwen-3
+- Expand Qwen-3 evaluation coverage
 
 ## 🔥 News
 
@@ -32,6 +32,19 @@ pip install -r requirements.txt
 ```
 
 For the SGLang implementation, use the pinned environment note in `SGLang/requirements-rkv.txt`.
+
+For the vLLM implementation, use the checked-in `vLLM/` tree as one source tree. The R-KV changes touch coupled vLLM V1 files such as the scheduler, engine core, platform helpers, tokenizer utilities, model definitions, and FlashAttention backend, so do not copy only a few Python files onto an arbitrary PyPI `vllm` wheel. A typical source install is:
+
+```bash
+cd vLLM
+SETUPTOOLS_SCM_PRETEND_VERSION=0.8.5 pip install -e . --no-build-isolation
+
+export VLLM_USE_V1=1
+export VLLM_V1_R_KV_BUDGET=64
+export VLLM_V1_R_KV_BUFFER=8
+```
+
+If you must reuse a prebuilt `vllm==0.8.5` wheel for the compiled CUDA extensions, overlay the entire checked-in `vLLM/vllm/` Python package, not individual files.
 
 ### Install FlashAttention
 If you're using Hugging Face, we default to flash attention to speed up attention computation:
