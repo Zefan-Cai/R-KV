@@ -69,6 +69,15 @@ logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 
+def _get_or_create_event_loop():
+    try:
+        return asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop
+
+
 class Engine:
     """
     The entry point to the inference engine.
@@ -146,7 +155,7 @@ class Engine:
             custom_logit_processor=custom_logit_processor,
             stream=stream,
         )
-        loop = asyncio.get_event_loop()
+        loop = _get_or_create_event_loop()
         generator = self.tokenizer_manager.generate_request(obj, None)
 
         if stream:
@@ -214,7 +223,7 @@ class Engine:
         """
 
         obj = EmbeddingReqInput(text=prompt)
-        loop = asyncio.get_event_loop()
+        loop = _get_or_create_event_loop()
         generator = self.tokenizer_manager.generate_request(obj, None)
         ret = loop.run_until_complete(generator.__anext__())
         return ret
@@ -254,7 +263,7 @@ class Engine:
             group_name=group_name,
             backend=backend,
         )
-        loop = asyncio.get_event_loop()
+        loop = _get_or_create_event_loop()
         return loop.run_until_complete(
             self.tokenizer_manager.init_weights_update_group(obj, None)
         )
@@ -266,7 +275,7 @@ class Engine:
             dtype=dtype,
             shape=shape,
         )
-        loop = asyncio.get_event_loop()
+        loop = _get_or_create_event_loop()
         return loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_distributed(obj, None)
         )
@@ -276,7 +285,7 @@ class Engine:
         obj = UpdateWeightsFromTensorReqInput(
             serialized_named_tensors=MultiprocessingSerializer.serialize(named_tensors)
         )
-        loop = asyncio.get_event_loop()
+        loop = _get_or_create_event_loop()
         return loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_tensor(obj, None)
         )
@@ -284,7 +293,7 @@ class Engine:
     def get_weights_by_name(self, name: str, truncate_size: int = 100):
         """Get weights by parameter name."""
         obj = GetWeightsByNameReqInput(name=name, truncate_size=truncate_size)
-        loop = asyncio.get_event_loop()
+        loop = _get_or_create_event_loop()
         return loop.run_until_complete(
             self.tokenizer_manager.get_weights_by_name(obj, None)
         )
@@ -292,7 +301,7 @@ class Engine:
     def release_memory_occupation(self):
         """Release GPU occupation temporarily."""
         obj = ReleaseMemoryOccupationReqInput()
-        loop = asyncio.get_event_loop()
+        loop = _get_or_create_event_loop()
         return loop.run_until_complete(
             self.tokenizer_manager.release_memory_occupation(obj, None)
         )
@@ -300,7 +309,7 @@ class Engine:
     def resume_memory_occupation(self):
         """Resume GPU occupation."""
         obj = ResumeMemoryOccupationReqInput()
-        loop = asyncio.get_event_loop()
+        loop = _get_or_create_event_loop()
         return loop.run_until_complete(
             self.tokenizer_manager.resume_memory_occupation(obj, None)
         )
