@@ -1008,5 +1008,15 @@ class Qwen2_5_VLImageProcessor(BaseImageProcessor):
         return BatchFeature(data=data, tensor_type=return_tensors)
 
 
-AutoImageProcessor.register(Qwen2_5_VLConfig, Qwen2_5_VLImageProcessor)
-AutoProcessor.register(Qwen2_5_VLConfig, Qwen2_5_VLProcessor)
+def _register_auto_processor_once(registry, config_cls, processor_cls):
+    try:
+        registry.register(config_cls, processor_cls)
+    except ValueError as err:
+        if "already used by a Transformers model" not in str(err):
+            raise
+
+
+_register_auto_processor_once(
+    AutoImageProcessor, Qwen2_5_VLConfig, Qwen2_5_VLImageProcessor
+)
+_register_auto_processor_once(AutoProcessor, Qwen2_5_VLConfig, Qwen2_5_VLProcessor)
