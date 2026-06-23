@@ -80,6 +80,10 @@ class RKVCompressor:
         # (uid, layer_id) -> (num_qo_heads, window, head_dim) cached
         # query slice. Stored on the query tensor's original device.
         self._query_buffer: dict[tuple[int, int], torch.Tensor] = {}
+        # Slot indices dropped by compression that should be returned to
+        # the cache manager's free pool. Populated by maybe_compress and
+        # drained by the scheduler after each forward.
+        self._pending_free_slots: list[torch.Tensor] = []
 
     @property
     def is_enabled(self) -> bool:
@@ -206,4 +210,23 @@ class RKVCompressor:
             new_lens.append(new_len)
             if new_len < source_len:
                 any_compressed = True
+                # Only the last layer enqueues slots for the page pool;
+                # earlier layers also compress in place but the K/V of
+                # all layers share the same page_table, so the slots
+                # only become free once every layer has compressed.
+                if layer_id == self.num_layers - 1:
+                    self._pending_free_slots.append(slots[new_len:].to(torch.int32))
         return new_lens if any_compressed else None
+
+    def drain_pending_free_slots(self) -> torch.Tensor | None:
+        """Return and clear the pending free-slot indices.
+
+        The scheduler should call this after each forward and pass the
+        returned tensor (if any) to ``CacheManager._free`` so the
+        compressed tail slots become visible to other requests.
+        """
+        if not self._pending_free_slots:
+            return None
+        merged = torch.cat(self._pending_free_slots)
+        self._pending_free_slots.clear()
+        return merged

@@ -69,9 +69,25 @@ def test_compressor_drop_request_clears_all_layers() -> None:
     assert len(compressor._query_buffer) == 0
 
 
+def test_drain_pending_free_slots_returns_and_clears() -> None:
+    cfg = RKVConfig(enabled=True, budget=64, window_size=8)
+    compressor = RKVCompressor(config=cfg, num_layers=4)
+    # First drain returns None when nothing pending.
+    assert compressor.drain_pending_free_slots() is None
+    # Enqueue two slot ranges as the last layer would.
+    compressor._pending_free_slots.append(torch.tensor([10, 11, 12], dtype=torch.int32))
+    compressor._pending_free_slots.append(torch.tensor([20, 21], dtype=torch.int32))
+    drained = compressor.drain_pending_free_slots()
+    assert drained is not None
+    assert drained.tolist() == [10, 11, 12, 20, 21]
+    # Drain is destructive.
+    assert compressor.drain_pending_free_slots() is None
+
+
 if __name__ == "__main__":
     test_update_kv_skips_when_within_budget()
     test_update_kv_compresses_to_budget()
     test_compressor_disabled_returns_none()
     test_compressor_drop_request_clears_all_layers()
+    test_drain_pending_free_slots_returns_and_clears()
     print("all tests passed")

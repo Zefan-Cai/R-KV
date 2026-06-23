@@ -94,13 +94,13 @@ finished-request path; not yet wired.)
   cache has been compressed, the page allocation no longer represents
   the verbatim prefix. Make sure `RadixCache` does not match incoming
   prefixes against compressed branches.
-- **Tail pages stay tied up until the request finishes.** Compression
-  shortens `req.device_len` but does not currently free the originally
-  allocated tail slots back to the page pool. Those slots get reused
-  by the same request as it decodes (so they are not wasted memory for
-  that request), but other requests cannot allocate from them until
-  this request is freed. A follow-up should return the dropped tail
-  pages to the cache manager.
+- **Tail pages are returned to the cache manager.** When the
+  last-layer compression drops slots, the indices are enqueued on the
+  compressor's `_pending_free_slots`; the scheduler drains them after
+  each forward via `drain_pending_free_slots()` and hands them to
+  `CacheManager._free`, so other requests can allocate the freed slots
+  on the next step. The `int32` slot dtype matches the cache manager's
+  `free_slots`.
 - **Single-GPU first.** TP is not yet supported by this prototype.
   Compression runs on rank 0's slice of the KV cache; for TP > 1, each
   rank should compress its own KV shard and the per-request `new_len`
@@ -131,9 +131,10 @@ all touched files succeeds. Open items:
   shape, trailing-window preservation, disabled-compressor /
   drop_request behavior). Cross-verified bit-identical to the
   Nano-vLLM port.
+- [x] Return dropped tail pages to the cache manager so freed slots
+  are visible to other requests (`drain_pending_free_slots` +
+  `Scheduler._forward`).
 - [ ] Smoke-test on an H100 with `Qwen3-0.6B` and a long-CoT prompt.
-- [ ] Return dropped tail pages to the cache manager so freed slots
-  are visible to other requests.
 - [ ] Confirm the offline `LLM` constructor surfaces `rkv_enabled`
   through `**kwargs` (it should — `SchedulerConfig(EngineConfig)`
   inherits the new fields).

@@ -232,6 +232,13 @@ class Scheduler(SchedulerIOMixin):
         forward_output = self.engine.forward_batch(batch, sample_args)
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
+        if self.engine.ctx.rkv is not None:
+            # Return any slots dropped by R-KV compression in this
+            # forward pass to the cache manager so other requests can
+            # allocate them.
+            freed = self.engine.ctx.rkv.drain_pending_free_slots()
+            if freed is not None and len(freed) > 0:
+                self.cache_manager._free(freed)
         return forward_output
 
 
