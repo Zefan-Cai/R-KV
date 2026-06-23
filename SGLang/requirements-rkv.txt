@@ -6,7 +6,7 @@ torch==2.5.1
 triton==3.1.0
 transformers>=4.48.1,<4.56
 vllm==0.7.2
-sgl-kernel>=0.0.3.post6
+sgl-kernel==0.0.3.post6
 flashinfer-python>=0.2.1.post1
 cuda-python
 outlines>=0.0.44,<=0.1.11
