@@ -3,7 +3,7 @@
 # vLLM range declared by SGLang/python/pyproject.toml. vLLM 0.7.x wheels pin
 # torch 2.5.1, so keep torch/triton aligned with that stack.
 torch==2.5.1
-torchao>=0.7.0
+torchao==0.7.0
 triton==3.1.0
 transformers>=4.48.1,<4.56
 vllm==0.7.2
