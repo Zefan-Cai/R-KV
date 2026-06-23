@@ -94,6 +94,13 @@ finished-request path; not yet wired.)
   cache has been compressed, the page allocation no longer represents
   the verbatim prefix. Make sure `RadixCache` does not match incoming
   prefixes against compressed branches.
+- **Tail pages stay tied up until the request finishes.** Compression
+  shortens `req.device_len` but does not currently free the originally
+  allocated tail slots back to the page pool. Those slots get reused
+  by the same request as it decodes (so they are not wasted memory for
+  that request), but other requests cannot allocate from them until
+  this request is freed. A follow-up should return the dropped tail
+  pages to the cache manager.
 - **Single-GPU first.** TP is not yet supported by this prototype.
   Compression runs on rank 0's slice of the KV cache; for TP > 1, each
   rank should compress its own KV shard and the per-request `new_len`
@@ -119,7 +126,14 @@ all touched files succeeds. Open items:
 - [x] Offline R-KV benchmark script at
   `benchmark/offline/bench_rkv.py` that flips R-KV on through the
   `LLM(...)` constructor kwargs.
+- [x] CPU-only algorithm tests at
+  `tests/misc/test_rkv_algorithm.py` (pre-trigger no-op, post-trigger
+  shape, trailing-window preservation, disabled-compressor /
+  drop_request behavior). Cross-verified bit-identical to the
+  Nano-vLLM port.
 - [ ] Smoke-test on an H100 with `Qwen3-0.6B` and a long-CoT prompt.
+- [ ] Return dropped tail pages to the cache manager so freed slots
+  are visible to other requests.
 - [ ] Confirm the offline `LLM` constructor surfaces `rkv_enabled`
   through `**kwargs` (it should — `SchedulerConfig(EngineConfig)`
   inherits the new fields).
