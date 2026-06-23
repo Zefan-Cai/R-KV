@@ -79,6 +79,20 @@ class Engine:
         if config.model_config.is_moe:
             self.ctx.moe_backend = self.moe_backend = create_moe_backend(config.moe_backend)
 
+        # ======================= R-KV compressor initialization ========================
+        if config.rkv_enabled:
+            from minisgl.compress import RKVCompressor
+
+            self.ctx.rkv = RKVCompressor(
+                config=config.rkv_config,
+                num_layers=config.model_config.num_layers,
+            )
+            if config.cuda_graph_bs is not None or config.cuda_graph_max_bs is not None:
+                logger.info_rank0(
+                    "R-KV is enabled; CUDA graph capture is incompatible with "
+                    "per-step variable cache_seqlens and should be disabled."
+                )
+
         # ======================= Sampler initialization ========================
         self.sampler = Sampler(self.device, config.model_config.vocab_size)
 

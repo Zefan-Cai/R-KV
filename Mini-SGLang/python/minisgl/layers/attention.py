@@ -53,5 +53,24 @@ class AttentionLayer(StateLessOP):
             self.k_norm.forward_inplace(k.view(-1, self.num_kv_heads, self.head_dim))
         q, k = self.rotary.forward(ctx.batch.positions, q, k)
         q = q.view(-1, self.num_qo_heads, self.head_dim)
+        if ctx.rkv is not None and ctx.rkv.is_enabled:
+            ctx.rkv.update_query_buffer(q, ctx.batch, self.layer_id)
         o = ctx.attn_backend.forward(q, k, v, self.layer_id, ctx.batch)
+        if ctx.rkv is not None and ctx.rkv.is_enabled and ctx.batch.is_decode:
+            # Compress this layer's cache in place after attention has
+            # already attended over the full cache. The shorter
+            # device_len takes effect on the next scheduler step.
+            new_lens = ctx.rkv.maybe_compress(
+                self.layer_id,
+                ctx.kv_cache,
+                ctx.batch.attn_metadata.page_table,
+                ctx.batch,
+            )
+            if new_lens is not None and self.layer_id == ctx.rkv.num_layers - 1:
+                # Only the last layer mutates request state, so all
+                # layers see the same source_len during this step.
+                for req, new_len in zip(ctx.batch.padded_reqs, new_lens):
+                    if new_len < req.device_len:
+                        req.device_len = new_len
+                        req.cached_len = max(0, new_len - 1)
         return o.view(-1, self.qo_attn_dim)

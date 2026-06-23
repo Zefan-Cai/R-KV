@@ -2,10 +2,11 @@
 
 The :class:`RKVCompressor` glues the pure-algorithm :class:`R1KV` against
 Mini-SGLang's paged KV cache pool. It is intentionally backend-agnostic:
-it reads/writes through ``kvcache.k_cache(layer_id)`` /
-``kvcache.v_cache(layer_id)`` slots, and the attention backend only
-needs to invoke ``maybe_compress`` in the decode path before forwarding
-into FA/FlashInfer/TRT-LLM. See ``docs/RKV.md`` for the wiring contract.
+the attention layer calls :meth:`update_query_buffer` before forwarding
+into FA/FlashInfer/TRT-LLM, and :meth:`maybe_compress` after each layer
+finishes attention. Compression is per ``(uid, layer_id)`` so each
+layer's K/V is scored against its own recent queries. See
+``docs/RKV.md`` for the full wiring contract.
 """
 
 from __future__ import annotations
@@ -49,41 +50,53 @@ class RKVConfig:
 
 
 class RKVCompressor:
-    """Per-layer R-KV driver that keeps a sliding query buffer per request.
+    """Per-(uid, layer_id) R-KV driver against a paged KV cache pool.
 
-    Mini-SGLang's attention path stores K/V into a paged cache via
-    ``kvcache.store_kv(...)``. To compress during decode we need to:
+    The driver maintains one sliding query window per ``(uid, layer_id)``
+    pair because the projection that produces ``q`` is layer-specific.
+    Compression triggers when ``req.device_len > budget + buffer`` and
+    always compacts the kept K/V into the first ``budget`` slots of the
+    request's page allocation, so every layer ends a step at the same
+    ``device_len`` and the shared page table stays in sync.
 
-    1. Maintain the last ``window_size`` queries for each live request
-       (so the score can be computed without re-running prefill).
-    2. Read the request's KV slots out of the paged cache into a dense
-       ``(1, kv_heads, kv_len, head_dim)`` tensor.
-    3. Run :meth:`R1KV.update_kv`.
-    4. Write the compressed K/V back into the *first* ``new_len`` slots
-       of the same page allocation and update the request's logical
-       cache length.
+    Compression schedule per step:
 
-    The Mini-SGLang scheduler must then reflect the new shorter cache
-    length on the next step (e.g. through ``cache_seqlens``) so the
-    attention kernel skips the freed tail.
+    1. ``AttentionLayer`` calls :meth:`update_query_buffer` *before*
+       invoking the attention backend, so the buffer reflects the
+       queries used to attend over this step's K/V.
+    2. ``AttentionLayer`` calls :meth:`maybe_compress` *after* the
+       backend has stored this step's K/V into the cache. The cache for
+       this layer is compacted in place.
+    3. On the *last* layer only, ``AttentionLayer`` updates each
+       request's ``device_len`` / ``cached_len`` from the returned
+       ``new_lens``, so the scheduler rebuilds metadata with the
+       shorter cache lengths on the next step.
     """
 
     def __init__(self, config: RKVConfig, num_layers: int) -> None:
         self.config = config
         self.num_layers = num_layers
         self.r1kv = config.make_r1kv()
-        # uid -> (window_size, num_kv_heads, head_dim) cached query slice
-        self._query_buffer: dict[int, torch.Tensor] = {}
+        # (uid, layer_id) -> (num_qo_heads, window, head_dim) cached
+        # query slice. Stored on the query tensor's original device.
+        self._query_buffer: dict[tuple[int, int], torch.Tensor] = {}
+
+    @property
+    def is_enabled(self) -> bool:
+        return self.r1kv is not None
 
     # ------------------------------------------------------------------
     # query buffer maintenance
     # ------------------------------------------------------------------
-    def update_query_buffer(self, q: torch.Tensor, batch: "Batch") -> None:
+    def update_query_buffer(
+        self, q: torch.Tensor, batch: "Batch", layer_id: int
+    ) -> None:
         """Stash the last ``window_size`` queries from this forward step.
 
-        ``q`` is the per-token query tensor before scattering into the
-        attention kernel. It has shape ``(total_tokens, num_qo_heads,
-        head_dim)`` in Mini-SGLang's convention.
+        ``q`` is the per-token query tensor *after* the QK projection and
+        rotary embedding, immediately before the attention kernel call.
+        Shape is ``(total_tokens, num_qo_heads, head_dim)`` in
+        Mini-SGLang's convention.
         """
         if self.r1kv is None:
             return
@@ -98,21 +111,26 @@ class RKVCompressor:
                 end = offset + ext
                 tail = q[max(offset, end - win) : end].detach()
                 # (window, num_qo_heads, head_dim) -> (num_qo_heads, window, head_dim)
-                self._query_buffer[req.uid] = tail.permute(1, 0, 2).contiguous()
+                self._query_buffer[(req.uid, layer_id)] = (
+                    tail.permute(1, 0, 2).contiguous()
+                )
                 offset = end
             return
         # decode: one token per request
         for i, req in enumerate(reqs):
             cur = q[i : i + 1].detach().permute(1, 0, 2).contiguous()
-            prev = self._query_buffer.get(req.uid)
+            key = (req.uid, layer_id)
+            prev = self._query_buffer.get(key)
             if prev is None:
-                self._query_buffer[req.uid] = cur
+                self._query_buffer[key] = cur
             else:
                 merged = torch.cat([prev.to(cur.device), cur], dim=1)
-                self._query_buffer[req.uid] = merged[:, -win:, :].contiguous()
+                self._query_buffer[key] = merged[:, -win:, :].contiguous()
 
     def drop_request(self, uid: int) -> None:
-        self._query_buffer.pop(uid, None)
+        for key in list(self._query_buffer):
+            if key[0] == uid:
+                self._query_buffer.pop(key, None)
 
     # ------------------------------------------------------------------
     # compression
@@ -127,11 +145,16 @@ class RKVCompressor:
         """Compress each request's KV cache for ``layer_id`` if oversized.
 
         Returns a list of new per-request cache lengths (same order as
-        ``batch.padded_reqs``) when compression ran, or ``None`` when
-        R-KV is disabled / the batch is in prefill mode. The caller is
-        responsible for propagating the new lengths into the attention
-        metadata (``cache_seqlens``) and back into ``req.cached_len`` so
-        the scheduler frees the dropped slots.
+        ``batch.padded_reqs``) when at least one request was compressed,
+        or ``None`` when R-KV is disabled / the batch is in prefill
+        mode / no request crossed the trigger threshold.
+
+        The cache is compacted in place: the kept K/V are written into
+        the first ``new_len`` slots of each request's page allocation,
+        so the page table itself does not move. The caller is
+        responsible for propagating ``new_lens`` into the request's
+        ``device_len`` exactly once per step (typically on the last
+        layer) so the scheduler frees the dropped slots.
         """
         if self.r1kv is None or batch.is_prefill:
             return None
@@ -144,6 +167,7 @@ class RKVCompressor:
         flat_k = k_cache.reshape(-1, num_kv_heads, head_dim)
         flat_v = v_cache.reshape(-1, num_kv_heads, head_dim)
 
+        any_compressed = False
         new_lens: list[int] = []
         reqs = list(batch.padded_reqs)
         for i, req in enumerate(reqs):
@@ -166,7 +190,7 @@ class RKVCompressor:
                 .contiguous()
             )
 
-            queries = self._query_buffer.get(req.uid)
+            queries = self._query_buffer.get((req.uid, layer_id))
             if queries is None:
                 # Without a recorded window we have nothing to score
                 # against; skip this request rather than guessing.
@@ -180,4 +204,6 @@ class RKVCompressor:
             flat_k[dst] = new_keys.squeeze(0).permute(1, 0, 2)
             flat_v[dst] = new_values.squeeze(0).permute(1, 0, 2)
             new_lens.append(new_len)
-        return new_lens
+            if new_len < source_len:
+                any_compressed = True
+        return new_lens if any_compressed else None

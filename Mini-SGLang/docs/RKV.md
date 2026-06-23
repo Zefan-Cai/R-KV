@@ -26,70 +26,59 @@ HuggingFace and full-vLLM/SGLang implementations in
 - `python/minisgl/engine/config.py` — `EngineConfig.rkv_*` fields and
   the `rkv_config` cached property that builds an `RKVConfig` instance.
 
-## Wiring contract for the attention layer
+## Wiring (now in main)
 
-The attention layer should construct one `RKVCompressor` per attention
-backend (it carries per-request query history, so it is stateful) and
-invoke it in the decode path. A reference wiring inside
-`python/minisgl/layers/attention.py` looks like this:
+The `RKVCompressor` lives on the global `Context` as `ctx.rkv` and is
+instantiated by `Engine.__init__` when `EngineConfig.rkv_enabled=True`.
+`AttentionLayer.forward` invokes it directly, so no per-layer
+constructor change is needed:
 
 ```python
-from minisgl.compress import RKVCompressor
-
-class AttentionLayer(StateLessOP):
-    def __init__(self, layer_id, ..., rkv: RKVCompressor | None = None):
-        ...
-        self.rkv = rkv
-
-    def forward(self, qkv: torch.Tensor) -> torch.Tensor:
-        ctx = get_global_ctx()
-        q, k, v = qkv.split([self.qo_attn_dim, self.kv_attn_dim, self.kv_attn_dim], dim=-1)
-        ...
-        q = q.view(-1, self.num_qo_heads, self.head_dim)
-        if self.rkv is not None:
-            # Stash the trailing query window before scattering into the
-            # attention kernel; the compressor uses this on the *next*
-            # step to score what to keep.
-            self.rkv.update_query_buffer(q, ctx.batch)
-            new_lens = self.rkv.maybe_compress(
-                self.layer_id,
-                ctx.kv_cache,
-                ctx.batch.attn_metadata.page_table,
-                ctx.batch,
-            )
-            if new_lens is not None:
-                # Patch in the new cache lengths so the kernel ignores
-                # the freed tail. For FlashAttentionBackend this means
-                # rewriting ``metadata.cache_seqlens``; other backends
-                # have an equivalent field.
-                ctx.batch.attn_metadata.cache_seqlens = torch.tensor(
-                    new_lens,
-                    device=ctx.batch.attn_metadata.cache_seqlens.device,
-                    dtype=ctx.batch.attn_metadata.cache_seqlens.dtype,
-                )
-                for req, new_len in zip(ctx.batch.padded_reqs, new_lens):
+# python/minisgl/layers/attention.py (now in main)
+def forward(self, qkv: torch.Tensor) -> torch.Tensor:
+    ctx = get_global_ctx()
+    q, k, v = qkv.split([self.qo_attn_dim, self.kv_attn_dim, self.kv_attn_dim], dim=-1)
+    ...
+    q = q.view(-1, self.num_qo_heads, self.head_dim)
+    if ctx.rkv is not None and ctx.rkv.is_enabled:
+        ctx.rkv.update_query_buffer(q, ctx.batch, self.layer_id)
+    o = ctx.attn_backend.forward(q, k, v, self.layer_id, ctx.batch)
+    if ctx.rkv is not None and ctx.rkv.is_enabled and ctx.batch.is_decode:
+        new_lens = ctx.rkv.maybe_compress(
+            self.layer_id, ctx.kv_cache,
+            ctx.batch.attn_metadata.page_table, ctx.batch,
+        )
+        if new_lens is not None and self.layer_id == ctx.rkv.num_layers - 1:
+            for req, new_len in zip(ctx.batch.padded_reqs, new_lens):
+                if new_len < req.device_len:
                     req.device_len = new_len
-                    req.cached_len = new_len - 1
-        o = ctx.attn_backend.forward(q, k, v, self.layer_id, ctx.batch)
-        return o.view(-1, self.qo_attn_dim)
+                    req.cached_len = max(0, new_len - 1)
+    return o.view(-1, self.qo_attn_dim)
 ```
 
-Construction in the engine path:
+Compression schedule per step:
 
-```python
-# python/minisgl/engine/engine.py (sketch)
-from minisgl.compress import RKVCompressor
-
-rkv = RKVCompressor(
-    config=engine_config.rkv_config,
-    num_layers=engine_config.model_config.num_hidden_layers,
-)
-# Pass `rkv` to each AttentionLayer during model construction so the
-# layers share one compressor (it indexes requests by uid, not layer).
-```
+1. *Before* `attn_backend.forward` — record the trailing window of
+   per-layer queries via `update_query_buffer(q, batch, layer_id)`. The
+   per-`(uid, layer_id)` buffering matters because each layer projects
+   its own `q`, and R-KV scores layer-specific K/V against the
+   matching layer's queries.
+2. *Inside* `attn_backend.forward` — the backend stores this step's
+   K/V into the cache and attends over the full (uncompressed) cache.
+   The current step's outputs are unaffected by R-KV.
+3. *After* `attn_backend.forward` — `maybe_compress(layer_id, ...)`
+   compacts this layer's K/V cache in place: each request's kept K/V
+   move to the first `budget` slots of its page allocation, so the
+   shared `page_table` stays valid.
+4. On the **last** layer only, the request's `device_len` /
+   `cached_len` are updated to the new shorter length. The scheduler
+   sees the shorter cache on the next step and rebuilds
+   `metadata.cache_seqlens` from it.
 
 When a request finishes, the scheduler should call
-`rkv.drop_request(uid)` so the cached query window is freed.
+`ctx.rkv.drop_request(uid)` so the cached query window for that uid
+across all layers is freed. (Hook this into the scheduler's
+finished-request path; not yet wired.)
 
 ## Constraints
 
@@ -112,13 +101,24 @@ When a request finishes, the scheduler should call
 
 ## Validation status
 
-The algorithm module and integration helper are ported but have not
-been GPU-validated against Mini-SGLang's runtime. Open items:
+The algorithm module, integration helper, and `AttentionLayer` wiring
+are all in `main`. The only thing not yet GPU-validated is the
+end-to-end run on a real Mini-SGLang serve job; pure-Python parsing of
+all touched files succeeds. Open items:
 
-- [ ] Hook `RKVCompressor` into `AttentionLayer` per the snippet above.
-- [ ] Add an `--rkv` flag (or equivalent) to the offline `LLM`
-  constructor and benchmark scripts.
+- [x] Algorithm port (`python/minisgl/compress/rkv.py`).
+- [x] Per-(uid, layer_id) compressor (`python/minisgl/compress/integration.py`).
+- [x] `EngineConfig.rkv_*` knobs and `rkv_config` cached property.
+- [x] `ctx.rkv` field on the global `Context`, instantiated by the
+  Engine when `rkv_enabled=True`.
+- [x] `AttentionLayer.forward` calls `update_query_buffer` /
+  `maybe_compress` with the last-layer guard on `device_len`.
 - [ ] Smoke-test on an H100 with `Qwen3-0.6B` and a long-CoT prompt.
+- [ ] Hook `ctx.rkv.drop_request(uid)` into the scheduler's
+  finished-request path so the query buffer can't leak.
+- [ ] Confirm the offline `LLM` constructor surfaces `rkv_enabled`
+  through `**kwargs` (it should — `SchedulerConfig(EngineConfig)`
+  inherits the new fields).
 - [ ] Compare token throughput and answer fidelity against the
   HuggingFace R-KV reference at matching budgets.
 

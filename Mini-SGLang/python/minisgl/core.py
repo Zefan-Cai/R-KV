@@ -8,6 +8,7 @@ import torch
 
 if TYPE_CHECKING:
     from minisgl.attention import BaseAttnBackend, BaseAttnMetadata
+    from minisgl.compress import RKVCompressor
     from minisgl.kvcache import BaseCacheHandle, BaseKVCachePool
     from minisgl.moe import BaseMoeBackend
 
@@ -105,6 +106,9 @@ class Context:
     attn_backend: BaseAttnBackend = field(init=False)
     moe_backend: BaseMoeBackend = field(init=False)
     kv_cache: BaseKVCachePool = field(init=False)
+    # R-KV decode-time KV cache compressor. None when R-KV is disabled.
+    # See minisgl.compress.RKVCompressor.
+    rkv: "RKVCompressor | None" = field(default=None, init=False)
     _batch: Batch | None = field(default=None, init=False)
 
     @property

@@ -15,7 +15,7 @@ Mini-SGLang is a compact implementation of [SGLang](https://github.com/sgl-proje
 - `EngineConfig.rkv_*` knobs that mirror the HuggingFace R-KV reference defaults.
 - [`docs/RKV.md`](docs/RKV.md) — the wiring contract for hooking the compressor into `AttentionLayer`.
 
-The algorithm port is bit-for-bit equivalent to the Nano-vLLM reference in the parent repo. The attention-layer wiring is a small follow-up step documented in `docs/RKV.md` and is being validated on Pluto as a follow-up.
+The algorithm port is bit-for-bit equivalent to the Nano-vLLM reference in the parent repo. The `AttentionLayer.forward` wiring is in place; the remaining follow-up is GPU smoke-testing on Pluto and hooking `RKVCompressor.drop_request` into the scheduler's finished-request path. See [`docs/RKV.md`](docs/RKV.md) for the integration contract and validation checklist.
 
 ## ✨ Key Features
 
