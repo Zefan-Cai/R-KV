@@ -114,6 +114,22 @@ bash examples/eval.sh
 ```
 The results will be saved in the `outputs` directory.
 
+## Tests
+
+CPU-only unit tests cover the R-KV algorithm port in the lightweight reference implementations:
+
+```bash
+# Nano-vLLM port — pre-trigger no-op, post-trigger shape + trailing-window
+# preservation, and cross-port equality against Mini-SGLang.
+python Nano-vLLM/tests/test_rkv_algorithm.py
+
+# Mini-SGLang port — same algorithm tests plus disabled-compressor /
+# drop_request / drain_pending_free_slots integration coverage.
+PYTHONPATH=Mini-SGLang/python python Mini-SGLang/tests/misc/test_rkv_algorithm.py
+```
+
+Both run on CPU without a GPU and exercise the exact `R1KV` class used at runtime.
+
 ## Overview
 
 Large language models that rely on chain-of-thought (CoT) or self-reflection can crack tough reasoning tasks—but at the cost of **very long outputs that bloat the key–value (KV) cache** during inference.  
