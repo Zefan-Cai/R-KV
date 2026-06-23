@@ -1,10 +1,11 @@
 # Reproduction-oriented dependency set for the checked-in R-KV SGLang tree.
 # The embedded package is SGLang 0.4.3.post1; keep the serving stack in the
-# vLLM range declared by SGLang/python/pyproject.toml.
-torch==2.6.0
-triton==3.2.0
+# vLLM range declared by SGLang/python/pyproject.toml. vLLM 0.7.x wheels pin
+# torch 2.5.1, so keep torch/triton aligned with that stack.
+torch==2.5.1
+triton==3.1.0
 transformers>=4.48.1,<4.56
-vllm>=0.6.4.post1,<=0.7.2
+vllm==0.7.2
 sgl-kernel>=0.0.3.post6
 flashinfer-python>=0.2.1.post1
 cuda-python
