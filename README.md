@@ -33,6 +33,8 @@ pip install -r requirements.txt
 
 For the SGLang implementation, use the pinned environment note in `SGLang/requirements-rkv.txt`.
 
+For lightweight reference ports, see `Nano-vLLM/` and `Mini-SGLang/`. `Nano-vLLM/` is a ~1.2k-line paged-KV inference engine with R-KV plugged into the attention path (`enforce_eager=True` required); `Mini-SGLang/` carries the R-KV algorithm and a paged-cache integration helper under `python/minisgl/compress/`, with the attention-layer wiring documented in `Mini-SGLang/docs/RKV.md`.
+
 For the vLLM implementation, use the checked-in `vLLM/` tree as one source tree. The R-KV changes touch coupled vLLM V1 files such as the scheduler, engine core, platform helpers, tokenizer utilities, model definitions, and FlashAttention backend, so do not copy only a few Python files onto an arbitrary PyPI `vllm` wheel. A typical source install is:
 
 ```bash
