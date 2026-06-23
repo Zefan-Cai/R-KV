@@ -84,15 +84,17 @@ class TritonAttnBackend(AttentionBackend):
 
         if forward_batch.forward_mode.is_decode_or_idle():
             if spec_info is None:
-                kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
+                kv_seq_lens = getattr(forward_batch, "kv_seq_lens", forward_batch.seq_lens)
+                kv_seq_lens_sum = getattr(forward_batch, "kv_seq_lens_sum", forward_batch.seq_lens_sum)
+                kv_indptr[1 : bs + 1] = torch.cumsum(kv_seq_lens, dim=0)
                 kv_indptr = kv_indptr[: bs + 1]
                 kv_indices = torch.zeros(
-                    forward_batch.seq_lens_sum, dtype=torch.int32, device=self.device
+                    kv_seq_lens_sum, dtype=torch.int32, device=self.device
                 )
                 create_flashinfer_kv_indices_triton[(bs,)](
                     self.req_to_token,
                     forward_batch.req_pool_indices,
-                    forward_batch.seq_lens,
+                    kv_seq_lens,
                     kv_indptr,
                     None,
                     kv_indices,
@@ -502,14 +504,15 @@ class TritonMultiStepDraftBackend:
     ):
         num_seqs = forward_batch.batch_size
         bs = self.topk * num_seqs
-        seq_lens_sum = forward_batch.seq_lens_sum
+        kv_seq_lens = getattr(forward_batch, "kv_seq_lens", forward_batch.seq_lens)
+        kv_seq_lens_sum = getattr(forward_batch, "kv_seq_lens_sum", forward_batch.seq_lens_sum)
 
         self.generate_draft_decode_kv_indices[
             (self.speculative_num_steps, num_seqs, self.topk)
         ](
             forward_batch.req_pool_indices,
             forward_batch.req_to_token_pool.req_to_token,
-            forward_batch.seq_lens,
+            kv_seq_lens,
             kv_indices_buffer,
             self.kv_indptr,
             forward_batch.positions,
@@ -526,7 +529,7 @@ class TritonMultiStepDraftBackend:
         for i in range(self.speculative_num_steps):
             forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
             forward_batch.spec_info.kv_indices = kv_indices_buffer[i][
-                : seq_lens_sum * self.topk + bs * (i + 1)
+                : kv_seq_lens_sum * self.topk + bs * (i + 1)
             ]
             call_fn(i, forward_batch)
 
@@ -568,7 +571,7 @@ class TritonMultiStepDraftBackend:
                 forward_batch.batch_size,
                 forward_batch.batch_size * self.topk,
                 forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
+                getattr(forward_batch, "kv_seq_lens", forward_batch.seq_lens),
                 encoder_lens=None,
                 forward_mode=ForwardMode.DECODE,
                 spec_info=forward_batch.spec_info,
@@ -581,8 +584,8 @@ class TritonMultiStepDraftBackend:
             self.attn_backends[i].init_forward_metadata_replay_cuda_graph(
                 forward_batch.batch_size,
                 forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                seq_lens_sum=-1,
+                getattr(forward_batch, "kv_seq_lens", forward_batch.seq_lens),
+                seq_lens_sum=getattr(forward_batch, "kv_seq_lens_sum", -1),
                 encoder_lens=None,
                 forward_mode=ForwardMode.DECODE,
                 spec_info=forward_batch.spec_info,

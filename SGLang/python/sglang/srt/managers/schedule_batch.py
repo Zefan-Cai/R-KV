@@ -342,6 +342,7 @@ class Req:
 
         # for RKV
         self.seq_len = 0
+        self.kv_seq_len = 0
 
     def extend_image_inputs(self, image_inputs):
         if self.image_inputs is None:
@@ -565,12 +566,14 @@ class ScheduleBatch:
     input_embeds: torch.Tensor = None  # shape: [b, hidden_size], float32
     req_pool_indices: torch.Tensor = None  # shape: [b], int32
     seq_lens: torch.Tensor = None  # shape: [b], int64
+    kv_seq_lens: torch.Tensor = None  # shape: [b], int64
     # The output locations of the KV cache
     out_cache_loc: torch.Tensor = None  # shape: [b], int32
     output_ids: torch.Tensor = None  # shape: [b], int32
 
     # The sum of all sequence lengths
     seq_lens_sum: int = None
+    kv_seq_lens_sum: int = None
 
     # For DP attention
     global_num_tokens: Optional[List[int]] = None
@@ -811,6 +814,10 @@ class ScheduleBatch:
         self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64).to(
             self.device, non_blocking=True
         )
+        self.kv_seq_lens = self.seq_lens.clone()
+        for i, req in enumerate(reqs):
+            req.seq_len = int(self.seq_lens[i].item())
+            req.kv_seq_len = int(self.kv_seq_lens[i].item())
         self.input_embeds = (
             torch.tensor(input_embeds).to(self.device, non_blocking=True)
             if input_embeds
@@ -820,6 +827,7 @@ class ScheduleBatch:
         self.out_cache_loc = out_cache_loc
 
         self.seq_lens_sum = sum(seq_lens)
+        self.kv_seq_lens_sum = self.seq_lens_sum
         if self.return_logprob:
             self.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
         self.extend_num_tokens = extend_num_tokens
@@ -1042,9 +1050,11 @@ class ScheduleBatch:
         self.forward_mode = ForwardMode.IDLE
         self.input_ids = torch.empty(0, dtype=torch.int32, device=self.device)
         self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
+        self.kv_seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
         self.out_cache_loc = torch.empty(0, dtype=torch.int32, device=self.device)
         self.req_pool_indices = torch.empty(0, dtype=torch.int32, device=self.device)
         self.seq_lens_sum = 0
+        self.kv_seq_lens_sum = 0
         self.extend_num_tokens = 0
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
             self,
@@ -1061,40 +1071,48 @@ class ScheduleBatch:
         self.output_ids = None
         self.sampling_info.penalizer_orchestrator.cumulate_output_tokens(self.input_ids)
 
+        if not hasattr(self, "kv_seq_lens"):
+            self.kv_seq_lens = self.seq_lens.clone()
+            self.kv_seq_lens_sum = self.kv_seq_lens.sum().item()
+
         # check previous compress modifications
         if hasattr(self.tree_cache, "compressed_req_len"):
             for i, req_indice in enumerate(self.req_pool_indices):
                 if req_indice.item() in self.tree_cache.compressed_req_len:
                     new_seq_len = self.tree_cache.compressed_req_len[req_indice.item()]
-                    self.seq_lens[i] = new_seq_len
-                    self.reqs[i].seq_len = new_seq_len
+                    self.kv_seq_lens[i] = new_seq_len
+                    self.reqs[i].kv_seq_len = new_seq_len
                     self.tree_cache.compressed_req_len.pop(req_indice.item())
-            self.seq_lens_sum = self.seq_lens.sum().item()
+            self.kv_seq_lens_sum = self.kv_seq_lens.sum().item()
         # Alloc mem
         bs = len(self.reqs)
         self.out_cache_loc = self.alloc_token_slots(bs)
 
         if self.model_config.is_encoder_decoder:
-            locs = self.encoder_lens + self.seq_lens
+            locs = self.encoder_lens + self.kv_seq_lens
             self.prepare_encoder_info_decode()
         else:
-            locs = self.seq_lens
+            locs = self.kv_seq_lens
 
         if self.enable_overlap:
             # Do not use in-place operations in the overlap mode
             self.req_to_token_pool.write(
                 (self.req_pool_indices, locs), self.out_cache_loc
             )
+            self.kv_seq_lens = self.kv_seq_lens + 1
             self.seq_lens = self.seq_lens + 1
         else:
             # A faster in-place version
             self.req_to_token_pool.write(
                 (self.req_pool_indices, locs), self.out_cache_loc
             )
+            self.kv_seq_lens.add_(1)
             self.seq_lens.add_(1)
         self.seq_lens_sum += bs
+        self.kv_seq_lens_sum = self.kv_seq_lens.sum().item()
         for i, req in enumerate(self.reqs):
             req.seq_len = self.seq_lens[i].item()
+            req.kv_seq_len = self.kv_seq_lens[i].item()
 
     def filter_batch(
         self,
@@ -1127,6 +1145,9 @@ class ScheduleBatch:
         )
         self.req_pool_indices = self.req_pool_indices[new_indices]
         self.seq_lens = self.seq_lens[new_indices]
+        if hasattr(self, "kv_seq_lens"):
+            self.kv_seq_lens = self.kv_seq_lens[new_indices]
+            self.kv_seq_lens_sum = self.kv_seq_lens.sum().item()
         self.out_cache_loc = None
         self.seq_lens_sum = self.seq_lens.sum().item()
         self.output_ids = self.output_ids[new_indices]
@@ -1158,6 +1179,11 @@ class ScheduleBatch:
             [self.req_pool_indices, other.req_pool_indices]
         )
         self.seq_lens = torch.concat([self.seq_lens, other.seq_lens])
+        if hasattr(self, "kv_seq_lens") or hasattr(other, "kv_seq_lens"):
+            self_kv_seq_lens = getattr(self, "kv_seq_lens", self.seq_lens[: len(self.reqs)])
+            other_kv_seq_lens = getattr(other, "kv_seq_lens", other.seq_lens)
+            self.kv_seq_lens = torch.concat([self_kv_seq_lens, other_kv_seq_lens])
+            self.kv_seq_lens_sum = self.kv_seq_lens.sum().item()
         self.out_cache_loc = None
         self.seq_lens_sum += other.seq_lens_sum
         if self.output_ids is not None:
@@ -1204,8 +1230,10 @@ class ScheduleBatch:
             input_ids=self.input_ids,
             req_pool_indices=self.req_pool_indices,
             seq_lens=self.seq_lens,
+            kv_seq_lens=getattr(self, "kv_seq_lens", self.seq_lens),
             out_cache_loc=self.out_cache_loc,
             seq_lens_sum=self.seq_lens_sum,
+            kv_seq_lens_sum=getattr(self, "kv_seq_lens_sum", self.seq_lens_sum),
             return_logprob=self.return_logprob,
             top_logprobs_nums=self.top_logprobs_nums,
             global_num_tokens=self.global_num_tokens,
@@ -1271,11 +1299,15 @@ class ModelWorkerBatch:
     req_pool_indices: torch.Tensor
     # The sequence length
     seq_lens: torch.Tensor
+    # The compressed KV-cache length. This can differ from seq_lens when R-KV is enabled.
+    kv_seq_lens: torch.Tensor
     # The indices of output tokens in the token_to_kv_pool
     out_cache_loc: torch.Tensor
 
     # The sum of all sequence lengths
     seq_lens_sum: int
+    # The sum of compressed KV-cache lengths
+    kv_seq_lens_sum: int
 
     # For logprob
     return_logprob: bool

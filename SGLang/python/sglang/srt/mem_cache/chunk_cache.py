@@ -44,7 +44,7 @@ class ChunkCache(BasePrefixCache):
 
     def cache_finished_req(self, req: Req, token_ids: Optional[List[int]] = None):
         if self.compress_algorithm is not None:
-            token_id_len = req.seq_len
+            token_id_len = req.kv_seq_len
         elif token_ids is None:
             token_id_len = len(req.origin_input_ids) + len(req.output_ids) - 1
         else:
@@ -60,7 +60,9 @@ class ChunkCache(BasePrefixCache):
             del self.entries[req.rid]
 
     def cache_unfinished_req(self, req: Req, token_ids: Optional[List[int]] = None):
-        if token_ids is None:
+        if self.compress_algorithm is not None:
+            token_id_len = req.kv_seq_len
+        elif token_ids is None:
             token_id_len = len(req.fill_ids)
         else:
             token_id_len = len(token_ids)

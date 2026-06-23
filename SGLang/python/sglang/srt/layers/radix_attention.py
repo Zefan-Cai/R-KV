@@ -90,6 +90,11 @@ class RadixAttention(nn.Module):
             cur_len = seq_len - prefix_len
             return req_indice, seq_len, cur_len
 
+    def _get_kv_seq_len(self, idx: int, forward_batch: ForwardBatch) -> int:
+        if hasattr(forward_batch, "kv_seq_lens") and forward_batch.kv_seq_lens is not None:
+            return forward_batch.kv_seq_lens[idx].item()
+        return forward_batch.seq_lens[idx].item()
+
     def _reshape_qkv_compress(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, forward_batch: ForwardBatch) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Reshape q, k, v tensors to match KV compression cluster's input. 
@@ -126,8 +131,8 @@ class RadixAttention(nn.Module):
             if req_indice not in forward_batch.compress_out_locs:
                 continue
             # extract old info
-            old_seq_len = forward_batch.seq_lens[i].item()
-            old_kv_loc = forward_batch.req_to_token_pool.req_to_token[req_indice][ : old_seq_len]
+            old_kv_len = self._get_kv_seq_len(i, forward_batch)
+            old_kv_loc = forward_batch.req_to_token_pool.req_to_token[req_indice][ : old_kv_len]
             # extract new info
             new_kv_loc = forward_batch.compress_out_locs[req_indice]
             new_seq_len = len(new_kv_loc)
@@ -209,7 +214,8 @@ class RadixAttention(nn.Module):
                 req_indice, seq_len, _ = self._get_metadata(i, forward_batch)
                 if need_compress(seq_len, req_indice, forward_batch):
                     q_state = forward_batch.req_to_token_pool.q_cache[self.layer_id][req_indice]
-                    kv_locs = forward_batch.req_to_token_pool.req_to_token[req_indice][ : seq_len]
+                    kv_seq_len = self._get_kv_seq_len(i, forward_batch)
+                    kv_locs = forward_batch.req_to_token_pool.req_to_token[req_indice][ : kv_seq_len]
                     k_state = forward_batch.token_to_kv_pool.k_buffer[self.layer_id][kv_locs]
                     v_state = forward_batch.token_to_kv_pool.v_buffer[self.layer_id][kv_locs]
                     q_state, k_state, v_state = self._reshape_qkv_compress(q_state, k_state, v_state, forward_batch)

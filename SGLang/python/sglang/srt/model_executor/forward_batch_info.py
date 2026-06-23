@@ -141,11 +141,15 @@ class ForwardBatch:
     req_pool_indices: torch.Tensor
     # The sequence length
     seq_lens: torch.Tensor
+    # The compressed KV-cache length. This can differ from seq_lens when R-KV is enabled.
+    kv_seq_lens: torch.Tensor
     # The indices of output tokens in the token_to_kv_pool
     out_cache_loc: torch.Tensor
 
     # The sum of all sequence lengths
     seq_lens_sum: int
+    # The sum of all compressed KV-cache lengths
+    kv_seq_lens_sum: int
 
     # For logprob
     return_logprob: bool = False
@@ -224,6 +228,7 @@ class ForwardBatch:
             input_ids=batch.input_ids,
             req_pool_indices=batch.req_pool_indices,
             seq_lens=batch.seq_lens,
+            kv_seq_lens=batch.kv_seq_lens,
             out_cache_loc=batch.out_cache_loc,
             image_inputs=batch.image_inputs,
             encoder_cached=batch.encoder_cached,
@@ -231,6 +236,7 @@ class ForwardBatch:
             encoder_lens_cpu=batch.encoder_lens_cpu,
             encoder_out_cache_loc=batch.encoder_out_cache_loc,
             seq_lens_sum=batch.seq_lens_sum,
+            kv_seq_lens_sum=batch.kv_seq_lens_sum,
             return_logprob=batch.return_logprob,
             top_logprobs_nums=batch.top_logprobs_nums,
             global_num_tokens=batch.global_num_tokens,
