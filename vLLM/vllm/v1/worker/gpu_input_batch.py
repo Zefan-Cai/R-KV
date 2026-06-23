@@ -39,6 +39,8 @@ class CachedRequestState:
 
     lora_request: Optional[LoRARequest] = None
 
+    num_dropped_tokens: Optional[int] = 0
+
     def __post_init__(self):
         self.num_prompt_tokens = len(self.prompt_token_ids)
 
@@ -273,6 +275,7 @@ class InputBatch:
         self.num_tokens_no_spec[req_index] = request.num_tokens
 
         self.num_computed_tokens_cpu[req_index] = request.num_computed_tokens
+        self.num_dropped_tokens_list_cpu[req_index] = request.num_dropped_tokens
         self.block_table.add_row(request.block_ids, req_index)
 
         sampling_params = request.sampling_params
@@ -499,6 +502,8 @@ class InputBatch:
                 last_req_index]
             self.num_computed_tokens_cpu[
                 empty_index] = self.num_computed_tokens_cpu[last_req_index]
+            self.num_dropped_tokens_list_cpu[
+                empty_index] = self.num_dropped_tokens_list_cpu[last_req_index]
             self.block_table.move_row(last_req_index, empty_index)
             self.temperature_cpu[empty_index] = self.temperature_cpu[
                 last_req_index]

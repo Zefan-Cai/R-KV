@@ -239,10 +239,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             device=self.device)
 
         # OPTIMIZATION: Cache the tensors rather than creating them every step.
-        self.arange_np = np.arange(max(self.max_num_reqs + 1,
-                                       self.max_model_len,
-                                       self.max_num_tokens),
-                                   dtype=np.int32)
+        # NOTE(R-KV): occupied_positions_np indexes into arange_np up to
+        # total_num_kv_cache_tokens, which is the sum of per-request KV cache
+        # sizes across the batch. With long contexts that grow past the
+        # compression budget this can exceed the usual per-step max_num_tokens,
+        # so size arange_np for the worst case max_model_len * max_num_reqs.
+        # See https://github.com/Zefan-Cai/R-KV/pull/25.
+        arange_size = max(self.max_num_reqs + 1,
+                          self.max_model_len,
+                          self.max_num_tokens,
+                          self.max_model_len * self.max_num_reqs)
+        self.arange_np = np.arange(arange_size, dtype=np.int32)
         # NOTE(woosuk): These tensors are "stateless", i.e., they are literally
         # a faster version of creating a new tensor every time. Thus, we should
         # not make any assumptions about the values in these tensors.
@@ -267,9 +274,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                                             pin_memory=self.pin_memory)
         self.slot_mapping_np = self.slot_mapping_cpu.numpy()
         self.occupied_slot_mapping_cpu = torch.zeros(
-                                            max(self.max_num_reqs + 1,
-                                                self.max_model_len,
-                                                self.max_num_tokens),
+                                            arange_size,
                                             dtype=torch.int32,
                                             device="cpu",
                                             pin_memory=self.pin_memory)
@@ -398,7 +403,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
             # Update the cached states.
             num_computed_tokens = req_data.num_computed_tokens
+            num_dropped_tokens = req_data.num_dropped_tokens
+
             req_state.num_computed_tokens = num_computed_tokens
+            req_state.num_dropped_tokens = num_dropped_tokens
             # Add the sampled token(s) from the previous step (if any).
             # This doesn't include "unverified" tokens like spec decode tokens.
             num_new_tokens = (num_computed_tokens +
@@ -431,7 +439,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.input_batch.num_computed_tokens_cpu[req_index] = (
                 num_computed_tokens)
             self.input_batch.num_dropped_tokens_list_cpu[req_index] = (
-                req_data.num_dropped_tokens)
+                num_dropped_tokens)
             self.input_batch.should_compress_list[req_index] = \
                 req_data.should_compress
             self.input_batch.block_table.append_row(req_data.new_block_ids,
