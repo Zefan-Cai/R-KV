@@ -1,0 +1,30 @@
+# R-KV on Mini-SGLang — dependency notes.
+#
+# R-KV itself is pure PyTorch and adds NO new dependencies: the algorithm
+# (rkv/algo.py) needs only `torch`, and the driver (rkv/integration.py) has no
+# runtime `minisgl` imports. So the dependency stack is simply upstream
+# Mini-SGLang's own, at the pinned commit this port targets:
+#
+#   sgl-project/mini-sglang @ 9a91cfafe754aa85daee49998176275667eb58f2
+#
+# Install Mini-SGLang from the patched tree that scripts/apply_rkv.sh produces
+# (see README.md), e.g. with uv:
+#
+#   scripts/apply_rkv.sh
+#   cd mini-sglang-src && uv venv --python=3.12 && source .venv/bin/activate
+#   uv pip install -e .
+#
+# The versions upstream declares at that commit (from its pyproject.toml) are
+# reproduced below for reference. They are the UPSTREAM-declared ranges, not an
+# independently GPU-verified pin for this port yet (end-to-end serving
+# validation is the open follow-up — see docs/IMPLEMENTATION.md).
+
+torch<2.10.0
+transformers>=4.56.0,<=4.57.3
+flashinfer-python>=0.5.3
+sgl_kernel>=0.3.17.post1
+apache-tvm-ffi>=0.1.4
+quack-kernels
+accelerate
+msgpack
+modelscope

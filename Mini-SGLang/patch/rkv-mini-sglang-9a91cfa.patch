@@ -1,0 +1,335 @@
+diff --git a/python/minisgl/attention/fa.py b/python/minisgl/attention/fa.py
+index ec17f37..ee705fa 100644
+--- a/python/minisgl/attention/fa.py
++++ b/python/minisgl/attention/fa.py
+@@ -69,7 +69,8 @@ class FlashAttentionBackend(BaseAttnBackend):
+ 
+         padded_size = len(reqs)
+         seqlens_q = [req.extend_len for req in reqs]
+-        seqlens_k = [req.device_len for req in reqs]
++        # kv_len: physical KV length (== device_len until R-KV drops tokens)
++        seqlens_k = [req.kv_len for req in reqs]
+         cached_lens = [req.cached_len for req in reqs]
+         max_seqlen_k = max(seqlens_k)
+         max_seqlen_q = max(seqlens_q)
+diff --git a/python/minisgl/attention/fi.py b/python/minisgl/attention/fi.py
+index f390137..e2448ed 100644
+--- a/python/minisgl/attention/fi.py
++++ b/python/minisgl/attention/fi.py
+@@ -192,7 +192,8 @@ class FlashInferBackend(BaseAttnBackend):
+ 
+         padded_size = len(reqs)
+         seqlens_q = [req.extend_len for req in reqs]
+-        seqlens_k = [req.device_len for req in reqs]
++        # kv_len: physical KV length (== device_len until R-KV drops tokens)
++        seqlens_k = [req.kv_len for req in reqs]
+         cached_lens = [req.cached_len for req in reqs]
+         max_seqlen_q = max(seqlens_q)
+         CPU_KWARGS = {"device": "cpu", "dtype": torch.int32, "pin_memory": True}
+@@ -212,7 +213,7 @@ class FlashInferBackend(BaseAttnBackend):
+             cu_seqlens_q_cpu=cu_seqlens_q_cpu,
+             cu_seqlens_k_cpu=cu_seqlens_k_cpu,
+             cu_seqlens_q_gpu=cu_seqlens_q_cpu.to(device, non_blocking=True),
+-            indices=torch.cat([page_table[req.table_idx, : req.device_len] for req in reqs]),
++            indices=torch.cat([page_table[req.table_idx, : req.kv_len] for req in reqs]),
+             last_page_len_cpu=self._get_ones_cpu(padded_size),
+             num_qo_heads=self.qo_head_local,
+             num_kv_heads=self.kv_head_local,
+diff --git a/python/minisgl/attention/trtllm.py b/python/minisgl/attention/trtllm.py
+index e780d54..32a77f1 100644
+--- a/python/minisgl/attention/trtllm.py
++++ b/python/minisgl/attention/trtllm.py
+@@ -93,7 +93,8 @@ class TensorRTLLMBackend(BaseAttnBackend):
+ 
+         padded_size = len(reqs)
+         seqlens_q = [req.extend_len for req in reqs]
+-        seqlens_k = [req.device_len for req in reqs]
++        # kv_len: physical KV length (== device_len until R-KV drops tokens)
++        seqlens_k = [req.kv_len for req in reqs]
+         cached_lens = [req.cached_len for req in reqs]
+         max_seqlen_k = max(seqlens_k)
+         max_seqlen_q = max(seqlens_q)
+diff --git a/python/minisgl/core.py b/python/minisgl/core.py
+index be4d643..f528889 100644
+--- a/python/minisgl/core.py
++++ b/python/minisgl/core.py
+@@ -8,6 +8,7 @@ import torch
+ 
+ if TYPE_CHECKING:
+     from minisgl.attention import BaseAttnBackend, BaseAttnMetadata
++    from minisgl.rkv import RKVCompressor
+     from minisgl.kvcache import BaseCacheHandle, BaseKVCachePool
+     from minisgl.moe import BaseMoeBackend
+ 
+@@ -39,6 +40,11 @@ class Req:
+         assert self.input_ids.is_cpu
+         self.device_len = len(self.input_ids)
+         self.max_device_len = len(self.input_ids) + self.output_len
++        # KV slots dropped by decode-time compression (R-KV). device_len /
++        # cached_len stay logical (token count, RoPE positions, stop
++        # condition); kv_len / kv_cached_len are the physical KV lengths
++        # used for page allocation, cache writes, and attention.
++        self.num_dropped_tokens = 0
+         assert 0 <= self.cached_len < self.device_len <= self.max_device_len
+ 
+     @property
+@@ -49,6 +55,14 @@ class Req:
+     def extend_len(self) -> int:
+         return self.device_len - self.cached_len
+ 
++    @property
++    def kv_len(self) -> int:
++        return self.device_len - self.num_dropped_tokens
++
++    @property
++    def kv_cached_len(self) -> int:
++        return self.cached_len - self.num_dropped_tokens
++
+     def complete_one(self) -> None:
+         self.cached_len = self.device_len
+         self.device_len += 1
+@@ -105,6 +119,9 @@ class Context:
+     attn_backend: BaseAttnBackend = field(init=False)
+     moe_backend: BaseMoeBackend = field(init=False)
+     kv_cache: BaseKVCachePool = field(init=False)
++    # R-KV decode-time KV cache compressor. None when R-KV is disabled.
++    # See minisgl.rkv.RKVCompressor.
++    rkv: "RKVCompressor | None" = field(default=None, init=False)
+     _batch: Batch | None = field(default=None, init=False)
+ 
+     @property
+diff --git a/python/minisgl/engine/config.py b/python/minisgl/engine/config.py
+index bbee54e..53c4b2e 100644
+--- a/python/minisgl/engine/config.py
++++ b/python/minisgl/engine/config.py
+@@ -30,6 +30,34 @@ class EngineConfig:
+     max_seq_len_override: int | None = None
+     num_page_override: int | None = None  # if not None, will override the number of pages
+ 
++    # R-KV decode-time KV cache compression (see minisgl.rkv).
++    # Defaults match the HuggingFace reference. The attention layer
++    # reads ``rkv_config`` to instantiate an ``RKVCompressor``; see
++    # ``docs/RKV.md`` for the wiring contract.
++    rkv_enabled: bool = False
++    rkv_budget: int = 1024
++    rkv_buffer: int = 128
++    rkv_window_size: int = 8
++    rkv_kernel_size: int = 7
++    rkv_mix_lambda: float = 0.07
++    rkv_retain_ratio: float = 0.1
++    rkv_retain_direction: str = "last"
++
++    @cached_property
++    def rkv_config(self):
++        from minisgl.rkv import RKVConfig
++
++        return RKVConfig(
++            enabled=self.rkv_enabled,
++            budget=self.rkv_budget,
++            buffer=self.rkv_buffer,
++            window_size=self.rkv_window_size,
++            kernel_size=self.rkv_kernel_size,
++            mix_lambda=self.rkv_mix_lambda,
++            retain_ratio=self.rkv_retain_ratio,
++            retain_direction=self.rkv_retain_direction,
++        )
++
+     @cached_property
+     def hf_config(self):
+         return cached_load_hf_config(self.model_path)
+diff --git a/python/minisgl/engine/engine.py b/python/minisgl/engine/engine.py
+index ea29a96..94015bd 100644
+--- a/python/minisgl/engine/engine.py
++++ b/python/minisgl/engine/engine.py
+@@ -79,6 +79,22 @@ class Engine:
+         if config.model_config.is_moe:
+             self.ctx.moe_backend = self.moe_backend = create_moe_backend(config.moe_backend)
+ 
++        # ======================= R-KV compressor initialization ========================
++        if config.rkv_enabled:
++            from minisgl.rkv import RKVCompressor
++
++            self.ctx.rkv = RKVCompressor(
++                config=config.rkv_config,
++                num_layers=config.model_config.num_layers,
++            )
++            # CUDA graph replay bypasses the Python compression hooks in
++            # AttentionLayer.forward, so any captured decode batch size would
++            # silently skip R-KV. Graph capture is force-disabled below.
++            logger.info_rank0(
++                "R-KV is enabled; CUDA graph capture is force-disabled "
++                "(graph replay would silently skip the compression hooks)."
++            )
++
+         # ======================= Sampler initialization ========================
+         self.sampler = Sampler(self.device, config.model_config.vocab_size)
+ 
+@@ -101,8 +117,8 @@ class Engine:
+             device=self.device,
+             model=self.model,
+             attn_backend=self.attn_backend,
+-            cuda_graph_bs=config.cuda_graph_bs,
+-            cuda_graph_max_bs=config.cuda_graph_max_bs,
++            cuda_graph_bs=[] if config.rkv_enabled else config.cuda_graph_bs,
++            cuda_graph_max_bs=0 if config.rkv_enabled else config.cuda_graph_max_bs,
+             free_memory=init_free_memory,
+             max_seq_len=aligned_max_seq_len,
+             vocab_size=config.model_config.vocab_size,
+diff --git a/python/minisgl/layers/attention.py b/python/minisgl/layers/attention.py
+index 7cd3ff6..ba51fa0 100644
+--- a/python/minisgl/layers/attention.py
++++ b/python/minisgl/layers/attention.py
+@@ -53,5 +53,28 @@ class AttentionLayer(StateLessOP):
+             self.k_norm.forward_inplace(k.view(-1, self.num_kv_heads, self.head_dim))
+         q, k = self.rotary.forward(ctx.batch.positions, q, k)
+         q = q.view(-1, self.num_qo_heads, self.head_dim)
++        if ctx.rkv is not None and ctx.rkv.is_enabled:
++            ctx.rkv.update_query_buffer(q, ctx.batch, self.layer_id)
+         o = ctx.attn_backend.forward(q, k, v, self.layer_id, ctx.batch)
++        if ctx.rkv is not None and ctx.rkv.is_enabled and ctx.batch.is_decode:
++            # Compress this layer's cache in place after attention has
++            # already attended over the full cache. The shorter
++            # device_len takes effect on the next scheduler step.
++            # Use the global page table (indexed by req.table_idx): backend
++            # metadata does not uniformly expose per-batch slot rows (the
++            # FlashInfer FIMetadata has no page_table attribute).
++            new_lens = ctx.rkv.maybe_compress(
++                self.layer_id,
++                ctx.kv_cache,
++                ctx.page_table,
++                ctx.batch,
++            )
++            if new_lens is not None and self.layer_id == ctx.rkv.num_layers - 1:
++                # Only the last layer mutates request state, so all
++                # layers see the same source_len during this step.
++                # device_len/cached_len stay logical (positions, stop
++                # condition); only the physical KV length shrinks.
++                for req, new_len in zip(ctx.batch.padded_reqs, new_lens):
++                    if new_len < req.kv_len:
++                        req.num_dropped_tokens += req.kv_len - new_len
+         return o.view(-1, self.qo_attn_dim)
+diff --git a/python/minisgl/scheduler/cache.py b/python/minisgl/scheduler/cache.py
+index abe42ba..1e21e0a 100644
+--- a/python/minisgl/scheduler/cache.py
++++ b/python/minisgl/scheduler/cache.py
+@@ -43,8 +43,11 @@ class CacheManager:
+         needed_pages = 0
+         allocation_info: List[Tuple[int, int, int]] = []
+         for req in reqs:
+-            first_page = div_ceil(req.cached_len, self.page_size)
+-            last_page = div_ceil(req.device_len, self.page_size)
++            # Physical lengths: R-KV compression compacts a request's KV
++            # into the first kv_len slots, so new slots are allocated at
++            # the physical frontier, not the logical token count.
++            first_page = div_ceil(req.kv_cached_len, self.page_size)
++            last_page = div_ceil(req.kv_len, self.page_size)
+             if last_page > first_page:
+                 needed_pages += last_page - first_page
+                 allocation_info.append((req.table_idx, first_page, last_page))
+@@ -64,6 +67,15 @@ class CacheManager:
+         # [cached_len, new_handle.cached_len)       This part is newly inserted into the prefix cache.
+         # [new_handle.cached_len, req.cached_len)   This part is tailing part that can not inserted into the prefix cache.
+         #                                           We should free it if the request has finished.
++        if req.num_dropped_tokens > 0:
++            # Compressed KV no longer represents the verbatim prefix: never
++            # insert it into the prefix cache. The live physical slots are
++            # the compacted [0, kv_cached_len) region; the dropped tail
++            # slots were already returned via drain_pending_free_slots().
++            self.unlock(req.cache_handle)
++            assert finished, "compression only happens to decoding requests"
++            self._free(self.page_table[req.table_idx, : req.kv_cached_len])
++            return
+         insert_ids = req.input_ids[: req.cached_len]
+         page_indices = self.page_table[req.table_idx, : req.cached_len]
+         old_handle = req.cache_handle
+diff --git a/python/minisgl/scheduler/scheduler.py b/python/minisgl/scheduler/scheduler.py
+index d0c08d8..1f9bfa1 100644
+--- a/python/minisgl/scheduler/scheduler.py
++++ b/python/minisgl/scheduler/scheduler.py
+@@ -56,8 +56,16 @@ class Scheduler(SchedulerIOMixin):
+ 
+         # initialize other managers
+         self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
++        cache_type = config.cache_type
++        if config.rkv_enabled and cache_type != "naive":
++            # R-KV rewrites cached pages in place, which would corrupt
++            # prefix-cache branches shared with other requests.
++            logger.info_rank0(
++                f"R-KV is enabled; forcing cache_type='naive' (was '{cache_type}')."
++            )
++            cache_type = "naive"
+         self.cache_manager = CacheManager(
+-            self.engine.num_pages, config.page_size, self.engine.page_table, config.cache_type
++            self.engine.num_pages, config.page_size, self.engine.page_table, cache_type
+         )
+         self.decode_manager = DecodeManager(config.page_size)
+         self.prefill_manager = PrefillManager(
+@@ -200,6 +208,8 @@ class Scheduler(SchedulerIOMixin):
+     def _free_req_resources(self, req: Req) -> None:
+         self.table_manager.free(req.table_idx)
+         self.cache_manager.cache_req(req, finished=True)
++        if self.engine.ctx.rkv is not None:
++            self.engine.ctx.rkv.drop_request(req.uid)
+ 
+     def _prepare_batch(self, batch: Batch) -> ForwardInput:
+         self.engine.graph_runner.pad_batch(batch)
+@@ -207,7 +217,14 @@ class Scheduler(SchedulerIOMixin):
+         batch.positions = _make_positions(batch, self.device)
+         input_mapping = _make_input_tuple(batch, self.device)
+         write_mapping = _make_write_tuple(batch, self.device)
+-        batch.out_loc = self.engine.page_table[input_mapping]
++        # Token ids live at logical positions (token_pool), but KV slots are
++        # compacted by R-KV compression: look up out_loc with physical slot
++        # positions, which equal the logical ones until tokens are dropped.
++        slot_positions = _make_slot_positions(batch, self.device)
++        if slot_positions is None:
++            batch.out_loc = self.engine.page_table[input_mapping]
++        else:
++            batch.out_loc = self.engine.page_table[input_mapping[0], slot_positions]
+         self.engine.attn_backend.prepare_metadata(batch)
+         return ForwardInput(
+             batch=batch,
+@@ -230,6 +247,13 @@ class Scheduler(SchedulerIOMixin):
+         forward_output = self.engine.forward_batch(batch, sample_args)
+         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
+         self.decode_manager.filter_reqs(forward_input.batch.reqs)
++        if self.engine.ctx.rkv is not None:
++            # Return any slots dropped by R-KV compression in this
++            # forward pass to the cache manager so other requests can
++            # allocate them.
++            freed = self.engine.ctx.rkv.drain_pending_free_slots()
++            if freed is not None and len(freed) > 0:
++                self.cache_manager._free(freed)
+         return forward_output
+ 
+ 
+@@ -249,6 +273,29 @@ def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
+     return indices_host.to(device, non_blocking=True)
+ 
+ 
++def _make_slot_positions(batch: Batch, device: torch.device) -> torch.Tensor | None:
++    """Physical page-table positions for the tokens processed this step.
++
++    Returns None when no request has compression-dropped tokens, in which
++    case the logical ``batch.positions`` can be used directly.
++    """
++    if all(r.num_dropped_tokens == 0 for r in batch.padded_reqs):
++        return None
++    needed_size = sum(r.extend_len for r in batch.padded_reqs)
++    indices_host = torch.empty(needed_size, dtype=torch.int64, pin_memory=True)
++    offset = 0
++    for req in batch.padded_reqs:
++        length = req.extend_len
++        torch.arange(
++            req.kv_cached_len,
++            req.kv_len,
++            dtype=torch.int64,
++            out=indices_host[offset : offset + length],
++        )
++        offset += length
++    return indices_host.to(device, non_blocking=True)
++
++
+ def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:
+     mapping_host = torch.empty(len(batch.positions), dtype=torch.int64, pin_memory=True)
+     offset = 0
