@@ -56,4 +56,25 @@ DeepSeek-R1-Distill-Qwen-1.5B, all 30 AIME-2024 problems, chat
 template, max_length 16384, temperature 0.6 / top-p 0.95, seed 42,
 **single candidate per problem** — a pipeline-sanity reference, not a
 paper reproduction (the paper reports 8B/14B models with 64 candidates
-averaged). See the metrics JSONs for scores.
+averaged at 32K max length).
+
+| method | acc | mean output tokens | truncated at 16K cap |
+|---|---:|---:|---:|
+| FullKV | 20.0 (6/30) | 11165 | 13/30 |
+| R-KV budget=1024 | 10.0 (3/30) | 13946 | 20/30 |
+
+Reading notes:
+
+- Single-candidate n=30 has ±~8-point noise; official pass@1 for this
+  model is 28.9 at 32K with many candidates, so 20.0 FullKV at a 16K cap
+  (which truncates 13/30 generations mid-reasoning) is in the expected
+  band.
+- The R-KV run illustrates the compression/length interaction discussed
+  in issues #8 and #11 rather than a quality verdict: with budget=1024
+  (≈7% of a 15K trace) the model re-derives forgotten context, outputs
+  get ~25% longer, 20/30 hit the hard 16K cap, and truncated answers
+  score 0. The paper's lossless AIME operating points for the *8B* model
+  are budget ≥1536 or ≥10% ratio at 32K max length; reproducing those
+  requires the bigger model, the longer cap, and candidate averaging.
+- Both runs produced fluent, method-dependent outputs end-to-end (unlike
+  the pre-fix GSM8K evaluations, which scored a frozen stale field).
