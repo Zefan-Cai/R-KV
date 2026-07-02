@@ -31,6 +31,56 @@ budget. See [`benchmark/RESULTS_math7b.md`](benchmark/RESULTS_math7b.md).
 
 ---
 
+## Independent verification (2026-07-01)
+
+The port was independently verified against this repo's reference
+implementation before being published here:
+
+- **Cross-repo bit-level parity** —
+  [`tests/test_cross_repo_parity.py`](tests/test_cross_repo_parity.py) feeds
+  identical random tensors through the port's `R1KV` (`rkv/algo.py`) and the
+  repo-root reference (`rkv/compression/r1_kv.py`): `update_kv` outputs, the
+  attention/similarity primitives, and `select_indices` selections are
+  **bit-for-bit identical** across MHA, Qwen2.5-7B/0.5B GQA shapes, batch>1,
+  fp32/bf16, and below-budget no-op cases.
+- **GPU rerun at n=100** — GSM8K few-shot, first 100 items,
+  Qwen2.5-Math-7B-Instruct, 1×A100-80G, `temperature=0`:
+
+  | Config | Accuracy (100) | Throughput | Compactions |
+  | --- | --- | --- | --- |
+  | baseline (eager, R-KV off) | **91.0%** | 49.2 tok/s | 0 |
+  | R-KV budget=512 | **90.0%** | 44.2 tok/s | 1012 |
+  | R-KV budget=256 | 89.0% | 42.4 tok/s | 1138 |
+  | R-KV budget=512, 8 concurrent | **90.0%** | **181.8 tok/s** | 1007 |
+
+  Accuracy holds within noise (±~3 pts at n=100) even with the budget below
+  the few-shot prompt length, and the batch path keeps identical accuracy at
+  4.1× throughput. Details:
+  [`benchmark/RESULTS_a100_n100.md`](benchmark/RESULTS_a100_n100.md).
+
+Two correctness fixes found during verification are included here on top of
+the ported source (`wanke1997/sglang-compress` @ `9ed5f084`):
+
+1. **Rotary position off-by-one** (`rkv/integration.py`,
+   `override_decode_positions`): the override used
+   `len(origin_input_ids) + len(output_ids)`, but at forward time the
+   just-sampled token is already in `output_ids`, so the current token's
+   0-based position is that count **minus one** (baseline:
+   `clamp_position(seq_lens) = seq_lens - 1`). Without the fix every
+   R-KV-managed decode token was rotated at `position + 1` from the first
+   decode step — a uniform shift that measurably did not hurt GSM8K accuracy
+   (89 vs 90 at n=100), but made `--enable-rkv` non-equivalent to baseline
+   even before any compression fires.
+2. **Startup validation** (in the wiring patch, `server_args.py`,
+   `_handle_rkv_validation`): `--enable-rkv` now rejects configurations the
+   port's memory safety depends on but previously did not enforce (radix
+   cache on, decode CUDA graph on, overlap schedule on, `page_size > 1`,
+   `tp_size > 1`) instead of silently corrupting the KV pool; plus
+   `RKVConfig` guard asserts (`buffer_size >= window_size`,
+   `min_seq_len >= budget`) and docstring corrections.
+
+---
+
 ## Why a patch, not a fork?
 
 R-KV touches SGLang in a **tiny, purely additive** way: one self-contained
@@ -121,9 +171,10 @@ The algorithm and integration logic have GPU-free CPU unit tests:
 ```bash
 python3 tests/test_rkv_algo.py           # 4 tests — algorithm parity vs reference
 python3 tests/test_rkv_integration.py    # 9 tests — compaction, lifecycle, batch>=2
+python3 tests/test_cross_repo_parity.py  # bit-level parity vs this repo's rkv/ reference
 ```
 
-Both should print `OK`.
+All should print `OK` / `ALL PARITY CHECKS PASSED`.
 
 ### Step 4 — Launch a server with R-KV on
 

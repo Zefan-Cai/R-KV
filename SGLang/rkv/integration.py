@@ -58,8 +58,13 @@ logger = logging.getLogger(__name__)
 class RKVConfig:
     """Hyper-parameters for R-KV compression.
 
-    Defaults mirror the R-KV reference (``budget=1024``); ``buffer_size`` is the
-    staging buffer ``B_buffer`` that controls how often compression fires.
+    ``budget=1024`` is a serving-oriented default (the R-KV reference class and
+    its HF eval scripts use ``budget=128``); ``buffer_size`` is the staging
+    buffer ``B_buffer`` that controls how often compression fires. Note the
+    reference HF eval scripts run ``mix_lambda=0.1, retain_ratio=0.2`` while the
+    reference class defaults are ``mix_lambda=0.07, retain_ratio=0.1``; override
+    via the ``--rkv-*`` flags / ``--rkv-config`` to match a specific
+    configuration exactly.
     """
 
     budget: int = 1024
@@ -78,6 +83,13 @@ class RKVConfig:
         if self.min_seq_len is None:
             self.min_seq_len = self.budget
         assert self.budget > self.window_size, "budget must exceed window_size"
+        assert self.buffer_size >= self.window_size, (
+            "buffer_size must be >= window_size, otherwise the first compaction "
+            "scores against zero-initialized queries in the observation window"
+        )
+        assert self.min_seq_len >= self.budget, (
+            "min_seq_len must be >= budget (select_indices keeps budget tokens)"
+        )
 
 
 class RKVRequestState:
@@ -492,7 +504,12 @@ class RKVCompressor:
         for i in range(req_indices.shape[0]):
             st = self.states.get(int(req_indices[i].item()))
             if st is not None and st.req is not None:
-                forward_batch.positions[i] = self.logical_position(st.req)
+                # logical_position() counts all tokens seen so far INCLUDING the
+                # token being decoded this step (it was appended to output_ids
+                # when it was sampled), so the current token's 0-based rotary
+                # position is that count minus one — for an un-compacted request
+                # this equals the baseline clamp_position(seq_lens) = seq_lens-1.
+                forward_batch.positions[i] = self.logical_position(st.req) - 1
 
 
 # ---------------------------------------------------------------------------

@@ -126,9 +126,15 @@ python Nano-vLLM/tests/test_rkv_algorithm.py
 # Mini-SGLang port — same algorithm tests plus disabled-compressor /
 # drop_request / drain_pending_free_slots integration coverage.
 PYTHONPATH=Mini-SGLang/python python Mini-SGLang/tests/misc/test_rkv_algorithm.py
+
+# SGLang port — algorithm parity, compaction/lifecycle/batch integration, and
+# cross-repo bit-level parity against this repo's rkv/ reference.
+python SGLang/tests/test_rkv_algo.py
+python SGLang/tests/test_rkv_integration.py
+python SGLang/tests/test_cross_repo_parity.py
 ```
 
-Both run on CPU without a GPU and exercise the exact `R1KV` class used at runtime.
+All run on CPU without a GPU and exercise the exact `R1KV` class used at runtime.
 
 ## Overview
 
