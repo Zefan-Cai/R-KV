@@ -1,5 +1,6 @@
-"""SGLang (0.4.3.post1 fork) R-KV smoke: Qwen2.5-0.5B-Instruct,
-triton backend, cuda graph off. Toggle with RKV_ON=0/1; BATCH=1/2.
+"""SGLang (v0.5.14 port) R-KV smoke: Qwen2.5-0.5B-Instruct, FlashInfer
+backend, eager decode. R-KV requires radix cache / cuda graph / overlap off and
+page_size=1 (enforced at startup). Toggle with RKV_ON=0/1; BATCH=1/2.
 Needs a __main__ guard: sglang launches subprocesses via mp spawn."""
 import os
 import sys
@@ -22,17 +23,21 @@ def main():
     kwargs = dict(
         model_path=MODEL,
         dtype="bfloat16",
-        attention_backend="triton",
+        attention_backend="flashinfer",
         mem_fraction_static=0.25,
         disable_cuda_graph=True,
+        # R-KV frees KV slots mid-generation; these are required (enforced by
+        # the port's ServerArgs validation) and eager-only.
+        disable_radix_cache=True,
+        disable_overlap_schedule=True,
+        page_size=1,
     )
     if RKV_ON:
         kwargs.update(
-            compress_algorithm="RKV",
-            compress_max_window=8,
-            compress_max_prompt=32,
-            compress_divide_length=16,
-            compress_divide_method="step_length",
+            enable_rkv=True,
+            rkv_budget=128,
+            rkv_window_size=8,
+            rkv_buffer_size=16,
         )
 
     t0 = time.time()
@@ -41,7 +46,7 @@ def main():
 
     prompts = [PROMPT] * BATCH
     t0 = time.time()
-    outputs = llm.generate(prompts, {"temperature": 0, "max_new_tokens": 128})
+    outputs = llm.generate(prompts, {"temperature": 0, "max_new_tokens": 256})
     gen_s = time.time() - t0
 
     if isinstance(outputs, dict):
