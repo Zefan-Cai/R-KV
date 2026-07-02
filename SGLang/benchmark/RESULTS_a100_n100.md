@@ -41,10 +41,11 @@ this port against the repo's reference implementation before publishing.
    points). Even `budget=256` (≈ one quarter of the peak KV) loses only 2
    points. ~1000 physical compactions per sweep, zero crashes, no
    leak-checker aborts at idle.
-2. **The H100 n=20 numbers reproduce in trend, not in letter.** The n=20
-   "100% vs 95%" (serial) result was small-sample luck, as its own caveat
-   admitted; at n=100 the honest statement is *parity within noise* (90 vs
-   91).
+2. **The H100 n=20 numbers reproduce in trend, not in letter.** The original
+   pre-fix n=20 run showed an optimistic "100% vs 95%" (serial) that was
+   small-sample luck; the post-fix n=20 re-run is a flat 95% (see
+   [`RESULTS_math7b.md`](./RESULTS_math7b.md)), and at n=100 here the honest
+   statement is *parity within noise* (90 vs 91).
 3. **The rotary off-by-one fix does not change GSM8K accuracy** (89 → 90 is
    one item, well within noise) — consistent with a uniform +1 position shift
    of all decode tokens being nearly invisible to relative-position attention.
