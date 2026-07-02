@@ -23,56 +23,59 @@ First measurements of the R-KV port, taken during phase-1 bring-up.
 ## Accuracy vs budget — Qwen2.5-Math-7B-Instruct (headline)
 
 Strong math model, so accuracy differences are signal, not noise. 20 items,
-few-shot prompt ~700 tokens, `window=8, buffer=16`, `max_new_tokens=512`.
+few-shot prompt ~700 tokens, `window=8, buffer=16`, `max_new_tokens=512`
+(re-run 2026-07-02, post rotary off-by-one fix).
 
 | Config | Accuracy (20) | Compactions | Notes |
 | --- | --- | --- | --- |
 | baseline (R-KV off) | 95% (19/20) | — | reference |
-| R-KV budget=512 | **100% (20/20)** | 184 | on par / +1, heavy eviction |
-| R-KV budget=256 | 90% (18/20) | 241 | most aggressive, slight drop |
+| R-KV budget=512 | **95% (19/20)** | ~230 | on par with baseline, heavy eviction |
+| R-KV budget=256 | **95% (19/20)** | 227 | most aggressive, still on par |
 
 **Headline takeaway.** Even though `budget=512 < prompt (~700)` — so R-KV evicts
-part of the few-shot prompt itself — accuracy is **fully preserved (100%)**,
-confirming the "keep important + recent" selection retains what matters. Only at
-`budget=256` does it dip (−5%). 184–241 physical compactions ran per sweep with
-the server never crashing.
+part of the few-shot prompt itself — accuracy is **identical to the baseline
+(95%)**, confirming the "keep important + recent" selection retains what matters.
+Even at `budget=256` there is **no drop**. ~227–230 physical compactions ran per
+sweep with the server never crashing. (Full report:
+[`RESULTS_math7b.md`](./RESULTS_math7b.md).)
 
 ## Accuracy vs budget — Qwen2.5-0.5B-Instruct (weak model, noisy)
 
+20 items (re-run 2026-07-02, post rotary off-by-one fix).
+
 | Config | Accuracy (20) | Compactions | Notes |
 | --- | --- | --- | --- |
-| baseline (R-KV off) | 35% (7/20) | — | reference |
-| R-KV budget=1024 | 35% (7/20) | ~0 | ≥ prompt+gen, almost no eviction ⇒ == baseline |
-| R-KV budget=512 | 40% (8/20) | 442 | heavy eviction, accuracy preserved |
-| R-KV budget=256 | 30% (6/20) | 482 | most aggressive, accuracy starts to drop |
+| baseline (R-KV off) | 30% (6/20) | — | reference |
+| R-KV budget=512 | 35% (7/20) | 386 | heavy eviction, accuracy preserved |
+| R-KV budget=256 | 35% (7/20) | 509 | most aggressive, still within noise |
 
-**Takeaway.** Accuracy is monotone and well-behaved in `budget`: at
-`budget ≥ 512` it matches the baseline within noise; only at `budget=256` does it
-start to degrade. This is exactly the expected behaviour of a KV compressor —
-lossless while the budget is large enough, lossy only when squeezed too hard.
-Crucially, the server ran **hundreds of physical compactions (freeing slots)
-without crashing**, confirming the eviction / free / `req_to_token` rewrite /
-rotary-decoupling are correct.
+**Takeaway.** On this weak *non-math* model the absolute accuracy is low and
+noisy (±5% per item), but R-KV is well-behaved: at both `budget=512` and
+`budget=256` it matches the baseline within noise (indeed marginally above).
+This is the expected behaviour of a KV compressor — lossless while the budget is
+large enough. Crucially, the server ran **hundreds of physical compactions
+(freeing slots) without crashing**, confirming the eviction / free /
+`req_to_token` rewrite / rotary-decoupling are correct.
 
-## Speed (fair, same eager config; serial batch=1)
+## Speed — Qwen2.5-0.5B-Instruct (fair, same eager config; serial batch=1)
 
-| Config | Wall (20) | avg tok | Throughput | Relative |
+| Config | Wall (20) | avg tok | Throughput | Notes |
 | --- | --- | --- | --- | --- |
-| baseline (CUDA graph, prod-like) | ~10s | 377 | ~750 tok/s | reference |
-| baseline (eager, fair) | 61s | 363 | **119 tok/s** | isolates CUDA-graph loss |
-| R-KV budget=512 | 81s | 366 | **90 tok/s** | 442 compactions |
-| R-KV budget=256 | 90s | 399 | **89 tok/s** | 482 compactions |
+| baseline (eager, fair) | 60.7s | 363 | **119.6 tok/s** | reference |
+| R-KV budget=512 | 72.3s | 320 | **88.6 tok/s** | 386 compactions |
+| R-KV budget=256 | 95.1s | 420 | **88.3 tok/s** | 509 compactions |
 
-**Two layers of cost:**
+**R-KV compaction overhead** (same eager path, only `--enable-rkv` differs):
+119.6 → 88.6 tok/s, **≈ 26% slower** — consistent with the Math-7B measurement
+(~28%). Source: every `buffer_size` steps R-KV reads back all layers' KV,
+computes an O(budget²) key-similarity, and relocates slots — all synchronous on
+the eager path.
 
-1. **R-KV compaction overhead** (same eager path, only `--enable-rkv` differs):
-   119 → 90 tok/s, **≈ 24% slower**. Source: every `buffer_size` steps R-KV
-   reads back all layers' KV, computes an O(budget²) key-similarity, and
-   relocates slots — all synchronous on the eager path.
-2. **Loss of CUDA graph** (implicit, larger): R-KV must run eager, while the
-   production baseline uses CUDA graph (~750 tok/s). So versus a *production*
-   baseline, most of the end-to-end slowdown comes from losing CUDA graph, not
-   from the compaction itself.
+**Loss of CUDA graph** (implicit, larger): R-KV must run eager, while a
+production baseline uses CUDA graph. So versus a *production* baseline, most of
+the end-to-end slowdown comes from losing CUDA graph, not from the compaction
+itself — see the Math-7B `concurrency=8` result (272 tok/s) for how batching
+amortizes the eager overhead.
 
 ## Caveat: this scenario is cost-only for R-KV
 

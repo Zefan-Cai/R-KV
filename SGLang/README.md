@@ -23,11 +23,16 @@ GSM8K-style math harness, first 20 items, **8 concurrent requests** (server-side
 | Config | Accuracy | KV compactions |
 | --- | --- | --- |
 | baseline (R-KV off) | 95% | — |
-| **R-KV, budget=512** | **95% (19/20)** | **188** |
+| **R-KV, budget=512** | **95% (19/20)** | **~235** |
 
-R-KV kept full accuracy while running **188 physical KV compactions with zero
+R-KV kept full accuracy while running **~235 physical KV compactions with zero
 crashes**, each shrinking a request from ~700+ tokens back to the 512-token
 budget. See [`benchmark/RESULTS_math7b.md`](benchmark/RESULTS_math7b.md).
+
+**Data parallel** (`DP=N ./benchmark/launch_server.sh rkv 512`, plain DP with
+`tp=1`) is validated: each replica runs its own R-KV over a disjoint request set,
+and throughput scales up to **5.2× on 8× H100** with unchanged accuracy — see
+[`benchmark/RESULTS_dp.md`](benchmark/RESULTS_dp.md).
 
 ---
 
