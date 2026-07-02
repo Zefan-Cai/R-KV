@@ -267,7 +267,8 @@ server configuration (all set for you by `launch_server.sh`):
 | `batch = 1`, `tp = 1`, `dp = 1` | ✅ validated |
 | `batch > 1` (`tp = 1`, `dp = 1`) | ✅ validated (per-request triggering) |
 | Tensor parallel (`tp ≥ 2`) | ❌ **not supported — silently incorrect** without a cross-rank score all-reduce (see [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §11.2). Do not combine `--enable-rkv` with `--tp > 1`. |
-| Data parallel (`dp ≥ 2`) | ❌ untested |
+| Data parallel — plain (`dp ≥ 2`, `tp = 1`) | ✅ validated — each replica runs its own R-KV over a disjoint request set; throughput scales up to 5.2× on 8× H100 (see [`benchmark/RESULTS_dp.md`](benchmark/RESULTS_dp.md)) |
+| DP attention (`--enable-dp-attention`) | ❌ untested — implies `tp > 1` (currently blocked at startup); padded `forward_batch` layout unverified |
 | CUDA-graph decode | ❌ eager only (phase 1) |
 
 ---
