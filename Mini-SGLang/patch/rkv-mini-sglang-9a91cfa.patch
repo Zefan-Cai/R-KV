@@ -243,7 +243,7 @@ index abe42ba..1e21e0a 100644
          page_indices = self.page_table[req.table_idx, : req.cached_len]
          old_handle = req.cache_handle
 diff --git a/python/minisgl/scheduler/scheduler.py b/python/minisgl/scheduler/scheduler.py
-index d0c08d8..1f9bfa1 100644
+index d0c08d8..8eb1194 100644
 --- a/python/minisgl/scheduler/scheduler.py
 +++ b/python/minisgl/scheduler/scheduler.py
 @@ -56,8 +56,16 @@ class Scheduler(SchedulerIOMixin):
@@ -264,7 +264,22 @@ index d0c08d8..1f9bfa1 100644
          )
          self.decode_manager = DecodeManager(config.page_size)
          self.prefill_manager = PrefillManager(
-@@ -200,6 +208,8 @@ class Scheduler(SchedulerIOMixin):
+@@ -119,7 +127,13 @@ class Scheduler(SchedulerIOMixin):
+ 
+     @torch.inference_mode()
+     def run_forever(self) -> NoReturn:
+-        if ENV.DISABLE_OVERLAP_SCHEDULING:
++        # R-KV mutates the KV cache in place during the forward and frees slots
++        # for reuse; overlap scheduling runs the next step on a separate stream
++        # and races with those in-place writes -> KV corruption (degenerate /
++        # looping output) or a CUDA illegal-access crash. Force the non-overlap
++        # loop when R-KV is enabled, mirroring the CUDA-graph force-disable in
++        # Engine.__init__.
++        if ENV.DISABLE_OVERLAP_SCHEDULING or self.engine.ctx.rkv is not None:
+             with self.engine_stream_ctx:
+                 self.engine.stream.wait_stream(self.stream)
+                 while True:
+@@ -200,6 +214,8 @@ class Scheduler(SchedulerIOMixin):
      def _free_req_resources(self, req: Req) -> None:
          self.table_manager.free(req.table_idx)
          self.cache_manager.cache_req(req, finished=True)
@@ -273,7 +288,7 @@ index d0c08d8..1f9bfa1 100644
  
      def _prepare_batch(self, batch: Batch) -> ForwardInput:
          self.engine.graph_runner.pad_batch(batch)
-@@ -207,7 +217,14 @@ class Scheduler(SchedulerIOMixin):
+@@ -207,7 +223,14 @@ class Scheduler(SchedulerIOMixin):
          batch.positions = _make_positions(batch, self.device)
          input_mapping = _make_input_tuple(batch, self.device)
          write_mapping = _make_write_tuple(batch, self.device)
@@ -289,7 +304,7 @@ index d0c08d8..1f9bfa1 100644
          self.engine.attn_backend.prepare_metadata(batch)
          return ForwardInput(
              batch=batch,
-@@ -230,6 +247,13 @@ class Scheduler(SchedulerIOMixin):
+@@ -230,6 +253,13 @@ class Scheduler(SchedulerIOMixin):
          forward_output = self.engine.forward_batch(batch, sample_args)
          self.token_pool[output_mapping] = forward_output.next_tokens_gpu
          self.decode_manager.filter_reqs(forward_input.batch.reqs)
@@ -303,7 +318,7 @@ index d0c08d8..1f9bfa1 100644
          return forward_output
  
  
-@@ -249,6 +273,29 @@ def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
+@@ -249,6 +279,29 @@ def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
      return indices_host.to(device, non_blocking=True)
  
  

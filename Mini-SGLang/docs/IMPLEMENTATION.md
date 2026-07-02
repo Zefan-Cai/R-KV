@@ -35,7 +35,7 @@ what R-KV changes on top of a known-good upstream commit.
 | `core.py` | `ctx.rkv` field + `Req.num_dropped_tokens` / derived `Req.kv_len = device_len - num_dropped_tokens` |
 | `layers/attention.py` | `AttentionLayer.forward` calls `update_query_buffer` before attention and `maybe_compress` after (decode only), with the last-layer `num_dropped_tokens` guard |
 | `scheduler/cache.py` | Page allocation at the **physical** frontier (`kv_len` / `kv_cached_len`); do not insert compressed pages into the prefix cache |
-| `scheduler/scheduler.py` | Drain `drain_pending_free_slots()` back to the cache manager after each forward; call `drop_request(uid)` on finished requests |
+| `scheduler/scheduler.py` | Drain `drain_pending_free_slots()` back to the cache manager after each forward; call `drop_request(uid)` on finished requests; **force the non-overlap scheduler loop when `rkv_enabled`** (overlap's separate stream races with the in-place compaction) |
 | `attention/{fa,fi,trtllm}.py` | Read the physical `kv_len` for `cache_seqlens` / slot rows |
 
 ## 3. Per-step compression schedule
@@ -68,6 +68,12 @@ other requests can reuse them on the next step.
   disable) — only `cuda_graph_max_bs=0` disables capture. The engine
   force-disables capture whenever `rkv_enabled=True`, since graph replay would
   silently skip the Python compression hooks.
+- **Overlap scheduling off.** R-KV mutates the KV cache in place mid-forward and
+  frees slots for reuse; the overlap scheduler runs the next step on a **separate
+  CUDA stream** and races with those in-place writes → KV corruption (degenerate/
+  looping output) or a CUDA illegal-access crash. The scheduler force-disables
+  the overlap loop when `rkv_enabled` (mirroring the CUDA-graph force-disable).
+  *Found and fixed via GPU validation, 2026-07-02.*
 - **`page_size = 1`.** `maybe_compress` slot resolution assumes it (matches
   Mini-SGLang's default); `page_size > 1` needs page-index × `page_size` scaling.
 - **No prefix reuse of compressed pages.** Compressed pages no longer represent
@@ -100,5 +106,9 @@ python3 tests/test_rkv_algorithm.py
   (disabled-noop, `drop_request`, `drain_pending_free_slots`).
 - [x] `EngineConfig.rkv_*` knobs + `ctx.rkv` + `AttentionLayer` wiring — patch
   applies cleanly to the pinned upstream and imports resolve.
-- [ ] **End-to-end GPU serve run** — the open follow-up (no functional blocker;
-  the wiring mirrors the GPU-validated SGLang port).
+- [x] **End-to-end GPU serve run** — validated 2026-07-02 on Qwen2.5-Math-7B
+  (FlashInfer, budget 256/512, batched=8): accuracy matches the baseline (7/8),
+  compaction fires (140–1120×), no crash. This surfaced and fixed a concurrency
+  bug — **overlap scheduling is now force-disabled when R-KV is on** (§4); the
+  algorithm / compaction logic itself was already correct (it matched the
+  baseline even before the fix under `CUDA_LAUNCH_BLOCKING=1`).

@@ -72,7 +72,8 @@ Mini-SGLang's own at that commit (see `requirements-rkv.txt`).
 | `page_size > 1` | ❌ slot resolution assumes `page_size = 1` |
 | Prefix-cache reuse of compressed pages | ❌ compressed pages are not the verbatim prefix |
 | Tensor parallel (`tp > 1`) | ❌ prototype compresses rank-0's shard only |
-| End-to-end GPU serving | ⏳ not yet validated (open follow-up) |
+| Overlap scheduling | ❌ force-disabled when R-KV is on (its separate stream races with the in-place compaction) |
+| End-to-end GPU serving | ✅ validated on Qwen2.5-Math-7B (FlashInfer, budget 256/512, batched) |
 
 See [`docs/DESIGN.md`](docs/DESIGN.md) and [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md)
 for the design and the concrete wiring.

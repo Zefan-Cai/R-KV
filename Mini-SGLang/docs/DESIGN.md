@@ -68,7 +68,8 @@ Resolution (mirrors the SGLang port's "scheme A"):
 | `page_size > 1` | ❌ `maybe_compress` slot resolution assumes `page_size=1` |
 | Prefix-cache reuse of compressed pages | ❌ compressed pages no longer represent the verbatim prefix; `RadixCache` must not match against compressed branches |
 | Tensor parallel (`tp > 1`) | ❌ prototype compresses rank-0's shard; per-rank `new_len` must agree across ranks |
-| End-to-end GPU serving | ⏳ not yet validated (open follow-up) |
+| Overlap scheduling | ❌ force-disabled when R-KV is on — its separate stream races with the in-place compaction (KV corruption / crash) |
+| End-to-end GPU serving | ✅ validated on Qwen2.5-Math-7B (FlashInfer, budget 256/512, batched) |
 
 See [`IMPLEMENTATION.md`](./IMPLEMENTATION.md) for the concrete wiring and the
 build/apply flow.
