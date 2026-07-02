@@ -7,7 +7,10 @@ and flips R-KV on via the engine config.
 
 | File | Purpose |
 | --- | --- |
-| `bench_rkv.py` | Offline generation benchmark with R-KV enabled (mirrors upstream `benchmark/offline/bench.py`, forwarding `rkv_*` config) |
+| `eval_math.py` | GSM8K accuracy + throughput vs full KV / `--budget` (numeric judging; the Math-7B report driver) |
+| `bench_rkv.py` | Offline generation throughput benchmark with R-KV enabled (mirrors upstream `benchmark/offline/bench.py`) |
+| `prepare_data.sh` | Fetch the GSM8K few-shot eval set into `data/` |
+| `RESULTS_math7b.md` | Measured full KV vs budget 256/512 on Qwen2.5-Math-7B (H100) |
 
 ## Run
 
@@ -17,7 +20,14 @@ scripts/apply_rkv.sh                    # build the patched, pinned tree
 cd mini-sglang-src && uv venv --python=3.12 && source .venv/bin/activate
 uv pip install -e .
 
-python3 ../benchmark/bench_rkv.py       # offline R-KV throughput
+../benchmark/prepare_data.sh            # fetch the GSM8K eval set into benchmark/data/
+
+# GSM8K accuracy + throughput (0 = full KV; see RESULTS_math7b.md):
+python3 ../benchmark/eval_math.py --budget 0   --n 40
+python3 ../benchmark/eval_math.py --budget 512 --n 40
+python3 ../benchmark/eval_math.py --budget 256 --n 40
+
+python3 ../benchmark/bench_rkv.py       # offline R-KV throughput micro-bench
 ```
 
 ## Config
@@ -34,6 +44,8 @@ RKVConfig`).
 
 ## Status
 
-The algorithm and wiring are CPU-tested and the patch applies cleanly to the
-pinned upstream, but an **end-to-end GPU serve run is not yet validated** — that
-is the open follow-up (see [`../docs/IMPLEMENTATION.md`](../docs/IMPLEMENTATION.md) §6).
+GPU-validated on Qwen2.5-Math-7B (FlashInfer, budget 256/512, batched):
+**accuracy is lossless (95.0% == full KV at both budgets)** with ~224 physical
+compactions per sweep and no crashes. See [`RESULTS_math7b.md`](./RESULTS_math7b.md).
+(Validation surfaced and fixed an overlap-scheduling race — see
+[`../docs/IMPLEMENTATION.md`](../docs/IMPLEMENTATION.md) §4/§6.)
