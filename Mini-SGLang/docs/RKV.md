@@ -83,9 +83,13 @@ finished-request path; not yet wired.)
 ## Constraints
 
 - **Eager mode required.** R-KV mutates `cache_seqlens` per step. CUDA
-  graphs and `torch.compile` must be disabled. Set
-  `cuda_graph_bs=None` and `cuda_graph_max_bs=None` in `EngineConfig`
-  when enabling R-KV.
+  graphs and `torch.compile` must be disabled. Note that
+  `cuda_graph_max_bs=None` means *auto-enable* (capture up to bs 160,
+  or 256 on >80 GB GPUs); only `cuda_graph_max_bs=0` (or
+  `cuda_graph_bs=[]`) disables capture. The engine force-disables
+  graph capture whenever `rkv_enabled=True`, because graph replay
+  would silently skip the Python compression hooks in
+  `AttentionLayer.forward`.
 - **Page size 1.** The current integration assumes `page_size=1`, which
   matches Mini-SGLang's default. For `page_size > 1`, slot resolution
   in `maybe_compress` needs to multiply page indices by `page_size`

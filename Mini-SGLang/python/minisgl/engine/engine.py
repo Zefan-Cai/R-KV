@@ -87,11 +87,13 @@ class Engine:
                 config=config.rkv_config,
                 num_layers=config.model_config.num_layers,
             )
-            if config.cuda_graph_bs is not None or config.cuda_graph_max_bs is not None:
-                logger.info_rank0(
-                    "R-KV is enabled; CUDA graph capture is incompatible with "
-                    "per-step variable cache_seqlens and should be disabled."
-                )
+            # CUDA graph replay bypasses the Python compression hooks in
+            # AttentionLayer.forward, so any captured decode batch size would
+            # silently skip R-KV. Graph capture is force-disabled below.
+            logger.info_rank0(
+                "R-KV is enabled; CUDA graph capture is force-disabled "
+                "(graph replay would silently skip the compression hooks)."
+            )
 
         # ======================= Sampler initialization ========================
         self.sampler = Sampler(self.device, config.model_config.vocab_size)
@@ -115,8 +117,8 @@ class Engine:
             device=self.device,
             model=self.model,
             attn_backend=self.attn_backend,
-            cuda_graph_bs=config.cuda_graph_bs,
-            cuda_graph_max_bs=config.cuda_graph_max_bs,
+            cuda_graph_bs=[] if config.rkv_enabled else config.cuda_graph_bs,
+            cuda_graph_max_bs=0 if config.rkv_enabled else config.cuda_graph_max_bs,
             free_memory=init_free_memory,
             max_seq_len=aligned_max_seq_len,
             vocab_size=config.model_config.vocab_size,

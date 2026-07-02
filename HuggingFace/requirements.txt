@@ -1,4 +1,7 @@
-transformers>=4.48.1
+# The rkv monkeypatch replaces transformers attention/CausalLM forwards and
+# is coupled to the 4.48-4.55 attention interface. transformers >=4.56
+# changes the internals and produces garbled output (see issue #26 / #17).
+transformers>=4.48.1,<4.56
 numpy>=2.2.2
 tqdm>=4.67.1
 matplotlib>=3.10.0

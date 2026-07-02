@@ -5,7 +5,9 @@ LLM constructor kwargs. The R-KV knobs are forwarded through
 ``SchedulerConfig(EngineConfig)`` → ``EngineConfig.rkv_*`` fields.
 
 R-KV requires variable per-step ``cache_seqlens`` so CUDA graph capture
-is disabled here (``cuda_graph_bs=None``, ``cuda_graph_max_bs=None``).
+must stay off. Note ``cuda_graph_max_bs=None`` means AUTO-enable, not
+disable — only ``cuda_graph_max_bs=0`` disables capture (the engine also
+force-disables graphs whenever ``rkv_enabled=True``).
 See ``docs/RKV.md`` for the wiring contract and limitations.
 """
 
@@ -27,8 +29,8 @@ def main():
         max_seq_len_override=8192,
         max_extend_tokens=16384,
         # R-KV needs variable cache_seqlens per step -> no CUDA graphs.
-        cuda_graph_bs=None,
-        cuda_graph_max_bs=None,
+        # None would AUTO-enable graph capture; 0 is the explicit off switch.
+        cuda_graph_max_bs=0,
         page_size=1,
         # R-KV configuration mirroring the HuggingFace reference.
         rkv_enabled=True,

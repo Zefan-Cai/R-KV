@@ -8,6 +8,11 @@ version = "0.1.0"
 requires-python = ">=3.9"
 description = "R-KV is the first production-level KV Cache Compression Method for serving R1-like models."
 readme = "README.md"
+# Keep in sync with requirements.txt: the monkeypatch is coupled to the
+# transformers 4.48-4.55 attention interface (issue #26 / #17).
+dependencies = [
+    "transformers>=4.48.1,<4.56",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
