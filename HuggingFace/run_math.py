@@ -49,6 +49,16 @@ def main(args):
             question = example[question_key]
             example["question"] = question
             prompt = prompt_template.format(**example)
+            if args.use_chat_template:
+                # R1-distill models are trained to reason inside the chat
+                # format (<think> after the assistant turn); a plain-text
+                # prompt makes them exit thinking immediately and lowers
+                # accuracy substantially.
+                prompt = tokenizer.apply_chat_template(
+                    [{"role": "user", "content": prompt}],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
 
             example["prompt"] = prompt
             example["index"] = index
@@ -62,7 +72,8 @@ def main(args):
             batch_prompts,
             padding="longest",
             return_tensors="pt",
-            add_special_tokens=True,
+            # the chat template already inserts BOS/special tokens
+            add_special_tokens=not args.use_chat_template,
         ).to("cuda")
 
         prefill_lengths = tokenized_prompts["attention_mask"].sum(dim=1).tolist()
@@ -181,6 +192,13 @@ def parse_arguments():
         "--do_sample",
         action="store_true",
         help="enable sampling; paper-style reproduction uses this with temperature 0.6 and top_p 0.95",
+    )
+    parser.add_argument(
+        "--use_chat_template",
+        action="store_true",
+        help="wrap the prompt with tokenizer.apply_chat_template; recommended "
+        "for DeepSeek-R1-distill models, which only enter their trained "
+        "<think> reasoning format inside the chat template",
     )
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--top_p", type=float, default=0.95)

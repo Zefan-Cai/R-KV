@@ -134,8 +134,13 @@ def main(data_name, args):
 
     codes = []
     for i in range(len(examples)):
-        # Try 'generation' first, then 'output' as fallback
-        code = examples[i].get("generation", examples[i].get("output", ""))
+        # 'output' is what run_math.py writes for the current run. Never
+        # prefer 'generation': the shipped gsm8k.jsonl carried a leftover
+        # 'generation' field from an old experiment, and run_math.py copies
+        # dataset fields into its results, so preferring 'generation'
+        # silently scored those stale outputs instead of the new run
+        # (constant ~40% accuracy regardless of method/settings).
+        code = examples[i].get("output", examples[i].get("generation", ""))
         for stop_word in args.stop_words:
             if stop_word in code:
                 code = code.split(stop_word)[0].strip()
