@@ -12,7 +12,7 @@ from health_check import report
 MODEL = os.environ.get("RKV_SMOKE_MODEL", "Qwen/Qwen3-0.6B")
 RKV_ON = os.environ.get("RKV_ON", "1") == "1"
 
-from minisgl.compress.integration import RKVCompressor  # noqa: E402
+from minisgl.rkv.integration import RKVCompressor  # noqa: E402
 from minisgl.core import SamplingParams  # noqa: E402
 from minisgl.llm import LLM  # noqa: E402
 

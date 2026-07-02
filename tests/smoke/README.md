@@ -16,8 +16,8 @@ Python 3.10, at repo `main`:
 |---|---|---|---|
 | `vllm_smoke.py` | `pip install vllm==0.8.5 transformers==4.51.3`, then overlay the whole checked-in `vLLM/vllm/` package onto site-packages | Qwen/Qwen3-0.6B | `VLLM_USE_V1=1 VLLM_V1_R_KV_BUDGET=64 VLLM_V1_R_KV_BUFFER=8` (`BUFFER=0` disables; backend must be FLASH_ATTN) |
 | `nano_smoke.py` | `pip install -e Nano-vLLM` + flash-attn>=2.5 (model path must be a **local directory**) | Qwen/Qwen3-0.6B | `RKV_ON=1` -> `rkv_enabled=True, rkv_budget=256, rkv_buffer=32` |
-| `minisgl_smoke.py` | `pip install -e Mini-SGLang` | Qwen/Qwen3-0.6B | `RKV_ON=1` -> `rkv_enabled=True, rkv_budget=512, rkv_buffer=64`; instruments `RKVCompressor.maybe_compress` and fails if compression never fires |
-| `sglang_smoke.py` | `pip install -r SGLang/requirements-rkv.txt && pip install -e SGLang/python --no-build-isolation` | Qwen/Qwen2.5-0.5B-Instruct | `RKV_ON=1` -> `compress_algorithm="RKV"`, triton backend, cuda graph off; `BATCH=2` for the batch variant |
+| `minisgl_smoke.py` | `cd Mini-SGLang && scripts/apply_rkv.sh`, then `pip install -e mini-sglang-src` | Qwen/Qwen3-0.6B | `RKV_ON=1` -> `rkv_enabled=True, rkv_budget=512, rkv_buffer=64`; instruments `RKVCompressor.maybe_compress` and fails if compression never fires |
+| `sglang_smoke.py` | `cd SGLang && scripts/apply_rkv.sh`, then `pip install -r requirements-rkv.txt && pip install -e sglang-src/python` | Qwen/Qwen2.5-0.5B-Instruct | `RKV_ON=1` -> `enable_rkv=True, rkv_budget=128`, FlashInfer, radix/cuda-graph/overlap off, `page_size=1`; `BATCH=2` for the batch variant |
 | `hf_smoke.py` | `pip install -e HuggingFace` + flash-attn (transformers must be `>=4.48.1,<4.56`) | deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B | `MODE=rkv` (monkeypatch) vs `MODE=fullkv` (stock forward) |
 
 Usage examples:
