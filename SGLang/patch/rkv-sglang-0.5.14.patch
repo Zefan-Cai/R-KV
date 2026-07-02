@@ -1,0 +1,280 @@
+diff --git a/python/sglang/srt/layers/attention/flashinfer_backend.py b/python/sglang/srt/layers/attention/flashinfer_backend.py
+index da22da628..e80af087b 100644
+--- a/python/sglang/srt/layers/attention/flashinfer_backend.py
++++ b/python/sglang/srt/layers/attention/flashinfer_backend.py
+@@ -305,6 +305,9 @@ class FlashInferAttnBackend(AttentionBackend):
+ 
+         self.req_to_token_pool = model_runner.req_to_token_pool
+         self.token_to_kv_pool = model_runner.token_to_kv_pool
++        # R-KV compressor (constructed in alloc_memory_pool, which runs before
++        # attention backends are built). None when R-KV is disabled.
++        self.rkv_compressor = getattr(model_runner, "rkv_compressor", None)
+         self._swa_kv_pool: Optional[BaseSWAKVPool] = self._resolve_swa_kv_pool(
+             model_runner
+         )
+@@ -759,6 +762,13 @@ class FlashInferAttnBackend(AttentionBackend):
+             self.forward_metadata = DecodeMetadata(
+                 self.decode_wrappers, swa_out_cache_loc=swa_out_cache_loc
+             )
++            if self.rkv_compressor is not None:
++                # Bind the compressor onto the *actual* decode forward_batch
++                # (the one the model will run on) and replace positions with
++                # logical ones, since seq_lens now tracks the physical KV length
++                # after R-KV eviction.
++                forward_batch.rkv_compressor = self.rkv_compressor
++                self.rkv_compressor.override_decode_positions(forward_batch)
+         elif forward_batch.forward_mode.is_target_verify():
+             self.indices_updater_prefill.update(
+                 forward_batch.req_pool_indices,
+@@ -1113,6 +1123,17 @@ class FlashInferAttnBackend(AttentionBackend):
+                     layer.v_scale,
+                 )
+ 
++        rkv_compressor = self.rkv_compressor
++        if rkv_compressor is not None:
++            # Observe this layer's decode step (cache query, accumulate score).
++            rkv_compressor.observe_decode_layer(
++                q.view(-1, layer.tp_q_head_num, layer.head_dim),
++                k,
++                v,
++                layer,
++                forward_batch,
++            )
++
+         # Call the wrapped function
+         o = decode_wrapper.forward(
+             q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index abba37441..26dbf27d3 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -352,6 +352,8 @@ class Scheduler(
+         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
+         self.enable_hisparse = server_args.enable_hisparse
+         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
++        self.enable_rkv = server_args.enable_rkv
++        self.rkv_compressor = None
+ 
+         # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
+         self.gracefully_exit = False
+@@ -477,6 +479,10 @@ class Scheduler(
+             self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
+             self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
+ 
++        if self.enable_rkv:
++            # RKVCompressor was created inside ModelRunner.alloc_memory_pool().
++            self.rkv_compressor = self.tp_worker.model_runner.rkv_compressor
++
+         if (
+             self.server_args.disaggregation_mode == "decode"
+             and self.server_args.disaggregation_decode_enable_offload_kvcache
+@@ -843,6 +849,11 @@ class Scheduler(
+                 req_to_token_pool=pool,
+                 token_to_kv_pool_allocator=allocator,
+             )
++        # RKVCompressor is constructed inside alloc_memory_pool (called above),
++        # which runs *after* __init__ took its early coordinator snapshot. Bind
++        # it now that the pools (and the compressor) actually exist.
++        if self.enable_rkv:
++            self.rkv_compressor = self.tp_worker.model_runner.rkv_compressor
+ 
+     def init_all_attention_backends(self):
+         """Initialize attention backends for all workers."""
+@@ -3078,10 +3089,34 @@ class Scheduler(
+         if batch.is_empty():
+             return batch
+ 
++        # R-KV: register new requests and apply the previous step's physical KV
++        # length shrink to seq_lens before it is advanced by prepare_for_decode.
++        if self.rkv_compressor is not None:
++            self._apply_rkv_pre_decode(batch)
++
+         # Update batch tensors
+         batch.prepare_for_decode()
+         return batch
+ 
++    def _apply_rkv_pre_decode(self, batch: ScheduleBatch):
++        """Register new R-KV requests and apply the previous step's physical KV
++        length shrink to the batch seq_lens tensors, before prepare_for_decode
++        advances them. seq_lens tracks physical KV length; rotary stays logical
++        via RKVCompressor.override_decode_positions at forward time."""
++        for req in batch.reqs:
++            st = self.rkv_compressor.states.get(req.req_pool_idx)
++            if st is None or st.req is not req:
++                self.rkv_compressor.on_request_begin(req)
++        updates = self.rkv_compressor.take_pending_length_updates()
++        if not updates:
++            return
++        for i, req in enumerate(batch.reqs):
++            new_len = updates.get(req.req_pool_idx)
++            if new_len is not None:
++                batch.seq_lens[i] = new_len
++                batch.seq_lens_cpu[i] = new_len
++                batch.orig_seq_lens[i] = new_len
++
+     def record_batch_in_overlap(self, batch: ScheduleBatch):
+         # FIXME(lsyin): hacky way to keep a reference to avoid GPU tensors being freed by torch GC
+         # NOTE: More Reliable: record all tensors into the forward stream
+diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+index a9d5f0c28..dd683259b 100644
+--- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
++++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+@@ -91,6 +91,13 @@ class SchedulerBatchResultProcessor:
+                 req.time_stats.set_quick_finish_time()
+                 if self.server_args.enable_hisparse:
+                     self.hisparse_coordinator.request_finished(req)
++                _rkv = getattr(
++                    getattr(self.model_worker, "model_runner", None),
++                    "rkv_compressor",
++                    None,
++                )
++                if _rkv is not None:
++                    _rkv.on_request_end(req)
+                 release_kv_cache(req, self.tree_cache)
+ 
+         # Note: Logprobs should be handled on the prefill engine.
+@@ -855,6 +862,13 @@ class SchedulerBatchResultProcessor:
+             else:
+                 if self.server_args.enable_hisparse:
+                     self.hisparse_coordinator.request_finished(req)
++                _rkv = getattr(
++                    getattr(self.model_worker, "model_runner", None),
++                    "rkv_compressor",
++                    None,
++                )
++                if _rkv is not None:
++                    _rkv.on_request_end(req)
+                 prepare_release = getattr(
+                     self.model_worker, "prepare_for_kv_cache_release", None
+                 )
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index 1cff5c983..740a9254f 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -417,6 +417,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+         self.init_new_workspace = False
+         self.draft_model_idx = draft_model_idx
+         self.enable_hisparse = server_args.enable_hisparse
++        self.enable_rkv = server_args.enable_rkv
+ 
+         self.remote_instance_transfer_engine = None
+         self.remote_instance_transfer_engine_session_id = ""
+@@ -566,6 +567,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+         # For hisparse (must be set before initialize() so CUDA graph capture can see it)
+         self.hisparse_coordinator = None
+ 
++        # For R-KV decoding-time KV compression (constructed in alloc_memory_pool).
++        self.rkv_compressor = None
++
+         self._linear_attn_registry_cache: Any = _UNSET
+ 
+         # Load model weights and configure
+@@ -846,6 +850,38 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+                 host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+             )
+ 
++        if self.enable_rkv:
++            import json
++
++            from sglang.srt.mem_cache.rkv.integration import (
++                RKVCompressor,
++                RKVConfig,
++            )
++
++            sa = self.server_args
++            # Base config from the per-field flags; --rkv-config JSON overrides.
++            rkv_cfg_dict = {
++                "budget": sa.rkv_budget,
++                "window_size": sa.rkv_window_size,
++                "kernel_size": sa.rkv_kernel_size,
++                "mix_lambda": sa.rkv_mix_lambda,
++                "retain_ratio": sa.rkv_retain_ratio,
++                "retain_direction": sa.rkv_retain_direction,
++                "buffer_size": sa.rkv_buffer_size,
++                "min_seq_len": sa.rkv_min_seq_len,
++            }
++            if sa.rkv_config:
++                rkv_cfg_dict.update(json.loads(sa.rkv_config))
++            self.rkv_compressor = RKVCompressor(
++                config=RKVConfig(**rkv_cfg_dict),
++                req_to_token_pool=self.req_to_token_pool,
++                token_to_kv_pool=self.token_to_kv_pool,
++                kv_allocator=self.token_to_kv_pool_allocator,
++                start_layer=self.start_layer,
++                end_layer=self.start_layer + self.num_effective_layers,
++                device=self.device,
++            )
++
+         self.init_routed_experts_capturer()
+         self.init_indexer_capturer()
+ 
+@@ -3072,6 +3108,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+             ):
+                 forward_batch.post_forward_mlp_sync_batch(ret)
+ 
++            if (
++                forward_batch.forward_mode.is_decode()
++                and self.rkv_compressor is not None
++            ):
++                # All layers have written their KV for this step; run R-KV
++                # compaction now (relocates kept slots, frees the tail, rewrites
++                # req_to_token, updates per-request physical lengths).
++                self.rkv_compressor.maybe_compact(forward_batch)
++
+             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
+ 
+     def _preprocess_logits(
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index c7162c16d..538d3b88b 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -1848,6 +1848,49 @@ class ServerArgs:
+         ),
+     ] = None
+ 
++    # -------------------------------------------------------------------------
++    # R-KV (redundancy-aware KV cache compression, decoding-time)
++    # -------------------------------------------------------------------------
++    enable_rkv: A[bool, "Enable R-KV decoding-time KV cache compression"] = False
++    # Per-field R-KV hyper-parameters. Defaults mirror RKVConfig. Any field left
++    # at its default is overridable by --rkv-config JSON (which takes priority).
++    rkv_budget: A[
++        int, "R-KV: KV entries kept per request after compression."
++    ] = 1024
++    rkv_window_size: A[
++        int, "R-KV: trailing observation window always retained."
++    ] = 8
++    rkv_kernel_size: A[
++        int, "R-KV: pooling kernel size for importance smoothing."
++    ] = 7
++    rkv_mix_lambda: A[
++        float, "R-KV: importance vs redundancy mix (0=redundancy only, 1=importance only)."
++    ] = 0.1
++    rkv_retain_ratio: A[
++        float, "R-KV: fraction of most-recent similar neighbours exempted from redundancy."
++    ] = 0.1
++    rkv_retain_direction: A[
++        str,
++        Arg(
++            help="R-KV: which end of the sequence the retain ratio protects.",
++            choices=["last", "first", "last_percent", "first_percent"],
++        ),
++    ] = "last"
++    rkv_buffer_size: A[
++        int, "R-KV: compress once every this many newly generated tokens per request."
++    ] = 128
++    rkv_min_seq_len: A[
++        Optional[int],
++        "R-KV: minimum KV length before compression is considered (defaults to budget).",
++    ] = None
++    rkv_config: A[
++        Optional[str],
++        Arg(
++            help='A dictionary in JSON string format that OVERRIDES the per-field R-KV flags above. Example: \'{"budget": 1024, "window_size": 8, "buffer_size": 128, "mix_lambda": 0.1}\'',
++            aliases=["--rkv-extra-config"],
++        ),
++    ] = None
++
+     # -------------------------------------------------------------------------
+     # LMCache
+     # -------------------------------------------------------------------------

@@ -1,7 +1,0 @@
-mpi4py
-cupy-cuda11x
-prettytable
-netifaces
-pytest
-numpy
-matplotlib

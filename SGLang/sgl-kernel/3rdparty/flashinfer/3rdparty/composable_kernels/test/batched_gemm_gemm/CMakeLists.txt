@@ -1,6 +1,0 @@
-add_gtest_executable(test_batched_gemm_gemm_fp16 test_batched_gemm_gemm_fp16_xdl.cpp)
-if(result EQUAL 0)
-  add_custom_target(test_batched_gemm_gemm)
-  target_link_libraries(test_batched_gemm_gemm_fp16 PRIVATE utility device_batched_gemm_gemm_instance)
-  add_dependencies(test_batched_gemm_gemm test_batched_gemm_gemm_fp16)
-endif()
