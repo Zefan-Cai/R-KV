@@ -1,7 +1,0 @@
-{
-    "num_samples": 100,
-    "num_scores": 100,
-    "timeout_samples": 0,
-    "empty_samples": 0,
-    "acc": 89.0
-}

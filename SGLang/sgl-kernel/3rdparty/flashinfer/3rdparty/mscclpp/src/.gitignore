@@ -1,2 +1,0 @@
-# Python in-place installs move the .so files into the source directories.
-*.so

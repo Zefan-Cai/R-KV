@@ -1,0 +1,7 @@
+# Upstream SGLang checkout produced by scripts/apply_rkv.sh — NOT vendored here.
+sglang-src/
+
+# Python / OS cruft
+__pycache__/
+*.py[cod]
+.DS_Store

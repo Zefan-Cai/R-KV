@@ -1,7 +1,0 @@
----
-BasedOnStyle: Google
-DerivePointerAlignment: false
-ColumnLimit:     100
-PointerAlignment: Left
-# InsertNewlineAtEOF: true
-...

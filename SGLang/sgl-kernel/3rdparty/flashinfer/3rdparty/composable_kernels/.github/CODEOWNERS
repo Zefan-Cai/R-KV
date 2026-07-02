@@ -1,8 +1,0 @@
-* @zjing14 @junliume @illsilin @carlushuang @aosewski @yigex
-# Documentation files
-docs/* @ROCm/rocm-documentation @zjing14 @junliume @illsilin @carlushuang @aosewski @yigex
-*.md @ROCm/rocm-documentation @zjing14 @junliume @illsilin @carlushuang @aosewski @yigex
-*.rst @ROCm/rocm-documentation @zjing14 @junliume @illsilin @carlushuang @aosewski @yigex
-.readthedocs.yaml @ROCm/rocm-documentation @zjing14 @junliume @illsilin @carlushuang @aosewski @yigex
-# Header directory for Doxygen documentation
-library/include/* @ROCm/rocm-documentation @zjing14 @junliume @illsilin @carlushuang @aosewski @yigex

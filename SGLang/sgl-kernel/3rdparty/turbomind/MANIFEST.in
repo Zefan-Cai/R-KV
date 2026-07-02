@@ -1,5 +1,0 @@
-
-include turbomind/lib/*.so
-include turbomind/lib/*.so*
-include turbomind/lib/*.dll
-include turbomind/lib/*.pyd

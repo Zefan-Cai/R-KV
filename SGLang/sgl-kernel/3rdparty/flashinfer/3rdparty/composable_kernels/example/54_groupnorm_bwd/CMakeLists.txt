@@ -1,1 +1,0 @@
-add_example_executable(example_groupnorm_bwd_fp32 groupnorm_bwd_fp32.cpp)
