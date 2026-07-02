@@ -81,7 +81,7 @@ still needed to show the upside.
 ## Reproduce
 
 ```bash
-cd R-KV/benchmark
+cd SGLang/benchmark
 ./prepare_data.sh   # or use an existing test.jsonl via --data
 
 # baseline (eager)

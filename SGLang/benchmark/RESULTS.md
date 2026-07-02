@@ -89,5 +89,5 @@ R-KV pays off when:
   concurrent requests, raising aggregate throughput.
 
 A long-sequence / memory-pressure throughput test is needed to show the benefit
-side. Phase-2 perf targets (see `R-KV/doc/DESIGN.md`): CUDA-graph-compatible compaction,
+side. Phase-2 perf targets (see `SGLang/docs/DESIGN.md`): CUDA-graph-compatible compaction,
 a cheaper redundancy estimate than O(budget²), and avoiding full KV read-back.
