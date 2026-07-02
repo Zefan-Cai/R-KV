@@ -19,11 +19,11 @@ jobs:
       - name: Byte-compile the R-KV integration sources
         run: |
           python -m compileall -q HuggingFace/rkv Nano-vLLM/nanovllm \
-            Mini-SGLang/python/minisgl tests/smoke
+            Mini-SGLang/rkv tests/smoke
       - name: Nano-vLLM R-KV algorithm tests
         run: python Nano-vLLM/tests/test_rkv_algorithm.py
       - name: Mini-SGLang R-KV algorithm + integration tests
-        run: PYTHONPATH=Mini-SGLang/python python Mini-SGLang/tests/misc/test_rkv_algorithm.py
+        run: python Mini-SGLang/tests/test_rkv_algorithm.py
       - name: SGLang R-KV algorithm / integration / cross-repo parity tests
         run: |
           python SGLang/tests/test_rkv_algo.py
