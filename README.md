@@ -13,13 +13,14 @@
 ## TODO
 - Apply R-KV in GPT-OSS
 - Integrate R-KV with VeRL
-- Harden R-KV benchmark coverage in vLLM, Nano-vLLM and SGLang
+- ~~Harden R-KV benchmark coverage in vLLM, Nano-vLLM and SGLang~~ (GPU smokes in `tests/smoke/`, throughput bench + raw artifacts in `results/`, CPU tests in CI)
 - Extend dataset to GPQA, liveCodeBench
 - Apply R-KV in QwQ
 - Expand Qwen-3 evaluation coverage
 
 ## 🔥 News
 
+- ⚠️ [26/07/02] **If you computed GSM8K numbers with this repo before commit `e9f54c45`, please rerun them.** The shipped `data/gsm8k.jsonl` carried a stale `generation` field from an old experiment and `eval_math.py` preferred it over the fresh run's `output`, freezing GSM8K scores at ~40% regardless of method or budget (issues #26/#23). MATH and AIME24 were unaffected. All four serving integrations (vLLM, SGLang, Nano-vLLM, Mini-SGLang) plus the HuggingFace path are now GPU-validated on A100 with R-KV on/off — see `tests/smoke/` and `results/validation-2026-07-02-a100/`.
 - 🚀 [25/05/29] We are pleased to announce the release of **R-KV**, a highly efficient decoding time KV Cache compression method to serve reasoning Models.
 
 
@@ -107,6 +108,9 @@ python3 ./run_math.py \
 ```
 
 For paper-style candidate generation, additionally set `--num_return_sequences 64`.
+Add `--use_chat_template` when evaluating DeepSeek-R1-distill (or other chat)
+models: they only enter their trained `<think>` reasoning format inside the
+chat template.
 
 To evaluate benchmark results, simply run:
 ```bash
@@ -134,7 +138,16 @@ python SGLang/tests/test_rkv_integration.py
 python SGLang/tests/test_cross_repo_parity.py
 ```
 
-All run on CPU without a GPU and exercise the exact `R1KV` class used at runtime.
+All run on CPU without a GPU and exercise the exact `R1KV` class used at
+runtime. The Nano-vLLM and Mini-SGLang tests also run in CI on every push
+(`.github/workflows/cpu-tests.yml`).
+
+GPU smoke tests for all four serving integrations (vLLM, Nano-vLLM,
+Mini-SGLang, SGLang) plus the HuggingFace monkeypatch live in
+`tests/smoke/` — each generates with R-KV on/off and applies a lexical
+health check that catches garbled or looping output. Raw outputs, accuracy
+metrics, and vLLM throughput benchmarks from the validated A100 runs are
+checked in under `results/`.
 
 ## Overview
 

@@ -1,0 +1,31 @@
+INFO 07-02 07:53:27 [__init__.py:239] Automatically detected platform cuda.
+INFO 07-02 07:53:37 [config.py:689] This model supports multiple tasks: {'reward', 'embed', 'generate', 'score', 'classify'}. Defaulting to 'generate'.
+INFO 07-02 07:53:37 [config.py:1901] Chunked prefill is enabled with max_num_batched_tokens=8192.
+WARNING 07-02 07:53:37 [cuda.py:96] To see benefits of async output processing, enable CUDA graph. Since, enforce-eager is enabled, async output processor cannot be used
+INFO 07-02 07:53:37 [core.py:61] Initializing a V1 LLM engine (v0.8.5) with config: model='/mnt/localssd/rkv-test/models/Qwen3-0.6B', speculative_config=None, tokenizer='/mnt/localssd/rkv-test/models/Qwen3-0.6B', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, override_neuron_config=None, tokenizer_revision=None, trust_remote_code=False, dtype=torch.bfloat16, max_seq_len=4096, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, disable_custom_all_reduce=False, quantization=None, enforce_eager=True, kv_cache_dtype=auto,  device_config=cuda, decoding_config=DecodingConfig(guided_decoding_backend='auto', reasoning_backend=None), observability_config=ObservabilityConfig(show_hidden_metrics=False, otlp_traces_endpoint=None, collect_model_forward_time=False, collect_model_execute_time=False), seed=None, served_model_name=/mnt/localssd/rkv-test/models/Qwen3-0.6B, num_scheduler_steps=1, multi_step_stream_outputs=True, enable_prefix_caching=False, chunked_prefill_enabled=True, use_async_output_proc=False, disable_mm_preprocessor_cache=False, mm_processor_kwargs=None, pooler_config=None, compilation_config={"splitting_ops":[],"compile_sizes":[],"cudagraph_capture_sizes":[],"max_capture_size":0}
+WARNING 07-02 07:53:38 [utils.py:2444] Methods determine_num_available_blocks,device_config,get_cache_block_size_bytes,initialize_cache not implemented in <vllm.v1.worker.gpu_worker.Worker object at 0x7f70c63cfeb0>
+INFO 07-02 07:53:39 [parallel_state.py:959] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, TP rank 0
+INFO 07-02 07:53:39 [cuda.py:221] Using Flash Attention backend on V1 engine.
+INFO 07-02 07:53:39 [gpu_model_runner.py:1331] Starting to load model /mnt/localssd/rkv-test/models/Qwen3-0.6B...
+WARNING 07-02 07:53:39 [topk_topp_sampler.py:69] FlashInfer is not available. Falling back to the PyTorch-native implementation of top-p & top-k sampling. For the best performance, please install FlashInfer.
+Loading safetensors checkpoint shards:   0% Completed | 0/1 [00:00<?, ?it/s]
+Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  2.30it/s]
+Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00,  2.30it/s]
+
+INFO 07-02 07:53:39 [loader.py:458] Loading weights took 0.48 seconds
+INFO 07-02 07:53:40 [gpu_model_runner.py:1346] Model loading took 1.1201 GiB and 0.689699 seconds
+INFO 07-02 07:53:40 [kv_cache_utils.py:634] GPU KV cache size: 285,312 tokens
+INFO 07-02 07:53:40 [kv_cache_utils.py:637] Maximum concurrency for 4,096 tokens per request: 69.66x
+INFO 07-02 07:53:40 [core.py:163] init engine (profile, create kv cache, warmup model) took 0.71 seconds
+INFO 07-02 07:53:40 [core_client.py:435] Core engine process 0 ready.
+ENGINE_LOAD_SECONDS 11.0 (budget=512,buffer=0)
+Processed prompts:   0%|          | 0/1 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s]Processed prompts: 100%|██████████| 1/1 [00:00<00:00,  1.49it/s, est. speed input: 89.41 toks/s, output: 47.69 toks/s]Processed prompts: 100%|██████████| 1/1 [00:00<00:00,  1.49it/s, est. speed input: 89.41 toks/s, output: 47.69 toks/s]
+Processed prompts:   0%|          | 0/1 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s]Processed prompts: 100%|██████████| 1/1 [00:40<00:00, 40.52s/it, est. speed input: 1.48 toks/s, output: 50.55 toks/s]Processed prompts: 100%|██████████| 1/1 [00:40<00:00, 40.52s/it, est. speed input: 1.48 toks/s, output: 50.55 toks/s]
+BENCH budget=512,buffer=0 bs=1 tokens=2048 seconds=40.52 tok_per_s=50.5
+Processed prompts:   0%|          | 0/4 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s]Processed prompts:  25%|██▌       | 1/4 [00:44<02:14, 44.72s/it, est. speed input: 1.34 toks/s, output: 45.80 toks/s]Processed prompts: 100%|██████████| 4/4 [00:44<00:00, 11.19s/it, est. speed input: 5.36 toks/s, output: 183.09 toks/s]
+BENCH budget=512,buffer=0 bs=4 tokens=8192 seconds=44.75 tok_per_s=183.1
+Processed prompts:   0%|          | 0/16 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s]Processed prompts:   6%|▋         | 1/16 [00:54<13:42, 54.83s/it, est. speed input: 1.09 toks/s, output: 37.35 toks/s]Processed prompts: 100%|██████████| 16/16 [00:54<00:00,  3.43s/it, est. speed input: 17.61 toks/s, output: 597.30 toks/s]
+BENCH budget=512,buffer=0 bs=16 tokens=32768 seconds=54.87 tok_per_s=597.2
+Processed prompts:   0%|          | 0/64 [00:00<?, ?it/s, est. speed input: 0.00 toks/s, output: 0.00 toks/s]Processed prompts:   2%|▏         | 1/64 [01:03<1:06:33, 63.39s/it, est. speed input: 0.95 toks/s, output: 32.31 toks/s]Processed prompts: 100%|██████████| 64/64 [01:03<00:00,  1.01it/s, est. speed input: 61.06 toks/s, output: 2065.93 toks/s]
+BENCH budget=512,buffer=0 bs=64 tokens=131072 seconds=63.47 tok_per_s=2065.2
+BENCH_DONE

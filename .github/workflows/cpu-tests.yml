@@ -1,0 +1,31 @@
+name: cpu-tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rkv-algorithm-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install CPU torch
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Byte-compile the R-KV integration sources
+        run: |
+          python -m compileall -q HuggingFace/rkv Nano-vLLM/nanovllm \
+            Mini-SGLang/python/minisgl tests/smoke
+      - name: Nano-vLLM R-KV algorithm tests
+        run: python Nano-vLLM/tests/test_rkv_algorithm.py
+      - name: Mini-SGLang R-KV algorithm + integration tests
+        run: PYTHONPATH=Mini-SGLang/python python Mini-SGLang/tests/misc/test_rkv_algorithm.py
+      - name: SGLang R-KV algorithm / integration / cross-repo parity tests
+        run: |
+          python SGLang/tests/test_rkv_algo.py
+          python SGLang/tests/test_rkv_integration.py
+          python SGLang/tests/test_cross_repo_parity.py
