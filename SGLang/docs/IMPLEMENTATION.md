@@ -18,8 +18,8 @@ The port is split into two layers:
 
 | Layer | File | Responsibility |
 | --- | --- | --- |
-| **Algorithm** | [`algo.py`](./algo.py) | Pure, device-agnostic R-KV scoring & selection. Zero SGLang deps. CPU-testable. |
-| **Integration** | [`integration.py`](./integration.py) | Bridges the algorithm to SGLang's paged KV pool, FlashInfer decode path, and scheduler lifecycle. |
+| **Algorithm** | [`algo.py`](../rkv/algo.py) | Pure, device-agnostic R-KV scoring & selection. Zero SGLang deps. CPU-testable. |
+| **Integration** | [`integration.py`](../rkv/integration.py) | Bridges the algorithm to SGLang's paged KV pool, FlashInfer decode path, and scheduler lifecycle. |
 
 Phase-1 scope: **FlashInfer backend, `page_size=1`, correctness first.**
 `batch >= 1` is supported via **per-request triggering** (each request decides
