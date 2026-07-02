@@ -174,13 +174,13 @@ class RKVCompressor:
         any_compressed = False
         new_lens: list[int] = []
         reqs = list(batch.padded_reqs)
-        for i, req in enumerate(reqs):
+        for req in reqs:
             source_len = req.device_len
             if source_len <= trigger_len:
                 new_lens.append(source_len)
                 continue
 
-            slots = page_table[i, :source_len].long()
+            slots = page_table[req.table_idx, :source_len].long()
             keys = (
                 flat_k.index_select(0, slots)
                 .permute(1, 0, 2)

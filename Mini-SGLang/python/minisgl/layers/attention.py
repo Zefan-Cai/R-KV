@@ -60,10 +60,13 @@ class AttentionLayer(StateLessOP):
             # Compress this layer's cache in place after attention has
             # already attended over the full cache. The shorter
             # device_len takes effect on the next scheduler step.
+            # Use the global page table (indexed by req.table_idx): backend
+            # metadata does not uniformly expose per-batch slot rows (the
+            # FlashInfer FIMetadata has no page_table attribute).
             new_lens = ctx.rkv.maybe_compress(
                 self.layer_id,
                 ctx.kv_cache,
-                ctx.batch.attn_metadata.page_table,
+                ctx.page_table,
                 ctx.batch,
             )
             if new_lens is not None and self.layer_id == ctx.rkv.num_layers - 1:
