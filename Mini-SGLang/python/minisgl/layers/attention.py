@@ -72,8 +72,9 @@ class AttentionLayer(StateLessOP):
             if new_lens is not None and self.layer_id == ctx.rkv.num_layers - 1:
                 # Only the last layer mutates request state, so all
                 # layers see the same source_len during this step.
+                # device_len/cached_len stay logical (positions, stop
+                # condition); only the physical KV length shrinks.
                 for req, new_len in zip(ctx.batch.padded_reqs, new_lens):
-                    if new_len < req.device_len:
-                        req.device_len = new_len
-                        req.cached_len = max(0, new_len - 1)
+                    if new_len < req.kv_len:
+                        req.num_dropped_tokens += req.kv_len - new_len
         return o.view(-1, self.qo_attn_dim)

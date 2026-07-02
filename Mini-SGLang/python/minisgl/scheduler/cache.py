@@ -43,8 +43,11 @@ class CacheManager:
         needed_pages = 0
         allocation_info: List[Tuple[int, int, int]] = []
         for req in reqs:
-            first_page = div_ceil(req.cached_len, self.page_size)
-            last_page = div_ceil(req.device_len, self.page_size)
+            # Physical lengths: R-KV compression compacts a request's KV
+            # into the first kv_len slots, so new slots are allocated at
+            # the physical frontier, not the logical token count.
+            first_page = div_ceil(req.kv_cached_len, self.page_size)
+            last_page = div_ceil(req.kv_len, self.page_size)
             if last_page > first_page:
                 needed_pages += last_page - first_page
                 allocation_info.append((req.table_idx, first_page, last_page))
@@ -64,6 +67,15 @@ class CacheManager:
         # [cached_len, new_handle.cached_len)       This part is newly inserted into the prefix cache.
         # [new_handle.cached_len, req.cached_len)   This part is tailing part that can not inserted into the prefix cache.
         #                                           We should free it if the request has finished.
+        if req.num_dropped_tokens > 0:
+            # Compressed KV no longer represents the verbatim prefix: never
+            # insert it into the prefix cache. The live physical slots are
+            # the compacted [0, kv_cached_len) region; the dropped tail
+            # slots were already returned via drain_pending_free_slots().
+            self.unlock(req.cache_handle)
+            assert finished, "compression only happens to decoding requests"
+            self._free(self.page_table[req.table_idx, : req.kv_cached_len])
+            return
         insert_ids = req.input_ids[: req.cached_len]
         page_indices = self.page_table[req.table_idx, : req.cached_len]
         old_handle = req.cache_handle

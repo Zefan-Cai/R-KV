@@ -69,7 +69,8 @@ class FlashAttentionBackend(BaseAttnBackend):
 
         padded_size = len(reqs)
         seqlens_q = [req.extend_len for req in reqs]
-        seqlens_k = [req.device_len for req in reqs]
+        # kv_len: physical KV length (== device_len until R-KV drops tokens)
+        seqlens_k = [req.kv_len for req in reqs]
         cached_lens = [req.cached_len for req in reqs]
         max_seqlen_k = max(seqlens_k)
         max_seqlen_q = max(seqlens_q)

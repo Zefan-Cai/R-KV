@@ -156,9 +156,11 @@ class RKVCompressor:
         The cache is compacted in place: the kept K/V are written into
         the first ``new_len`` slots of each request's page allocation,
         so the page table itself does not move. The caller is
-        responsible for propagating ``new_lens`` into the request's
-        ``device_len`` exactly once per step (typically on the last
-        layer) so the scheduler frees the dropped slots.
+        responsible for accumulating ``kv_len - new_len`` into the
+        request's ``num_dropped_tokens`` exactly once per step
+        (typically on the last layer); ``device_len``/``cached_len``
+        remain logical token counts so positions and the stop condition
+        are unaffected.
         """
         if self.r1kv is None or batch.is_prefill:
             return None
@@ -175,7 +177,9 @@ class RKVCompressor:
         new_lens: list[int] = []
         reqs = list(batch.padded_reqs)
         for req in reqs:
-            source_len = req.device_len
+            # Physical KV length: logical device_len minus tokens already
+            # dropped by earlier compressions.
+            source_len = req.kv_len
             if source_len <= trigger_len:
                 new_lens.append(source_len)
                 continue

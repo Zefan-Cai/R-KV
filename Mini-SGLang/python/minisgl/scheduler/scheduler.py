@@ -56,8 +56,16 @@ class Scheduler(SchedulerIOMixin):
 
         # initialize other managers
         self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
+        cache_type = config.cache_type
+        if config.rkv_enabled and cache_type != "naive":
+            # R-KV rewrites cached pages in place, which would corrupt
+            # prefix-cache branches shared with other requests.
+            logger.info_rank0(
+                f"R-KV is enabled; forcing cache_type='naive' (was '{cache_type}')."
+            )
+            cache_type = "naive"
         self.cache_manager = CacheManager(
-            self.engine.num_pages, config.page_size, self.engine.page_table, config.cache_type
+            self.engine.num_pages, config.page_size, self.engine.page_table, cache_type
         )
         self.decode_manager = DecodeManager(config.page_size)
         self.prefill_manager = PrefillManager(
@@ -209,7 +217,14 @@ class Scheduler(SchedulerIOMixin):
         batch.positions = _make_positions(batch, self.device)
         input_mapping = _make_input_tuple(batch, self.device)
         write_mapping = _make_write_tuple(batch, self.device)
-        batch.out_loc = self.engine.page_table[input_mapping]
+        # Token ids live at logical positions (token_pool), but KV slots are
+        # compacted by R-KV compression: look up out_loc with physical slot
+        # positions, which equal the logical ones until tokens are dropped.
+        slot_positions = _make_slot_positions(batch, self.device)
+        if slot_positions is None:
+            batch.out_loc = self.engine.page_table[input_mapping]
+        else:
+            batch.out_loc = self.engine.page_table[input_mapping[0], slot_positions]
         self.engine.attn_backend.prepare_metadata(batch)
         return ForwardInput(
             batch=batch,
@@ -252,6 +267,29 @@ def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
             req.cached_len,
             req.device_len,
             dtype=torch.int32,
+            out=indices_host[offset : offset + length],
+        )
+        offset += length
+    return indices_host.to(device, non_blocking=True)
+
+
+def _make_slot_positions(batch: Batch, device: torch.device) -> torch.Tensor | None:
+    """Physical page-table positions for the tokens processed this step.
+
+    Returns None when no request has compression-dropped tokens, in which
+    case the logical ``batch.positions`` can be used directly.
+    """
+    if all(r.num_dropped_tokens == 0 for r in batch.padded_reqs):
+        return None
+    needed_size = sum(r.extend_len for r in batch.padded_reqs)
+    indices_host = torch.empty(needed_size, dtype=torch.int64, pin_memory=True)
+    offset = 0
+    for req in batch.padded_reqs:
+        length = req.extend_len
+        torch.arange(
+            req.kv_cached_len,
+            req.kv_len,
+            dtype=torch.int64,
             out=indices_host[offset : offset + length],
         )
         offset += length

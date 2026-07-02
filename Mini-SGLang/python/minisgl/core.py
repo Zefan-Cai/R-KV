@@ -40,6 +40,11 @@ class Req:
         assert self.input_ids.is_cpu
         self.device_len = len(self.input_ids)
         self.max_device_len = len(self.input_ids) + self.output_len
+        # KV slots dropped by decode-time compression (R-KV). device_len /
+        # cached_len stay logical (token count, RoPE positions, stop
+        # condition); kv_len / kv_cached_len are the physical KV lengths
+        # used for page allocation, cache writes, and attention.
+        self.num_dropped_tokens = 0
         assert 0 <= self.cached_len < self.device_len <= self.max_device_len
 
     @property
@@ -49,6 +54,14 @@ class Req:
     @property
     def extend_len(self) -> int:
         return self.device_len - self.cached_len
+
+    @property
+    def kv_len(self) -> int:
+        return self.device_len - self.num_dropped_tokens
+
+    @property
+    def kv_cached_len(self) -> int:
+        return self.cached_len - self.num_dropped_tokens
 
     def complete_one(self) -> None:
         self.cached_len = self.device_len

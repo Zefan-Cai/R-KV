@@ -46,13 +46,12 @@ def forward(self, qkv: torch.Tensor) -> torch.Tensor:
     if ctx.rkv is not None and ctx.rkv.is_enabled and ctx.batch.is_decode:
         new_lens = ctx.rkv.maybe_compress(
             self.layer_id, ctx.kv_cache,
-            ctx.batch.attn_metadata.page_table, ctx.batch,
+            ctx.page_table, ctx.batch,
         )
         if new_lens is not None and self.layer_id == ctx.rkv.num_layers - 1:
             for req, new_len in zip(ctx.batch.padded_reqs, new_lens):
-                if new_len < req.device_len:
-                    req.device_len = new_len
-                    req.cached_len = max(0, new_len - 1)
+                if new_len < req.kv_len:
+                    req.num_dropped_tokens += req.kv_len - new_len
     return o.view(-1, self.qo_attn_dim)
 ```
 
@@ -70,10 +69,15 @@ Compression schedule per step:
    compacts this layer's K/V cache in place: each request's kept K/V
    move to the first `budget` slots of its page allocation, so the
    shared `page_table` stays valid.
-4. On the **last** layer only, the request's `device_len` /
-   `cached_len` are updated to the new shorter length. The scheduler
-   sees the shorter cache on the next step and rebuilds
-   `metadata.cache_seqlens` from it.
+4. On the **last** layer only, the request's `num_dropped_tokens` is
+   increased by the number of dropped slots. `device_len` and
+   `cached_len` stay *logical* (they drive RoPE positions, token-pool
+   indexing, and the `max_tokens` stop condition — shrinking them
+   would make requests generate forever and reset positions); the
+   physical KV length is the derived `req.kv_len =
+   device_len - num_dropped_tokens`, which the scheduler and attention
+   backends use for page allocation, out_loc slot lookup, and
+   `cache_seqlens`.
 
 When a request finishes, the scheduler should call
 `ctx.rkv.drop_request(uid)` so the cached query window for that uid
@@ -123,7 +127,7 @@ all touched files succeeds. Open items:
 - [x] `ctx.rkv` field on the global `Context`, instantiated by the
   Engine when `rkv_enabled=True`.
 - [x] `AttentionLayer.forward` calls `update_query_buffer` /
-  `maybe_compress` with the last-layer guard on `device_len`.
+  `maybe_compress` with the last-layer guard on `num_dropped_tokens`.
 - [x] Hook `ctx.rkv.drop_request(uid)` into the scheduler's
   finished-request path (`Scheduler._free_req_resources`) so the
   per-(uid, layer_id) query buffer can't leak.
