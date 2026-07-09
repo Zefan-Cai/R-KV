@@ -1,0 +1,8 @@
+Loading weights:   0%|          | 0/399 [00:00<?, ?it/s]Loading weights: 100%|██████████| 399/399 [00:00<00:00, 6318.80it/s]
+[transformers] The attention mask is not set and cannot be inferred from input because pad token is same as eos token. As a consequence, you may observe unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results.
+delta profile: s0=0.656 s1=0.438 s2=0.461 s4=0.250 s8=0.250 s16=0.234 s24=0.250 s32=0.375 s48=0.188 s63=0.500
+long_prefill_vs_hfpre: maxdelta=0.5000 argmax_same=True
+fi_vs_hfdec: argmax_agree=64/64 worst_maxdelta=0.6562
+hfdec_vs_hfpre: argmax_agree=64/64 worst_maxdelta=0.7500
+fi_vs_hfpre: argmax_agree=64/64 worst_maxdelta=0.7500
+PROBE_OK

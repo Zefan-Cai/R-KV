@@ -1,0 +1,6 @@
+Loading weights:   0%|          | 0/339 [00:00<?, ?it/s]Loading weights: 100%|██████████| 339/339 [00:00<00:00, 6722.44it/s]
+[transformers] The attention mask is not set and cannot be inferred from input because pad token is same as eos token. As a consequence, you may observe unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results.
+hf_len=200 fi_len=200 common_prefix=200
+hf : First, I'll break down the multiplication of 17 by 23 into smaller, more manageable parts.\n\nI'll start by multiplying 17 by 20, which equals 340.\n\nNext, I'll multiply 17 by 3, resulting in 51
+fi : First, I'll break down the multiplication of 17 by 23 into smaller, more manageable parts.\n\nI'll start by multiplying 17 by 20, which equals 340.\n\nNext, I'll multiply 17 by 3, resulting in 51
+COMPARE_HF_PASS

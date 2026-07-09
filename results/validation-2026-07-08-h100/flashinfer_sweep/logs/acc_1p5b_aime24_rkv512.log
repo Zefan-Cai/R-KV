@@ -1,0 +1,12 @@
+[gen] batch 1/3: 502.3s, output tokens 193532
+[gen] batch 2/3: 500.7s, output tokens 218795
+[gen] batch 3/3: 509.3s, output tokens 211782
+Evaluate:   0%|          | 0/30 [00:00<?, ?it/s]Evaluate:  27%|██▋       | 8/30 [00:00<00:01, 17.63it/s]Evaluate:  87%|████████▋ | 26/30 [00:00<00:00, 55.79it/s]Evaluate: 100%|██████████| 30/30 [00:00<00:00, 53.20it/s]
+{'num_samples': 30, 'num_scores': 30, 'timeout_samples': 0, 'empty_samples': 3, 'acc': np.float64(0.0)}
+== eval_math summary ==
+model=/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-1.5B dataset=aime24 mode=rkv(budget=512, buffer=128) shard=0/1 samples=30
+acc=0.0 empty=3 timeout=0
+tokens: prefill=4931 output=624109 (mean 20803.6/seq) compactions=4778
+generate wall 1512.3s -> 412.7 output tok/s
+records: /mnt/localssd/zefan/rkv-fi/results/records/acc_1p5b_aime24_rkv512.jsonl
+{"script": "eval_math", "timestamp": "2026-07-08T20:53:44", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-1.5B", "dataset": "aime24", "mode": "rkv", "budget": 512, "buffer": 128, "mix_lambda": 0.1, "shard": "0/1", "num_samples": 30, "max_new_tokens": 32768, "temperature": 0.6, "top_p": 0.95, "seed": 42, "acc": 0.0, "empty_samples": 3, "timeout_samples": 0, "prefill_tokens": 4931, "output_tokens": 624109, "mean_output_tokens": 20803.6, "num_compactions": 4778, "gen_wall_s": 1512.29, "output_tok_s": 412.69, "output": "/mnt/localssd/zefan/rkv-fi/results/records/acc_1p5b_aime24_rkv512.jsonl"}

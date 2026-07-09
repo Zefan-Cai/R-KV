@@ -1,0 +1,22 @@
+[gen] batch 1/13: 12.0s, output tokens 3249
+[gen] batch 2/13: 8.9s, output tokens 3180
+[gen] batch 3/13: 8.3s, output tokens 3110
+[gen] batch 4/13: 11.5s, output tokens 4204
+[gen] batch 5/13: 10.0s, output tokens 3405
+[gen] batch 6/13: 12.4s, output tokens 4232
+[gen] batch 7/13: 15.7s, output tokens 4679
+[gen] batch 8/13: 9.8s, output tokens 3979
+[gen] batch 9/13: 10.9s, output tokens 3940
+[gen] batch 10/13: 10.9s, output tokens 3612
+[gen] batch 11/13: 10.2s, output tokens 3813
+[gen] batch 12/13: 17.3s, output tokens 4615
+[gen] batch 13/13: 7.7s, output tokens 1681
+Evaluate:   0%|          | 0/100 [00:00<?, ?it/s]Evaluate:  31%|███       | 31/100 [00:00<00:00, 232.72it/s]Evaluate: 100%|██████████| 100/100 [00:00<00:00, 655.06it/s]
+{'num_samples': 100, 'num_scores': 100, 'timeout_samples': 0, 'empty_samples': 0, 'acc': np.float64(82.0)}
+== eval_math summary ==
+model=/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-7B dataset=gsm8k mode=rkv(budget=512, buffer=128) shard=0/1 samples=100
+acc=82.0 empty=0 timeout=0
+tokens: prefill=11875 output=47699 (mean 477.0/seq) compactions=55
+generate wall 145.5s -> 327.9 output tok/s
+records: /mnt/localssd/zefan/rkv-fi/results/records/acc_7b_gsm8k_rkv512.jsonl
+{"script": "eval_math", "timestamp": "2026-07-08T21:46:01", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-7B", "dataset": "gsm8k", "mode": "rkv", "budget": 512, "buffer": 128, "mix_lambda": 0.1, "shard": "0/1", "num_samples": 100, "max_new_tokens": 8192, "temperature": 0.6, "top_p": 0.95, "seed": 42, "acc": 82.0, "empty_samples": 0, "timeout_samples": 0, "prefill_tokens": 11875, "output_tokens": 47699, "mean_output_tokens": 477.0, "num_compactions": 55, "gen_wall_s": 145.45, "output_tok_s": 327.94, "output": "/mnt/localssd/zefan/rkv-fi/results/records/acc_7b_gsm8k_rkv512.jsonl"}

@@ -1,0 +1,6 @@
+Loading weights:   0%|          | 0/311 [00:00<?, ?it/s]Loading weights: 100%|██████████| 311/311 [00:00<00:00, 6654.67it/s]
+[transformers] The attention mask is not set and cannot be inferred from input because pad token is same as eos token. As a consequence, you may observe unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results.
+hf_len=200 fi_len=200 common_prefix=8
+hf : <think>\nOkay, so I need to figure out what 17 multiplied by 23 is. Let me think about how to approach this. Hmm, I remember that multiplying two numbers can be done by breaking them down into smaller
+fi : <think>\nOkay, so I need to find the product of 17 and 23. Hmm, let me think about how to approach this.\n\nFirst, I remember that multiplying two numbers can be done by breaking them down into smalle
+COMPARE_HF_FAIL

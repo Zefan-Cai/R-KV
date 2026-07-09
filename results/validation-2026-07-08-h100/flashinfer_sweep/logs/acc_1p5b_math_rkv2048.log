@@ -1,0 +1,16 @@
+[gen] batch 1/7: 246.3s, output tokens 46607
+[gen] batch 2/7: 242.0s, output tokens 66896
+[gen] batch 3/7: 251.5s, output tokens 32909
+[gen] batch 4/7: 152.9s, output tokens 23825
+[gen] batch 5/7: 97.9s, output tokens 23952
+[gen] batch 6/7: 244.4s, output tokens 77215
+[gen] batch 7/7: 256.5s, output tokens 19238
+Evaluate:   0%|          | 0/100 [00:00<?, ?it/s]Evaluate:  12%|█▏        | 12/100 [00:00<00:01, 87.99it/s]Evaluate:  22%|██▏       | 22/100 [00:00<00:01, 73.41it/s]Evaluate:  95%|█████████▌| 95/100 [00:00<00:00, 246.02it/s]Evaluate: 100%|██████████| 100/100 [00:00<00:00, 201.03it/s]
+{'num_samples': 100, 'num_scores': 100, 'timeout_samples': 0, 'empty_samples': 1, 'acc': np.float64(75.0)}
+== eval_math summary ==
+model=/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-1.5B dataset=math mode=rkv(budget=2048, buffer=128) shard=0/1 samples=100
+acc=75.0 empty=1 timeout=0
+tokens: prefill=11849 output=290642 (mean 2906.4/seq) compactions=1447
+generate wall 1491.5s -> 194.9 output tok/s
+records: /mnt/localssd/zefan/rkv-fi/results/records/acc_1p5b_math_rkv2048.jsonl
+{"script": "eval_math", "timestamp": "2026-07-08T20:28:22", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-1.5B", "dataset": "math", "mode": "rkv", "budget": 2048, "buffer": 128, "mix_lambda": 0.1, "shard": "0/1", "num_samples": 100, "max_new_tokens": 16384, "temperature": 0.6, "top_p": 0.95, "seed": 42, "acc": 75.0, "empty_samples": 1, "timeout_samples": 0, "prefill_tokens": 11849, "output_tokens": 290642, "mean_output_tokens": 2906.4, "num_compactions": 1447, "gen_wall_s": 1491.48, "output_tok_s": 194.87, "output": "/mnt/localssd/zefan/rkv-fi/results/records/acc_1p5b_math_rkv2048.jsonl"}

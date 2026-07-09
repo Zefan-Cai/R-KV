@@ -1,0 +1,7 @@
+model=/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-7B mode=rkv(budget=1024, buffer=128) batch=8 prompt_len=512 gen_len=8192 trials=2
+trial    wall_s  prefill_s  decode_s  decode_tok/s  tok/s/seq  compactions  compaction_s
+    1    133.58      0.090    133.49         490.9       61.4          472         7.957
+    2    133.07      0.088    132.98         492.8       61.6          472         7.880
+ mean    133.33      0.089    133.24         491.9       61.5        472.0         7.918
+peak torch.cuda.max_memory_allocated: 15.57 GiB
+{"script": "bench_rkv", "timestamp": "2026-07-09T00:37:06", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-7B", "mode": "rkv", "budget": 1024, "buffer": 128, "mix_lambda": 0.1, "batch_size": 8, "prompt_len": 512, "gen_len": 8192, "trials": 2, "prefill_s_mean": 0.0891, "decode_s_mean": 133.238, "decode_tok_s_mean": 491.87, "decode_tok_s_per_seq_mean": 61.48, "num_compactions_mean": 472.0, "compaction_s_mean": 7.9184, "peak_mem_gib": 15.569, "per_trial": [{"wall_s": 133.58122750371695, "prefill_s": 0.08975767996162176, "decode_s": 133.49121319316328, "new_tokens": 65536, "decode_tok_s": 490.9386800250941, "decode_tok_s_per_seq": 61.36733500313676, "num_compactions": 472, "compaction_s": 7.956836382392794}, {"wall_s": 133.07339274603873, "prefill_s": 0.08836858393624425, "decode_s": 132.98474635882303, "new_tokens": 65536, "decode_tok_s": 492.80839941724594, "decode_tok_s_per_seq": 61.60104992715574, "num_compactions": 472, "compaction_s": 7.87992186145857}]}

@@ -1,0 +1,9 @@
+[transformers] Ignoring clean_up_tokenization_spaces=True for BPE tokenizer TokenizersBackend. The clean_up_tokenization post-processing step is designed for WordPiece tokenizers and is destructive for BPE (it strips spaces before punctuation). Set clean_up_tokenization_spaces=False to suppress this warning, or set clean_up_tokenization_spaces_for_bpe_even_though_it_will_corrupt_output=True to force cleanup anyway.
+
+===== FLASHINFER (rkv_on) =====
+Output(1104 chars): 'To find the average speed for the entire journey, we need to calculate the total distance traveled and the total time taken.\n\nStep 1: Calculate the distance traveled in the first part of the journey.\n\nDistance = Speed × Time\nDistance = 60 km / 45 minutes\nDistance = 60 km / (45/60) hours\nDistance = 60 km / 0.75 hours\nDistance = 80 km\n\nDistance = 80 km\n\nAverage speed for the first part of the journey = Total distance / Total time\nAverage speed for the first part of the journey = 80 km / (45/60) hours\nAverage speed for the first part of the journey = 80 km / 0.75 hours\nAverage speed for the first part of the journey = 106.67 km/h\n\nSimilarly, for the second part of the journey:\n\nTotal distance = 80 km + 80 km = 160 km\nTotal time = 75 minutes + 45 minutes = 120 minutes\nAverage speed = Total dis'
+RKV_COMPACTIONS 19 finish=stop
+HEALTH_PASS flashinfer[rkv_on] chars=1104 distinct=37 rep20=2 printable=0.973
+LOAD_SECONDS 0.686
+GENERATE_SECONDS 6.200
+FLASHINFER_SMOKE_PASS

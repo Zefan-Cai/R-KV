@@ -1,0 +1,69 @@
+# name | timeout_s | command (run under venv python, cwd=/mnt/localssd/zefan/rkv-fi)
+# --- quick family smokes + HF comparisons first (loader/arch coverage) ---
+smoke_qwen3_8b_off|1800|RKV_SMOKE_MODEL=$M/Qwen3-8B RKV_ON=0 $PY R-KV/tests/smoke/flashinfer_smoke.py
+smoke_qwen3_8b_on|1800|RKV_SMOKE_MODEL=$M/Qwen3-8B RKV_ON=1 $PY R-KV/tests/smoke/flashinfer_smoke.py
+smoke_llama32_1b_off|1800|RKV_SMOKE_MODEL=$M/Llama-3.2-1B-Instruct RKV_ON=0 $PY R-KV/tests/smoke/flashinfer_smoke.py
+smoke_llama32_1b_on|1800|RKV_SMOKE_MODEL=$M/Llama-3.2-1B-Instruct RKV_ON=1 $PY R-KV/tests/smoke/flashinfer_smoke.py
+compare_hf_7b|2400|$PY compare_hf.py --model $M/DeepSeek-R1-Distill-Qwen-7B
+compare_hf_qwen3_06b|1800|$PY compare_hf.py --model $M/Qwen3-0.6B
+compare_hf_llama32_1b|1800|$PY compare_hf.py --model $M/Llama-3.2-1B-Instruct
+# --- accuracy matrix: DeepSeek-R1-Distill-Qwen-1.5B ---
+acc_1p5b_gsm8k_fullkv|7200|$PY $B/eval_math.py --model $M/DeepSeek-R1-Distill-Qwen-1.5B --dataset gsm8k --mode fullkv --max-samples 100 --bsz 16 --output $R/records/acc_1p5b_gsm8k_fullkv.jsonl
+acc_1p5b_gsm8k_rkv512|7200|$PY $B/eval_math.py --model $M/DeepSeek-R1-Distill-Qwen-1.5B --dataset gsm8k --mode rkv --budget 512 --max-samples 100 --bsz 16 --output $R/records/acc_1p5b_gsm8k_rkv512.jsonl
+acc_1p5b_gsm8k_rkv1024|7200|$PY $B/eval_math.py --model $M/DeepSeek-R1-Distill-Qwen-1.5B --dataset gsm8k --mode rkv --budget 1024 --max-samples 100 --bsz 16 --output $R/records/acc_1p5b_gsm8k_rkv1024.jsonl
+acc_1p5b_gsm8k_rkv2048|7200|$PY $B/eval_math.py --model $M/DeepSeek-R1-Distill-Qwen-1.5B --dataset gsm8k --mode rkv --budget 2048 --max-samples 100 --bsz 16 --output $R/records/acc_1p5b_gsm8k_rkv2048.jsonl
+acc_1p5b_math_fullkv|10800|$PY $B/eval_math.py --model $M/DeepSeek-R1-Distill-Qwen-1.5B --dataset math --mode fullkv --max-samples 100 --bsz 16 --output $R/records/acc_1p5b_math_fullkv.jsonl
+acc_1p5b_math_rkv512|10800|$PY $B/eval_math.py --model $M/DeepSeek-R1-Distill-Qwen-1.5B --dataset math --mode rkv --budget 512 --max-samples 100 --bsz 16 --output $R/records/acc_1p5b_math_rkv512.jsonl
+acc_1p5b_math_rkv1024|10800|$PY $B/eval_math.py --model $M/DeepSeek-R1-Distill-Qwen-1.5B --dataset math --mode rkv --budget 1024 --max-samples 100 --bsz 16 --output $R/records/acc_1p5b_math_rkv1024.jsonl
+acc_1p5b_math_rkv2048|10800|$PY $B/eval_math.py --model $M/DeepSeek-R1-Distill-Qwen-1.5B --dataset math --mode rkv --budget 2048 --max-samples 100 --bsz 16 --output $R/records/acc_1p5b_math_rkv2048.jsonl
+acc_1p5b_aime24_fullkv|10800|$PY $B/eval_math.py --model $M/DeepSeek-R1-Distill-Qwen-1.5B --dataset aime24 --mode fullkv --bsz 10 --output $R/records/acc_1p5b_aime24_fullkv.jsonl
+acc_1p5b_aime24_rkv512|10800|$PY $B/eval_math.py --model $M/DeepSeek-R1-Distill-Qwen-1.5B --dataset aime24 --mode rkv --budget 512 --bsz 10 --output $R/records/acc_1p5b_aime24_rkv512.jsonl
+acc_1p5b_aime24_rkv1024|10800|$PY $B/eval_math.py --model $M/DeepSeek-R1-Distill-Qwen-1.5B --dataset aime24 --mode rkv --budget 1024 --bsz 10 --output $R/records/acc_1p5b_aime24_rkv1024.jsonl
+acc_1p5b_aime24_rkv2048|10800|$PY $B/eval_math.py --model $M/DeepSeek-R1-Distill-Qwen-1.5B --dataset aime24 --mode rkv --budget 2048 --bsz 10 --output $R/records/acc_1p5b_aime24_rkv2048.jsonl
+# --- SnapKV-style ablation (attention-only scoring) on 1.5B ---
+acc_1p5b_gsm8k_snapkv1024|7200|$PY $B/eval_math.py --model $M/DeepSeek-R1-Distill-Qwen-1.5B --dataset gsm8k --mode rkv --budget 1024 --mix-lambda 1.0 --max-samples 100 --bsz 16 --output $R/records/acc_1p5b_gsm8k_snapkv1024.jsonl
+acc_1p5b_math_snapkv1024|10800|$PY $B/eval_math.py --model $M/DeepSeek-R1-Distill-Qwen-1.5B --dataset math --mode rkv --budget 1024 --mix-lambda 1.0 --max-samples 100 --bsz 16 --output $R/records/acc_1p5b_math_snapkv1024.jsonl
+acc_1p5b_aime24_snapkv1024|10800|$PY $B/eval_math.py --model $M/DeepSeek-R1-Distill-Qwen-1.5B --dataset aime24 --mode rkv --budget 1024 --mix-lambda 1.0 --bsz 10 --output $R/records/acc_1p5b_aime24_snapkv1024.jsonl
+# --- accuracy matrix: DeepSeek-R1-Distill-Qwen-7B ---
+acc_7b_gsm8k_fullkv|10800|$PY $B/eval_math.py --model $M/DeepSeek-R1-Distill-Qwen-7B --dataset gsm8k --mode fullkv --max-samples 100 --bsz 8 --output $R/records/acc_7b_gsm8k_fullkv.jsonl
+acc_7b_gsm8k_rkv512|10800|$PY $B/eval_math.py --model $M/DeepSeek-R1-Distill-Qwen-7B --dataset gsm8k --mode rkv --budget 512 --max-samples 100 --bsz 8 --output $R/records/acc_7b_gsm8k_rkv512.jsonl
+acc_7b_gsm8k_rkv1024|10800|$PY $B/eval_math.py --model $M/DeepSeek-R1-Distill-Qwen-7B --dataset gsm8k --mode rkv --budget 1024 --max-samples 100 --bsz 8 --output $R/records/acc_7b_gsm8k_rkv1024.jsonl
+acc_7b_gsm8k_rkv2048|10800|$PY $B/eval_math.py --model $M/DeepSeek-R1-Distill-Qwen-7B --dataset gsm8k --mode rkv --budget 2048 --max-samples 100 --bsz 8 --output $R/records/acc_7b_gsm8k_rkv2048.jsonl
+acc_7b_math_fullkv|14400|$PY $B/eval_math.py --model $M/DeepSeek-R1-Distill-Qwen-7B --dataset math --mode fullkv --max-samples 100 --bsz 8 --output $R/records/acc_7b_math_fullkv.jsonl
+acc_7b_math_rkv512|14400|$PY $B/eval_math.py --model $M/DeepSeek-R1-Distill-Qwen-7B --dataset math --mode rkv --budget 512 --max-samples 100 --bsz 8 --output $R/records/acc_7b_math_rkv512.jsonl
+acc_7b_math_rkv1024|14400|$PY $B/eval_math.py --model $M/DeepSeek-R1-Distill-Qwen-7B --dataset math --mode rkv --budget 1024 --max-samples 100 --bsz 8 --output $R/records/acc_7b_math_rkv1024.jsonl
+acc_7b_math_rkv2048|14400|$PY $B/eval_math.py --model $M/DeepSeek-R1-Distill-Qwen-7B --dataset math --mode rkv --budget 2048 --max-samples 100 --bsz 8 --output $R/records/acc_7b_math_rkv2048.jsonl
+acc_7b_aime24_fullkv|14400|$PY $B/eval_math.py --model $M/DeepSeek-R1-Distill-Qwen-7B --dataset aime24 --mode fullkv --bsz 6 --output $R/records/acc_7b_aime24_fullkv.jsonl
+acc_7b_aime24_rkv512|14400|$PY $B/eval_math.py --model $M/DeepSeek-R1-Distill-Qwen-7B --dataset aime24 --mode rkv --budget 512 --bsz 6 --output $R/records/acc_7b_aime24_rkv512.jsonl
+acc_7b_aime24_rkv1024|14400|$PY $B/eval_math.py --model $M/DeepSeek-R1-Distill-Qwen-7B --dataset aime24 --mode rkv --budget 1024 --bsz 6 --output $R/records/acc_7b_aime24_rkv1024.jsonl
+acc_7b_aime24_rkv2048|14400|$PY $B/eval_math.py --model $M/DeepSeek-R1-Distill-Qwen-7B --dataset aime24 --mode rkv --budget 2048 --bsz 6 --output $R/records/acc_7b_aime24_rkv2048.jsonl
+# --- perf matrix: 1.5B ---
+perf_1p5b_b1_g2048_fullkv|3600|$PY $B/bench_rkv.py --model $M/DeepSeek-R1-Distill-Qwen-1.5B --mode fullkv --batch-size 1 --gen-len 2048
+perf_1p5b_b1_g2048_rkv1024|3600|$PY $B/bench_rkv.py --model $M/DeepSeek-R1-Distill-Qwen-1.5B --mode rkv --budget 1024 --batch-size 1 --gen-len 2048
+perf_1p5b_b8_g2048_fullkv|3600|$PY $B/bench_rkv.py --model $M/DeepSeek-R1-Distill-Qwen-1.5B --mode fullkv --batch-size 8 --gen-len 2048
+perf_1p5b_b8_g2048_rkv1024|3600|$PY $B/bench_rkv.py --model $M/DeepSeek-R1-Distill-Qwen-1.5B --mode rkv --budget 1024 --batch-size 8 --gen-len 2048
+perf_1p5b_b32_g2048_fullkv|5400|$PY $B/bench_rkv.py --model $M/DeepSeek-R1-Distill-Qwen-1.5B --mode fullkv --batch-size 32 --gen-len 2048
+perf_1p5b_b32_g2048_rkv1024|5400|$PY $B/bench_rkv.py --model $M/DeepSeek-R1-Distill-Qwen-1.5B --mode rkv --budget 1024 --batch-size 32 --gen-len 2048
+perf_1p5b_b8_g8192_fullkv|7200|$PY $B/bench_rkv.py --model $M/DeepSeek-R1-Distill-Qwen-1.5B --mode fullkv --batch-size 8 --gen-len 8192 --trials 2
+perf_1p5b_b8_g8192_rkv1024|7200|$PY $B/bench_rkv.py --model $M/DeepSeek-R1-Distill-Qwen-1.5B --mode rkv --budget 1024 --batch-size 8 --gen-len 8192 --trials 2
+# --- perf matrix: 7B ---
+perf_7b_b1_g2048_fullkv|3600|$PY $B/bench_rkv.py --model $M/DeepSeek-R1-Distill-Qwen-7B --mode fullkv --batch-size 1 --gen-len 2048
+perf_7b_b1_g2048_rkv1024|3600|$PY $B/bench_rkv.py --model $M/DeepSeek-R1-Distill-Qwen-7B --mode rkv --budget 1024 --batch-size 1 --gen-len 2048
+perf_7b_b8_g2048_fullkv|5400|$PY $B/bench_rkv.py --model $M/DeepSeek-R1-Distill-Qwen-7B --mode fullkv --batch-size 8 --gen-len 2048
+perf_7b_b8_g2048_rkv1024|5400|$PY $B/bench_rkv.py --model $M/DeepSeek-R1-Distill-Qwen-7B --mode rkv --budget 1024 --batch-size 8 --gen-len 2048
+perf_7b_b32_g2048_fullkv|7200|$PY $B/bench_rkv.py --model $M/DeepSeek-R1-Distill-Qwen-7B --mode fullkv --batch-size 32 --gen-len 2048
+perf_7b_b32_g2048_rkv1024|7200|$PY $B/bench_rkv.py --model $M/DeepSeek-R1-Distill-Qwen-7B --mode rkv --budget 1024 --batch-size 32 --gen-len 2048
+perf_7b_b8_g8192_fullkv|10800|$PY $B/bench_rkv.py --model $M/DeepSeek-R1-Distill-Qwen-7B --mode fullkv --batch-size 8 --gen-len 8192 --trials 2
+perf_7b_b8_g8192_rkv1024|10800|$PY $B/bench_rkv.py --model $M/DeepSeek-R1-Distill-Qwen-7B --mode rkv --budget 1024 --batch-size 8 --gen-len 8192 --trials 2
+smoke2_qwen3_06b_off|1800|RKV_SMOKE_MODEL=$M/Qwen3-0.6B RKV_ON=0 $PY R-KV/tests/smoke/flashinfer_smoke.py
+smoke2_qwen3_06b_on|1800|RKV_SMOKE_MODEL=$M/Qwen3-0.6B RKV_ON=1 $PY R-KV/tests/smoke/flashinfer_smoke.py
+smoke2_qwen3_8b_off|1800|RKV_SMOKE_MODEL=$M/Qwen3-8B RKV_ON=0 $PY R-KV/tests/smoke/flashinfer_smoke.py
+smoke2_qwen3_8b_on|1800|RKV_SMOKE_MODEL=$M/Qwen3-8B RKV_ON=1 $PY R-KV/tests/smoke/flashinfer_smoke.py
+smoke2_llama32_1b_off|1800|RKV_SMOKE_MODEL=$M/Llama-3.2-1B-Instruct RKV_ON=0 $PY R-KV/tests/smoke/flashinfer_smoke.py
+smoke2_llama32_1b_on|1800|RKV_SMOKE_MODEL=$M/Llama-3.2-1B-Instruct RKV_ON=1 $PY R-KV/tests/smoke/flashinfer_smoke.py
+probe2_qwen3_06b|2400|$PY probe_logits.py --model $M/Qwen3-0.6B --flashinfer-dir /mnt/localssd/zefan/rkv-fi/R-KV/FlashInfer
+probe2_llama32_1b|2400|$PY probe_logits.py --model $M/Llama-3.2-1B-Instruct --flashinfer-dir /mnt/localssd/zefan/rkv-fi/R-KV/FlashInfer
+probe2_qwen3_8b|2400|$PY probe_logits.py --model $M/Qwen3-8B --flashinfer-dir /mnt/localssd/zefan/rkv-fi/R-KV/FlashInfer
+probe2_r1_7b|2400|$PY probe_logits.py --model $M/DeepSeek-R1-Distill-Qwen-7B --flashinfer-dir /mnt/localssd/zefan/rkv-fi/R-KV/FlashInfer
+perf_1p5b_b4_p4096_rkv512|3600|$PY $B/bench_rkv.py --model $M/DeepSeek-R1-Distill-Qwen-1.5B --mode rkv --budget 512 --batch-size 4 --prompt-len 4096 --gen-len 512 --trials 2
+perf_7b_b4_p4096_rkv512|5400|$PY $B/bench_rkv.py --model $M/DeepSeek-R1-Distill-Qwen-7B --mode rkv --budget 512 --batch-size 4 --prompt-len 4096 --gen-len 512 --trials 2

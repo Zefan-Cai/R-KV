@@ -172,8 +172,11 @@ algorithm (house convention across backends).
 
 ## Results
 
-See `benchmark/RESULTS_*.md` (pending GPU validation — accuracy and
-throughput/memory matrices per [`docs/DESIGN.md`](docs/DESIGN.md) §8).
+See [`benchmark/RESULTS_H100.md`](benchmark/RESULTS_H100.md) — full H100
+accuracy matrix (GSM8K / MATH-500 / AIME24 on DeepSeek-R1-Distill 1.5B/7B,
+budgets 512/1024/2048 + SnapKV-style ablation), throughput/memory bench,
+logit-level HF parity probes, and the post-sweep optimization A/B. Raw
+artifacts live under `results/validation-2026-07-08-h100/flashinfer_sweep/`.
 
 ## Learn more
 

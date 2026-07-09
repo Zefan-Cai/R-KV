@@ -1,0 +1,7 @@
+Loading weights:   0%|          | 0/146 [00:00<?, ?it/s]Loading weights: 100%|██████████| 146/146 [00:00<00:00, 6746.67it/s]
+[transformers] The attention mask is not set and cannot be inferred from input because pad token is same as eos token. As a consequence, you may observe unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results.
+[transformers] Ignoring clean_up_tokenization_spaces=True for BPE tokenizer TokenizersBackend. The clean_up_tokenization post-processing step is designed for WordPiece tokenizers and is destructive for BPE (it strips spaces before punctuation). Set clean_up_tokenization_spaces=False to suppress this warning, or set clean_up_tokenization_spaces_for_bpe_even_though_it_will_corrupt_output=True to force cleanup anyway.
+hf_len=89 fi_len=127 common_prefix=12
+hf : To find the product of 17 and 23, we'll multiply them step by step:\n\n1. Multiply 17 by 20: 17 * 20 = 340\n2. Multiply 17 by 3: 17 * 3 = 51\n3. Add the results
+fi : To find the product of 17 and 23, we can follow the steps below:\n\n1. Multiply 17 by 20 (since 23 is 3 more than 20).\n2. Multiply the result from step 1 by 3.\n3. Add the result from step 2
+COMPARE_HF_FAIL

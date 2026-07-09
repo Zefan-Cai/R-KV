@@ -1,0 +1,126 @@
+START gpu0 smoke_qwen3_8b_off 2026-07-09T02:26:03Z
+DONE gpu0 smoke_qwen3_8b_off OK 29s 
+START gpu0 smoke_qwen3_8b_on 2026-07-09T02:26:32Z
+DONE gpu0 smoke_qwen3_8b_on OK 32s 
+START gpu0 smoke_llama32_1b_off 2026-07-09T02:27:04Z
+DONE gpu0 smoke_llama32_1b_off OK 79s 
+START gpu0 smoke_llama32_1b_on 2026-07-09T02:28:23Z
+DONE gpu0 smoke_llama32_1b_on FAIL(1) 10s 
+START gpu0 compare_hf_7b 2026-07-09T02:28:33Z
+DONE gpu0 compare_hf_7b OK 49s 
+START gpu0 compare_hf_qwen3_06b 2026-07-09T02:29:22Z
+DONE gpu0 compare_hf_qwen3_06b FAIL(1) 21s 
+START gpu0 compare_hf_llama32_1b 2026-07-09T02:29:43Z
+DONE gpu0 compare_hf_llama32_1b FAIL(1) 19s 
+START gpu0 acc_1p5b_gsm8k_fullkv 2026-07-09T02:30:02Z
+START gpu1 acc_1p5b_gsm8k_rkv512 2026-07-09T02:30:40Z
+DONE gpu0 acc_1p5b_gsm8k_fullkv OK 86s {"script": "eval_math", "timestamp": "2026-07-08T19:31:27", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-1.5B", "dataset": "gsm8k", "mode": "fullkv", "budget": null, "buffer": null, "mix_lambda": null, "shard": "0/1", "num_samples": 100, "max_new_tokens": 8192, "temperature": 0.6, "top_p": 0.95, "seed": 42, "acc": 71.0, "empty_samples": 0, "t
+START gpu0 acc_1p5b_gsm8k_rkv1024 2026-07-09T02:31:28Z
+DONE gpu1 acc_1p5b_gsm8k_rkv512 OK 95s {"script": "eval_math", "timestamp": "2026-07-08T19:32:14", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-1.5B", "dataset": "gsm8k", "mode": "rkv", "budget": 512, "buffer": 128, "mix_lambda": 0.1, "shard": "0/1", "num_samples": 100, "max_new_tokens": 8192, "temperature": 0.6, "top_p": 0.95, "seed": 42, "acc": 71.0, "empty_samples": 0, "timeout
+START gpu1 acc_1p5b_gsm8k_rkv2048 2026-07-09T02:32:15Z
+DONE gpu0 acc_1p5b_gsm8k_rkv1024 OK 95s {"script": "eval_math", "timestamp": "2026-07-08T19:33:01", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-1.5B", "dataset": "gsm8k", "mode": "rkv", "budget": 1024, "buffer": 128, "mix_lambda": 0.1, "shard": "0/1", "num_samples": 100, "max_new_tokens": 8192, "temperature": 0.6, "top_p": 0.95, "seed": 42, "acc": 71.0, "empty_samples": 0, "timeou
+START gpu0 acc_1p5b_math_fullkv 2026-07-09T02:33:03Z
+DONE gpu1 acc_1p5b_gsm8k_rkv2048 OK 95s {"script": "eval_math", "timestamp": "2026-07-08T19:33:49", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-1.5B", "dataset": "gsm8k", "mode": "rkv", "budget": 2048, "buffer": 128, "mix_lambda": 0.1, "shard": "0/1", "num_samples": 100, "max_new_tokens": 8192, "temperature": 0.6, "top_p": 0.95, "seed": 42, "acc": 71.0, "empty_samples": 0, "timeou
+START gpu1 acc_1p5b_math_rkv512 2026-07-09T02:33:50Z
+DONE gpu0 acc_1p5b_math_fullkv OK 1453s {"script": "eval_math", "timestamp": "2026-07-08T19:57:15", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-1.5B", "dataset": "math", "mode": "fullkv", "budget": null, "buffer": null, "mix_lambda": null, "shard": "0/1", "num_samples": 100, "max_new_tokens": 16384, "temperature": 0.6, "top_p": 0.95, "seed": 42, "acc": 77.0, "empty_samples": 0, "t
+START gpu0 acc_1p5b_math_rkv1024 2026-07-09T02:57:16Z
+DONE gpu1 acc_1p5b_math_rkv512 OK 1773s {"script": "eval_math", "timestamp": "2026-07-08T20:03:22", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-1.5B", "dataset": "math", "mode": "rkv", "budget": 512, "buffer": 128, "mix_lambda": 0.1, "shard": "0/1", "num_samples": 100, "max_new_tokens": 16384, "temperature": 0.6, "top_p": 0.95, "seed": 42, "acc": 64.0, "empty_samples": 7, "timeout
+START gpu1 acc_1p5b_math_rkv2048 2026-07-09T03:03:24Z
+DONE gpu0 acc_1p5b_math_rkv1024 OK 1741s {"script": "eval_math", "timestamp": "2026-07-08T20:26:16", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-1.5B", "dataset": "math", "mode": "rkv", "budget": 1024, "buffer": 128, "mix_lambda": 0.1, "shard": "0/1", "num_samples": 100, "max_new_tokens": 16384, "temperature": 0.6, "top_p": 0.95, "seed": 42, "acc": 73.0, "empty_samples": 0, "timeou
+START gpu0 acc_1p5b_aime24_fullkv 2026-07-09T03:26:17Z
+DONE gpu1 acc_1p5b_math_rkv2048 OK 1499s {"script": "eval_math", "timestamp": "2026-07-08T20:28:22", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-1.5B", "dataset": "math", "mode": "rkv", "budget": 2048, "buffer": 128, "mix_lambda": 0.1, "shard": "0/1", "num_samples": 100, "max_new_tokens": 16384, "temperature": 0.6, "top_p": 0.95, "seed": 42, "acc": 75.0, "empty_samples": 1, "timeou
+START gpu1 acc_1p5b_aime24_rkv512 2026-07-09T03:28:23Z
+DONE gpu0 acc_1p5b_aime24_fullkv OK 1300s {"script": "eval_math", "timestamp": "2026-07-08T20:47:54", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-1.5B", "dataset": "aime24", "mode": "fullkv", "budget": null, "buffer": null, "mix_lambda": null, "shard": "0/1", "num_samples": 30, "max_new_tokens": 32768, "temperature": 0.6, "top_p": 0.95, "seed": 42, "acc": 20.0, "empty_samples": 0, "
+START gpu0 acc_1p5b_aime24_rkv1024 2026-07-09T03:47:57Z
+DONE gpu1 acc_1p5b_aime24_rkv512 OK 1522s {"script": "eval_math", "timestamp": "2026-07-08T20:53:44", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-1.5B", "dataset": "aime24", "mode": "rkv", "budget": 512, "buffer": 128, "mix_lambda": 0.1, "shard": "0/1", "num_samples": 30, "max_new_tokens": 32768, "temperature": 0.6, "top_p": 0.95, "seed": 42, "acc": 0.0, "empty_samples": 3, "timeout
+START gpu1 acc_1p5b_aime24_rkv2048 2026-07-09T03:53:45Z
+DONE gpu0 acc_1p5b_aime24_rkv1024 OK 1501s {"script": "eval_math", "timestamp": "2026-07-08T21:12:54", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-1.5B", "dataset": "aime24", "mode": "rkv", "budget": 1024, "buffer": 128, "mix_lambda": 0.1, "shard": "0/1", "num_samples": 30, "max_new_tokens": 32768, "temperature": 0.6, "top_p": 0.95, "seed": 42, "acc": 6.7, "empty_samples": 0, "timeou
+START gpu0 acc_1p5b_gsm8k_snapkv1024 2026-07-09T04:12:58Z
+DONE gpu0 acc_1p5b_gsm8k_snapkv1024 OK 95s {"script": "eval_math", "timestamp": "2026-07-08T21:14:32", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-1.5B", "dataset": "gsm8k", "mode": "rkv", "budget": 1024, "buffer": 128, "mix_lambda": 1.0, "shard": "0/1", "num_samples": 100, "max_new_tokens": 8192, "temperature": 0.6, "top_p": 0.95, "seed": 42, "acc": 71.0, "empty_samples": 0, "timeou
+START gpu0 acc_1p5b_math_snapkv1024 2026-07-09T04:14:33Z
+DONE gpu1 acc_1p5b_aime24_rkv2048 OK 1484s {"script": "eval_math", "timestamp": "2026-07-08T21:18:28", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-1.5B", "dataset": "aime24", "mode": "rkv", "budget": 2048, "buffer": 128, "mix_lambda": 0.1, "shard": "0/1", "num_samples": 30, "max_new_tokens": 32768, "temperature": 0.6, "top_p": 0.95, "seed": 42, "acc": 13.3, "empty_samples": 0, "timeo
+START gpu1 acc_1p5b_aime24_snapkv1024 2026-07-09T04:18:29Z
+DONE gpu0 acc_1p5b_math_snapkv1024 OK 1599s {"script": "eval_math", "timestamp": "2026-07-08T21:41:10", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-1.5B", "dataset": "math", "mode": "rkv", "budget": 1024, "buffer": 128, "mix_lambda": 1.0, "shard": "0/1", "num_samples": 100, "max_new_tokens": 16384, "temperature": 0.6, "top_p": 0.95, "seed": 42, "acc": 71.0, "empty_samples": 1, "timeou
+START gpu0 acc_7b_gsm8k_fullkv 2026-07-09T04:41:12Z
+DONE gpu0 acc_7b_gsm8k_fullkv OK 135s {"script": "eval_math", "timestamp": "2026-07-08T21:43:26", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-7B", "dataset": "gsm8k", "mode": "fullkv", "budget": null, "buffer": null, "mix_lambda": null, "shard": "0/1", "num_samples": 100, "max_new_tokens": 8192, "temperature": 0.6, "top_p": 0.95, "seed": 42, "acc": 82.0, "empty_samples": 0, "tim
+START gpu0 acc_7b_gsm8k_rkv512 2026-07-09T04:43:27Z
+DONE gpu1 acc_1p5b_aime24_snapkv1024 OK 1546s {"script": "eval_math", "timestamp": "2026-07-08T21:44:14", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-1.5B", "dataset": "aime24", "mode": "rkv", "budget": 1024, "buffer": 128, "mix_lambda": 1.0, "shard": "0/1", "num_samples": 30, "max_new_tokens": 32768, "temperature": 0.6, "top_p": 0.95, "seed": 42, "acc": 6.7, "empty_samples": 0, "timeou
+START gpu1 acc_7b_gsm8k_rkv1024 2026-07-09T04:44:15Z
+DONE gpu0 acc_7b_gsm8k_rkv512 OK 155s {"script": "eval_math", "timestamp": "2026-07-08T21:46:01", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-7B", "dataset": "gsm8k", "mode": "rkv", "budget": 512, "buffer": 128, "mix_lambda": 0.1, "shard": "0/1", "num_samples": 100, "max_new_tokens": 8192, "temperature": 0.6, "top_p": 0.95, "seed": 42, "acc": 82.0, "empty_samples": 0, "timeout_s
+START gpu0 acc_7b_gsm8k_rkv2048 2026-07-09T04:46:02Z
+DONE gpu1 acc_7b_gsm8k_rkv1024 OK 150s {"script": "eval_math", "timestamp": "2026-07-08T21:46:44", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-7B", "dataset": "gsm8k", "mode": "rkv", "budget": 1024, "buffer": 128, "mix_lambda": 0.1, "shard": "0/1", "num_samples": 100, "max_new_tokens": 8192, "temperature": 0.6, "top_p": 0.95, "seed": 42, "acc": 82.0, "empty_samples": 0, "timeout_
+START gpu1 acc_7b_math_fullkv 2026-07-09T04:46:45Z
+DONE gpu0 acc_7b_gsm8k_rkv2048 OK 148s {"script": "eval_math", "timestamp": "2026-07-08T21:48:29", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-7B", "dataset": "gsm8k", "mode": "rkv", "budget": 2048, "buffer": 128, "mix_lambda": 0.1, "shard": "0/1", "num_samples": 100, "max_new_tokens": 8192, "temperature": 0.6, "top_p": 0.95, "seed": 42, "acc": 82.0, "empty_samples": 0, "timeout_
+START gpu0 acc_7b_math_rkv512 2026-07-09T04:48:30Z
+DONE gpu1 acc_7b_math_fullkv OK 1417s {"script": "eval_math", "timestamp": "2026-07-08T22:10:21", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-7B", "dataset": "math", "mode": "fullkv", "budget": null, "buffer": null, "mix_lambda": null, "shard": "0/1", "num_samples": 100, "max_new_tokens": 16384, "temperature": 0.6, "top_p": 0.95, "seed": 42, "acc": 88.0, "empty_samples": 0, "tim
+START gpu1 acc_7b_math_rkv1024 2026-07-09T05:10:22Z
+DONE gpu0 acc_7b_math_rkv512 OK 2779s {"script": "eval_math", "timestamp": "2026-07-08T22:34:48", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-7B", "dataset": "math", "mode": "rkv", "budget": 512, "buffer": 128, "mix_lambda": 0.1, "shard": "0/1", "num_samples": 100, "max_new_tokens": 16384, "temperature": 0.6, "top_p": 0.95, "seed": 42, "acc": 76.0, "empty_samples": 2, "timeout_s
+START gpu0 acc_7b_math_rkv2048 2026-07-09T05:34:49Z
+DONE gpu1 acc_7b_math_rkv1024 OK 2443s {"script": "eval_math", "timestamp": "2026-07-08T22:51:04", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-7B", "dataset": "math", "mode": "rkv", "budget": 1024, "buffer": 128, "mix_lambda": 0.1, "shard": "0/1", "num_samples": 100, "max_new_tokens": 16384, "temperature": 0.6, "top_p": 0.95, "seed": 42, "acc": 79.0, "empty_samples": 2, "timeout_
+START gpu1 acc_7b_aime24_fullkv 2026-07-09T05:51:05Z
+DONE gpu0 acc_7b_math_rkv2048 OK 2109s {"script": "eval_math", "timestamp": "2026-07-08T23:09:54", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-7B", "dataset": "math", "mode": "rkv", "budget": 2048, "buffer": 128, "mix_lambda": 0.1, "shard": "0/1", "num_samples": 100, "max_new_tokens": 16384, "temperature": 0.6, "top_p": 0.95, "seed": 42, "acc": 85.0, "empty_samples": 0, "timeout_
+START gpu0 acc_7b_aime24_rkv512 2026-07-09T06:09:58Z
+DONE gpu1 acc_7b_aime24_fullkv OK 2092s {"script": "eval_math", "timestamp": "2026-07-08T23:25:55", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-7B", "dataset": "aime24", "mode": "fullkv", "budget": null, "buffer": null, "mix_lambda": null, "shard": "0/1", "num_samples": 30, "max_new_tokens": 32768, "temperature": 0.6, "top_p": 0.95, "seed": 42, "acc": 53.3, "empty_samples": 0, "ti
+START gpu1 acc_7b_aime24_rkv1024 2026-07-09T06:25:57Z
+DONE gpu0 acc_7b_aime24_rkv512 OK 2449s {"script": "eval_math", "timestamp": "2026-07-08T23:50:45", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-7B", "dataset": "aime24", "mode": "rkv", "budget": 512, "buffer": 128, "mix_lambda": 0.1, "shard": "0/1", "num_samples": 30, "max_new_tokens": 32768, "temperature": 0.6, "top_p": 0.95, "seed": 42, "acc": 6.7, "empty_samples": 3, "timeout_s
+START gpu0 acc_7b_aime24_rkv2048 2026-07-09T06:50:47Z
+DONE gpu1 acc_7b_aime24_rkv1024 OK 2224s {"script": "eval_math", "timestamp": "2026-07-09T00:02:59", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-7B", "dataset": "aime24", "mode": "rkv", "budget": 1024, "buffer": 128, "mix_lambda": 0.1, "shard": "0/1", "num_samples": 30, "max_new_tokens": 32768, "temperature": 0.6, "top_p": 0.95, "seed": 42, "acc": 16.7, "empty_samples": 0, "timeout
+START gpu1 perf_1p5b_b1_g2048_fullkv 2026-07-09T07:03:01Z
+DONE gpu1 perf_1p5b_b1_g2048_fullkv OK 94s {"script": "bench_rkv", "timestamp": "2026-07-09T00:04:34", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-1.5B", "mode": "fullkv", "budget": null, "buffer": null, "mix_lambda": null, "batch_size": 1, "prompt_len": 512, "gen_len": 2048, "trials": 3, "prefill_s_mean": 0.0125, "decode_s_mean": 28.9613, "decode_tok_s_mean": 70.72, "decode_tok_s_pe
+START gpu1 perf_1p5b_b1_g2048_rkv1024 2026-07-09T07:04:35Z
+DONE gpu1 perf_1p5b_b1_g2048_rkv1024 OK 105s {"script": "bench_rkv", "timestamp": "2026-07-09T00:06:19", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-1.5B", "mode": "rkv", "budget": 1024, "buffer": 128, "mix_lambda": 0.1, "batch_size": 1, "prompt_len": 512, "gen_len": 2048, "trials": 3, "prefill_s_mean": 0.0132, "decode_s_mean": 32.3356, "decode_tok_s_mean": 63.34, "decode_tok_s_per_seq
+START gpu1 perf_1p5b_b8_g2048_fullkv 2026-07-09T07:06:20Z
+DONE gpu1 perf_1p5b_b8_g2048_fullkv OK 85s {"script": "bench_rkv", "timestamp": "2026-07-09T00:07:45", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-1.5B", "mode": "fullkv", "budget": null, "buffer": null, "mix_lambda": null, "batch_size": 8, "prompt_len": 512, "gen_len": 2048, "trials": 3, "prefill_s_mean": 0.0244, "decode_s_mean": 25.8706, "decode_tok_s_mean": 633.32, "decode_tok_s_p
+START gpu1 perf_1p5b_b8_g2048_rkv1024 2026-07-09T07:07:46Z
+DONE gpu1 perf_1p5b_b8_g2048_rkv1024 OK 101s {"script": "bench_rkv", "timestamp": "2026-07-09T00:09:26", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-1.5B", "mode": "rkv", "budget": 1024, "buffer": 128, "mix_lambda": 0.1, "batch_size": 8, "prompt_len": 512, "gen_len": 2048, "trials": 3, "prefill_s_mean": 0.0253, "decode_s_mean": 31.2158, "decode_tok_s_mean": 524.9, "decode_tok_s_per_seq
+START gpu1 perf_1p5b_b32_g2048_fullkv 2026-07-09T07:09:27Z
+DONE gpu1 perf_1p5b_b32_g2048_fullkv OK 87s {"script": "bench_rkv", "timestamp": "2026-07-09T00:10:53", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-1.5B", "mode": "fullkv", "budget": null, "buffer": null, "mix_lambda": null, "batch_size": 32, "prompt_len": 512, "gen_len": 2048, "trials": 3, "prefill_s_mean": 0.0929, "decode_s_mean": 26.2806, "decode_tok_s_mean": 2493.71, "decode_tok_s
+START gpu1 perf_1p5b_b32_g2048_rkv1024 2026-07-09T07:10:54Z
+DONE gpu1 perf_1p5b_b32_g2048_rkv1024 OK 119s {"script": "bench_rkv", "timestamp": "2026-07-09T00:12:52", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-1.5B", "mode": "rkv", "budget": 1024, "buffer": 128, "mix_lambda": 0.1, "batch_size": 32, "prompt_len": 512, "gen_len": 2048, "trials": 3, "prefill_s_mean": 0.097, "decode_s_mean": 36.6747, "decode_tok_s_mean": 1787.0, "decode_tok_s_per_se
+START gpu1 perf_1p5b_b8_g8192_fullkv 2026-07-09T07:12:53Z
+DONE gpu1 perf_1p5b_b8_g8192_fullkv OK 219s {"script": "bench_rkv", "timestamp": "2026-07-09T00:16:32", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-1.5B", "mode": "fullkv", "budget": null, "buffer": null, "mix_lambda": null, "batch_size": 8, "prompt_len": 512, "gen_len": 8192, "trials": 2, "prefill_s_mean": 0.0243, "decode_s_mean": 105.8499, "decode_tok_s_mean": 619.17, "decode_tok_s_
+START gpu1 perf_1p5b_b8_g8192_rkv1024 2026-07-09T07:16:33Z
+DONE gpu1 perf_1p5b_b8_g8192_rkv1024 OK 261s {"script": "bench_rkv", "timestamp": "2026-07-09T00:20:53", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-1.5B", "mode": "rkv", "budget": 1024, "buffer": 128, "mix_lambda": 0.1, "batch_size": 8, "prompt_len": 512, "gen_len": 8192, "trials": 2, "prefill_s_mean": 0.0253, "decode_s_mean": 126.9074, "decode_tok_s_mean": 516.41, "decode_tok_s_per_s
+START gpu1 perf_7b_b1_g2048_fullkv 2026-07-09T07:20:54Z
+DONE gpu1 perf_7b_b1_g2048_fullkv OK 101s {"script": "bench_rkv", "timestamp": "2026-07-09T00:22:34", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-7B", "mode": "fullkv", "budget": null, "buffer": null, "mix_lambda": null, "batch_size": 1, "prompt_len": 512, "gen_len": 2048, "trials": 3, "prefill_s_mean": 0.013, "decode_s_mean": 29.9693, "decode_tok_s_mean": 68.34, "decode_tok_s_per_s
+START gpu1 perf_7b_b1_g2048_rkv1024 2026-07-09T07:22:35Z
+DONE gpu1 perf_7b_b1_g2048_rkv1024 OK 112s {"script": "bench_rkv", "timestamp": "2026-07-09T00:24:26", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-7B", "mode": "rkv", "budget": 1024, "buffer": 128, "mix_lambda": 0.1, "batch_size": 1, "prompt_len": 512, "gen_len": 2048, "trials": 3, "prefill_s_mean": 0.0143, "decode_s_mean": 34.033, "decode_tok_s_mean": 60.18, "decode_tok_s_per_seq_me
+START gpu1 perf_7b_b8_g2048_fullkv 2026-07-09T07:24:27Z
+DONE gpu1 perf_7b_b8_g2048_fullkv OK 92s {"script": "bench_rkv", "timestamp": "2026-07-09T00:25:58", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-7B", "mode": "fullkv", "budget": null, "buffer": null, "mix_lambda": null, "batch_size": 8, "prompt_len": 512, "gen_len": 2048, "trials": 3, "prefill_s_mean": 0.0878, "decode_s_mean": 27.199, "decode_tok_s_mean": 602.38, "decode_tok_s_per_
+START gpu1 perf_7b_b8_g2048_rkv1024 2026-07-09T07:25:59Z
+DONE gpu1 perf_7b_b8_g2048_rkv1024 OK 105s {"script": "bench_rkv", "timestamp": "2026-07-09T00:27:43", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-7B", "mode": "rkv", "budget": 1024, "buffer": 128, "mix_lambda": 0.1, "batch_size": 8, "prompt_len": 512, "gen_len": 2048, "trials": 3, "prefill_s_mean": 0.0887, "decode_s_mean": 31.9244, "decode_tok_s_mean": 513.23, "decode_tok_s_per_seq_
+START gpu1 perf_7b_b32_g2048_fullkv 2026-07-09T07:27:45Z
+DONE gpu1 perf_7b_b32_g2048_fullkv OK 93s {"script": "bench_rkv", "timestamp": "2026-07-09T00:29:17", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-7B", "mode": "fullkv", "budget": null, "buffer": null, "mix_lambda": null, "batch_size": 32, "prompt_len": 512, "gen_len": 2048, "trials": 3, "prefill_s_mean": 0.3528, "decode_s_mean": 27.4579, "decode_tok_s_mean": 2386.8, "decode_tok_s_pe
+START gpu1 perf_7b_b32_g2048_rkv1024 2026-07-09T07:29:18Z
+DONE gpu1 perf_7b_b32_g2048_rkv1024 OK 121s {"script": "bench_rkv", "timestamp": "2026-07-09T00:31:19", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-7B", "mode": "rkv", "budget": 1024, "buffer": 128, "mix_lambda": 0.1, "batch_size": 32, "prompt_len": 512, "gen_len": 2048, "trials": 3, "prefill_s_mean": 0.3563, "decode_s_mean": 36.8176, "decode_tok_s_mean": 1780.04, "decode_tok_s_per_se
+START gpu1 perf_7b_b8_g8192_fullkv 2026-07-09T07:31:20Z
+DONE gpu0 acc_7b_aime24_rkv2048 OK 2503s {"script": "eval_math", "timestamp": "2026-07-09T00:32:29", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-7B", "dataset": "aime24", "mode": "rkv", "budget": 2048, "buffer": 128, "mix_lambda": 0.1, "shard": "0/1", "num_samples": 30, "max_new_tokens": 32768, "temperature": 0.6, "top_p": 0.95, "seed": 42, "acc": 40.0, "empty_samples": 0, "timeout
+START gpu0 perf_7b_b8_g8192_rkv1024 2026-07-09T07:32:31Z
+DONE gpu1 perf_7b_b8_g8192_fullkv OK 229s {"script": "bench_rkv", "timestamp": "2026-07-09T00:35:07", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-7B", "mode": "fullkv", "budget": null, "buffer": null, "mix_lambda": null, "batch_size": 8, "prompt_len": 512, "gen_len": 8192, "trials": 2, "prefill_s_mean": 0.0877, "decode_s_mean": 109.3946, "decode_tok_s_mean": 599.11, "decode_tok_s_pe
+START gpu1 smoke2_qwen3_06b_off 2026-07-09T07:35:09Z
+DONE gpu1 smoke2_qwen3_06b_off OK 21s 
+START gpu1 smoke2_qwen3_06b_on 2026-07-09T07:35:31Z
+DONE gpu1 smoke2_qwen3_06b_on FAIL(1) 26s 
+START gpu1 smoke2_qwen3_8b_off 2026-07-09T07:35:57Z
+DONE gpu1 smoke2_qwen3_8b_off OK 29s 
+START gpu1 smoke2_qwen3_8b_on 2026-07-09T07:36:26Z
+DONE gpu1 smoke2_qwen3_8b_on OK 33s 
+START gpu1 smoke2_llama32_1b_off 2026-07-09T07:36:59Z
+DONE gpu0 perf_7b_b8_g8192_rkv1024 OK 276s {"script": "bench_rkv", "timestamp": "2026-07-09T00:37:06", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-7B", "mode": "rkv", "budget": 1024, "buffer": 128, "mix_lambda": 0.1, "batch_size": 8, "prompt_len": 512, "gen_len": 8192, "trials": 2, "prefill_s_mean": 0.0891, "decode_s_mean": 133.238, "decode_tok_s_mean": 491.87, "decode_tok_s_per_seq_
+START gpu0 smoke2_llama32_1b_on 2026-07-09T07:37:07Z
+DONE gpu1 smoke2_llama32_1b_off FAIL(1) 11s 
+START gpu1 probe2_qwen3_06b 2026-07-09T07:37:10Z
+DONE gpu0 smoke2_llama32_1b_on OK 14s 
+START gpu0 probe2_llama32_1b 2026-07-09T07:37:21Z
+DONE gpu1 probe2_qwen3_06b OK 17s 
+START gpu1 probe2_qwen3_8b 2026-07-09T07:37:27Z
+DONE gpu0 probe2_llama32_1b OK 16s 
+START gpu0 probe2_r1_7b 2026-07-09T07:37:37Z
+DONE gpu1 probe2_qwen3_8b OK 53s 
+START gpu1 perf_1p5b_b4_p4096_rkv512 2026-07-09T07:38:20Z
+DONE gpu0 probe2_r1_7b OK 48s 
+START gpu0 perf_7b_b4_p4096_rkv512 2026-07-09T07:38:26Z
+DONE gpu1 perf_1p5b_b4_p4096_rkv512 OK 23s {"script": "bench_rkv", "timestamp": "2026-07-09T00:38:42", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-1.5B", "mode": "rkv", "budget": 512, "buffer": 128, "mix_lambda": 0.1, "batch_size": 4, "prompt_len": 4096, "gen_len": 512, "trials": 2, "prefill_s_mean": 0.1814, "decode_s_mean": 7.5687, "decode_tok_s_mean": 270.59, "decode_tok_s_per_seq_
+WORKER gpu1 EXHAUSTED 2026-07-09T07:38:44Z
+DONE gpu0 perf_7b_b4_p4096_rkv512 OK 27s {"script": "bench_rkv", "timestamp": "2026-07-09T00:38:52", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-7B", "mode": "rkv", "budget": 512, "buffer": 128, "mix_lambda": 0.1, "batch_size": 4, "prompt_len": 4096, "gen_len": 512, "trials": 2, "prefill_s_mean": 0.507, "decode_s_mean": 7.9686, "decode_tok_s_mean": 257.01, "decode_tok_s_per_seq_mea
+WORKER gpu0 EXHAUSTED 2026-07-09T07:38:54Z
