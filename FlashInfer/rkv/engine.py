@@ -20,6 +20,7 @@ from flashinfer import (
     BatchPrefillWithRaggedKVCacheWrapper,
 )
 from flashinfer.sampling import top_p_sampling_from_probs
+from flashinfer.utils import device_support_pdl
 
 from . import algo
 from .compressor import R1KV
@@ -87,6 +88,29 @@ class FlashInferEngine:
         )
         self._prefill_wrapper = BatchPrefillWithRaggedKVCacheWrapper(workspace, "NHD")
 
+        # Static per-step planning inputs. Slot ids per request are always
+        # `r * region_len + [0, n)`, so decode kv_indices are cheap slices of
+        # one precomputed arange instead of per-request arange launches.
+        # indptr / last_page_len stay on CPU: flashinfer 0.6.x `plan()` reads
+        # them host-side (`.to("cpu")`), so passing device tensors would force
+        # a D2H sync copy inside every decode step.
+        self._pool_indices = torch.arange(
+            max_batch_size * self.region_len, dtype=torch.int32, device=self.device
+        )
+        self._last_page_len_cpu = torch.ones(max_batch_size, dtype=torch.int32)
+        # run() otherwise allocates a fresh out tensor and re-detects PDL
+        # support num_layers times per decode step.
+        self._attn_out = torch.empty(
+            max_batch_size,
+            model.num_q_heads,
+            model.head_dim,
+            dtype=dtype,
+            device=self.device,
+        )
+        self._enable_pdl = (
+            device_support_pdl(self.device) if self.device.type == "cuda" else False
+        )
+
         self.compressor: R1KV | None = None
         if rkv is not None:
             self.compressor = R1KV(
@@ -148,6 +172,11 @@ class FlashInferEngine:
 
         start = time.perf_counter()
         compaction_seconds = 0.0
+        # Compaction time is attributed with CUDA event pairs read after the
+        # final sync, instead of bracketing each round with two host syncs
+        # that would stall the decode pipeline.
+        compaction_events: list[tuple] = []
+        use_events = self.device.type == "cuda"
         sampled = self._sample(logits, temperature, top_p, generator).tolist()
         record(list(range(batch)), sampled)
 
@@ -166,14 +195,23 @@ class FlashInferEngine:
                     and self.compressor.should_compact(self._phys_len[r])
                 ]
                 if rows:
-                    self._sync()
-                    compact_start = time.perf_counter()
-                    for row in rows:
-                        self._compact_request(row)
-                    self._sync()
-                    compaction_seconds += time.perf_counter() - compact_start
+                    if use_events:
+                        begin = torch.cuda.Event(enable_timing=True)
+                        end = torch.cuda.Event(enable_timing=True)
+                        begin.record()
+                    else:
+                        compact_start = time.perf_counter()
+                    self._compact_rows(rows)
+                    if use_events:
+                        end.record()
+                        compaction_events.append((begin, end))
+                    else:
+                        compaction_seconds += time.perf_counter() - compact_start
         self._sync()
         decode_seconds = time.perf_counter() - start
+        compaction_seconds += (
+            sum(begin.elapsed_time(end) for begin, end in compaction_events) / 1e3
+        )
 
         num_compactions = (
             self.compressor.num_compactions[:batch]
@@ -237,7 +275,8 @@ class FlashInferEngine:
         model = self.model
         device = self.device
         indptr = [0, *accumulate(prompt_lens)]
-        qo_indptr = torch.tensor(indptr, dtype=torch.int32, device=device)
+        # CPU tensor: flashinfer plan() reads indptr host-side (see __init__).
+        qo_indptr = torch.tensor(indptr, dtype=torch.int32)
         input_ids = torch.tensor(
             [t for p in prompts for t in p], dtype=torch.long, device=device
         )
@@ -268,7 +307,9 @@ class FlashInferEngine:
             self._logical_len[row] = length
 
         hidden = model(input_ids, positions, self._prefill_attention)
-        last = qo_indptr[1:].long() - 1
+        last = torch.tensor(
+            [end - 1 for end in indptr[1:]], dtype=torch.long, device=device
+        )
         return model.compute_logits(hidden[last])
 
     def _prefill_attention(
@@ -309,27 +350,20 @@ class FlashInferEngine:
         model = self.model
         device = self.device
         # Plan over post-append KV lengths: the step's k/v are written into
-        # slot phys_len before the wrapper runs.
+        # slot phys_len before the wrapper runs. indptr / last_page_len are
+        # CPU tensors by design (see __init__); kv_indices are device slices
+        # of the precomputed pool arange.
         lens = [self._phys_len[r] + 1 for r in active]
-        kv_indptr = torch.tensor(
-            [0, *accumulate(lens)], dtype=torch.int32, device=device
-        )
-        kv_indices = torch.cat(
-            [
-                torch.arange(
-                    r * self.region_len,
-                    r * self.region_len + n,
-                    dtype=torch.int32,
-                    device=device,
-                )
-                for r, n in zip(active, lens)
-            ]
-        )
-        last_page_len = torch.ones(len(active), dtype=torch.int32, device=device)
+        kv_indptr = torch.tensor([0, *accumulate(lens)], dtype=torch.int32)
+        regions = [
+            self._pool_indices[r * self.region_len : r * self.region_len + n]
+            for r, n in zip(active, lens)
+        ]
+        kv_indices = regions[0] if len(regions) == 1 else torch.cat(regions)
         self._decode_wrapper.plan(
             kv_indptr,
             kv_indices,
-            last_page_len,
+            self._last_page_len_cpu[: len(active)],
             model.num_q_heads,
             model.num_kv_heads,
             model.head_dim,
@@ -339,21 +373,21 @@ class FlashInferEngine:
             kv_data_type=self.dtype,
         )
 
-        self._decode_slots = torch.tensor(
-            [r * self.region_len + self._phys_len[r] for r in active],
+        # One H2D transfer for all per-step scalars instead of four.
+        staged = torch.tensor(
+            [
+                [r * self.region_len + self._phys_len[r] for r in active],
+                active,
+                [last_token[r] for r in active],
+                [self._logical_len[r] for r in active],
+            ],
             dtype=torch.long,
-            device=device,
-        )
-        self._decode_rows = torch.tensor(active, dtype=torch.long, device=device)
+        ).to(device, non_blocking=True)
+        self._decode_slots, self._decode_rows, input_ids, positions64 = staged.unbind(0)
+        positions = positions64.to(torch.int32)
         if self.compressor is not None:
             self.compressor.begin_step(active)
 
-        input_ids = torch.tensor(
-            [last_token[r] for r in active], dtype=torch.long, device=device
-        )
-        positions = torch.tensor(
-            [self._logical_len[r] for r in active], dtype=torch.int32, device=device
-        )
         hidden = model(input_ids, positions, self._decode_attention)
         for r in active:
             self._phys_len[r] += 1
@@ -367,19 +401,39 @@ class FlashInferEngine:
         self.kv_pool[layer, self._decode_slots, 1, 0] = v
         if self.compressor is not None:
             self.compressor.push_queries(layer, self._decode_rows, q)
-        return self._decode_wrapper.run(q, self.kv_pool[layer])
+        return self._decode_wrapper.run(
+            q,
+            self.kv_pool[layer],
+            out=self._attn_out[: q.shape[0]],
+            enable_pdl=self._enable_pdl,
+        )
 
-    def _compact_request(self, row: int) -> None:
-        base = row * self.region_len
-        phys = self._phys_len[row]
+    def _compact_rows(self, rows: list[int]) -> None:
+        # Rows compacting on the same step share phys_len (equality trigger),
+        # so all layers of all rows batch into few update_kv calls; the
+        # per-pair bit-parity gate lives in ``compressor.compact_batch``.
         budget = self.rkv.budget
-        for layer in range(self.model.num_layers):
-            keys = self.kv_pool[layer, base : base + phys, 0, 0]
-            values = self.kv_pool[layer, base : base + phys, 1, 0]
-            kept_k, kept_v = self.compressor.compact(row, layer, keys, values)
-            self.kv_pool[layer, base : base + budget, 0, 0] = kept_k
-            self.kv_pool[layer, base : base + budget, 1, 0] = kept_v
-        self._phys_len[row] = budget
+        phys = self._phys_len[rows[0]]
+        keys = torch.stack(
+            [
+                self.kv_pool[:, r * self.region_len : r * self.region_len + phys, 0, 0]
+                for r in rows
+            ],
+            dim=1,
+        )
+        values = torch.stack(
+            [
+                self.kv_pool[:, r * self.region_len : r * self.region_len + phys, 1, 0]
+                for r in rows
+            ],
+            dim=1,
+        )
+        kept_k, kept_v = self.compressor.compact_batch(rows, keys, values)
+        for i, row in enumerate(rows):
+            base = row * self.region_len
+            self.kv_pool[:, base : base + budget, 0, 0] = kept_k[:, i]
+            self.kv_pool[:, base : base + budget, 1, 0] = kept_v[:, i]
+            self._phys_len[row] = budget
 
     # ------------------------------------------------------------------
     # Sampling / misc

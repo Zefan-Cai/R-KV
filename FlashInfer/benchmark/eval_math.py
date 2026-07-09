@@ -86,7 +86,14 @@ def parse_shard(spec: str) -> tuple[int, int]:
 
 
 def default_output(args: argparse.Namespace, shard: tuple[int, int]) -> Path:
-    mode_tag = f"rkv{args.budget}" if args.mode == "rkv" else "fullkv"
+    # Tag every rkv sweep axis so sweep points cannot silently clobber each
+    # other's records ({:g} keeps float lambdas repr-stable). A later
+    # default-named --score-only must pass the same --budget/--buffer/
+    # --mix-lambda to resolve the same path (or use --output explicitly).
+    if args.mode == "rkv":
+        mode_tag = f"rkv{args.budget}b{args.buffer}lam{args.mix_lambda:g}"
+    else:
+        mode_tag = "fullkv"
     idx, count = shard
     suffix = f"_shard{idx}of{count}" if count > 1 else ""
     return SCRIPT_DIR / f"eval_{args.dataset}_{mode_tag}{suffix}.jsonl"
@@ -142,6 +149,22 @@ def generate(args: argparse.Namespace, records: list[dict], out_path: Path) -> t
         raise SystemExit("eval_math.py generation needs a CUDA GPU (--score-only scores without one)")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
+    # Stop on the model's full EOS set: generation_config may carry several
+    # ids (e.g. Qwen-instruct <|im_end|> + <|endoftext|>) and the HF reference
+    # (model.generate) stops on that list; tokenizer.eos alone can let a
+    # finished sample ramble to max_new_tokens, where a later spurious
+    # \boxed{} silently replaces the real answer (last-boxed extraction).
+    stop_ids = {tokenizer.eos_token_id} - {None}
+    try:
+        from transformers import GenerationConfig
+
+        gen_eos = GenerationConfig.from_pretrained(args.model).eos_token_id
+    except OSError:
+        gen_eos = None  # no generation_config.json next to the checkpoint
+    if isinstance(gen_eos, int):
+        stop_ids.add(gen_eos)
+    elif gen_eos is not None:
+        stop_ids.update(gen_eos)
     question_key = DATASET_QUESTION_KEY[args.dataset]
     prompt_ids: list[list[int]] = []
     for rec in records:
@@ -168,12 +191,31 @@ def generate(args: argparse.Namespace, records: list[dict], out_path: Path) -> t
         rkv=rkv_cfg,
     )
 
+    # Excluded warmup: absorbs FlashInfer JIT / first-plan / cuBLAS init and
+    # allocator growth so gen_wall_s reflects steady state. generate() resets
+    # all engine and compressor state and re-seeds per call, so the scored
+    # generations are bit-identical with or without it. (Compaction is eager
+    # torch with no JIT and is intentionally not warmed.)
+    print("[warmup] one small generate, excluded from timing", flush=True)
+    engine.generate(
+        [prompt_ids[0][:64]],
+        max_new_tokens=8,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        stop_token_ids=(),
+        seed=args.seed,
+    )
+
     outputs: list[dict] = []
     totals = {
         "prefill_tokens": 0,
         "output_tokens": 0,
         "num_compactions": 0,
+        "num_truncated": 0,
         "gen_wall_s": 0.0,
+        "prefill_s": 0.0,
+        "decode_s": 0.0,
+        "compaction_s": 0.0,
         "gpu": torch.cuda.get_device_name(0),
     }
     num_batches = (len(records) + args.bsz - 1) // args.bsz
@@ -187,11 +229,14 @@ def generate(args: argparse.Namespace, records: list[dict], out_path: Path) -> t
                 max_new_tokens=args.max_new_tokens,
                 temperature=args.temperature,
                 top_p=args.top_p,
-                stop_token_ids=(tokenizer.eos_token_id,),
+                stop_token_ids=tuple(stop_ids),
                 seed=args.seed,
             )
             wall_s = time.perf_counter() - start
             totals["gen_wall_s"] += wall_s
+            totals["prefill_s"] += engine.stats["prefill_seconds"]
+            totals["decode_s"] += engine.stats["decode_seconds"]
+            totals["compaction_s"] += engine.stats["compaction_seconds"]
             for rec, out in zip(batch, outs):
                 row = {
                     **rec,
@@ -204,6 +249,7 @@ def generate(args: argparse.Namespace, records: list[dict], out_path: Path) -> t
                 totals["prefill_tokens"] += row["prefill_tokens"]
                 totals["output_tokens"] += row["output_tokens"]
                 totals["num_compactions"] += row["num_compactions"]
+                totals["num_truncated"] += row["finish_reason"] == "length"
                 fout.write(json.dumps(row, ensure_ascii=False) + "\n")
                 outputs.append(row)
             fout.flush()
@@ -231,12 +277,24 @@ def main() -> None:
             "prefill_tokens": sum(rec.get("prefill_tokens", 0) for rec in records),
             "output_tokens": sum(rec.get("output_tokens", 0) for rec in records),
             "num_compactions": sum(rec.get("num_compactions", 0) for rec in records),
+            # .get: records written before finish_reason existed lack the field
+            "num_truncated": sum(
+                rec.get("finish_reason") == "length" for rec in records
+            ),
             "gen_wall_s": None,
+            "prefill_s": None,
+            "decode_s": None,
+            "compaction_s": None,
             "gpu": None,
         }
     else:
         if not args.model:
             raise SystemExit("--model is required unless --score-only")
+        if args.output is None and out_path.exists():
+            raise SystemExit(
+                f"refusing to overwrite existing default-named records at "
+                f"{out_path}; pass --output explicitly to replace them"
+            )
         data_path = Path(args.data_path) if args.data_path else DATA_DIR / f"{args.dataset}.jsonl"
         records = load_records(data_path, args.max_samples, shard)
         if not records:
@@ -257,12 +315,26 @@ def main() -> None:
     mean_output_tokens = totals["output_tokens"] / len(records)
     print(
         f"tokens: prefill={totals['prefill_tokens']} output={totals['output_tokens']} "
-        f"(mean {mean_output_tokens:.1f}/seq) compactions={totals['num_compactions']}"
+        f"(mean {mean_output_tokens:.1f}/seq) compactions={totals['num_compactions']} "
+        f"truncated={totals['num_truncated']}"
     )
     output_tok_s = None
     if totals["gen_wall_s"]:
         output_tok_s = totals["output_tokens"] / totals["gen_wall_s"]
         print(f"generate wall {totals['gen_wall_s']:.1f}s -> {output_tok_s:.1f} output tok/s")
+    decode_only_tok_s = None
+    if totals["decode_s"]:
+        # The engine's decode timer encloses the compaction loop, so
+        # decode-only throughput strips compaction time out.
+        decode_only_tok_s = totals["output_tokens"] / (
+            totals["decode_s"] - totals["compaction_s"]
+        )
+        print(
+            f"engine: prefill {totals['prefill_s']:.1f}s "
+            f"decode+compaction {totals['decode_s']:.1f}s "
+            f"(compaction {totals['compaction_s']:.1f}s) -> "
+            f"{decode_only_tok_s:.1f} decode-only tok/s"
+        )
     print(f"records: {out_path}")
 
     summary = {
@@ -288,8 +360,19 @@ def main() -> None:
         "output_tokens": totals["output_tokens"],
         "mean_output_tokens": round(mean_output_tokens, 1),
         "num_compactions": totals["num_compactions"],
+        "num_truncated": totals["num_truncated"],
         "gen_wall_s": round(totals["gen_wall_s"], 2) if totals["gen_wall_s"] else None,
         "output_tok_s": round(output_tok_s, 2) if output_tok_s else None,
+        "prefill_s": round(totals["prefill_s"], 2) if totals["prefill_s"] else None,
+        "decode_s": round(totals["decode_s"], 2) if totals["decode_s"] else None,
+        "compaction_s": (
+            round(totals["compaction_s"], 2)
+            if totals["compaction_s"] is not None and totals["decode_s"]
+            else None
+        ),
+        "decode_only_tok_s": (
+            round(decode_only_tok_s, 2) if decode_only_tok_s else None
+        ),
         "output": str(out_path),
     }
     print(json.dumps(summary))

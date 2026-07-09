@@ -121,13 +121,20 @@ No `flashinfer` import in this module (CPU CI runs it).
 
 One `plan()` per step (not per layer) on `BatchDecodeWithPagedKVCacheWrapper`
 (`float workspace 128MB`, `"NHD"`), shared by all layers — valid because every layer keeps
-the same count. `pos_encoding_mode="NONE"` (we pre-rotate q/k).
+the same count. `pos_encoding_mode="NONE"` (we pre-rotate q/k). Plan inputs are built
+cheaply: `kv_indptr` / `last_page_len` stay **CPU** tensors (flashinfer 0.6.x `plan()`
+reads them host-side via `.to("cpu")`, so device tensors would force a per-step D2H
+sync), `kv_indices` are slices of one precomputed device arange, and the per-step
+scalars (slots / rows / input ids / positions) ride a single staged H2D transfer.
 
-Per layer: rmsnorm → qkv proj → reshape → `flashinfer.apply_rope_with_cos_sin_cache_inplace(
-positions=logical_pos, query, key, head_size, cos_sin_cache, is_neox=True)` → write k/v into
-slot `phys_len` of each active request's region (direct indexing; page_size=1) → push
-post-RoPE q into the rolling window-query cache (R-KV mode) → `decode_wrapper.run(q, kv_pool[layer])`
-→ o proj → residual/MLP (`fused_add_rmsnorm`, `silu_and_mul`).
+Per layer: rmsnorm → **fused** qkv proj (one GEMM; split + contiguous copies, since the
+flashinfer rope/attention kernels are only known-safe on packed layouts) →
+`flashinfer.apply_rope_with_cos_sin_cache_inplace(positions=logical_pos, query, key,
+head_size, cos_sin_cache, is_neox=True)` → write k/v into slot `phys_len` of each active
+request's region (direct indexing; page_size=1) → push post-RoPE q into the rolling
+window-query cache (R-KV mode; circular slot write, no shift) →
+`decode_wrapper.run(q, kv_pool[layer])` → o proj → residual/MLP (`fused_add_rmsnorm`,
+fused gate_up GEMM feeding `silu_and_mul` directly — no concat).
 
 After the step: `phys_len += 1`, `logical_len += 1`; sample next token
 (`flashinfer.sampling.top_p_sampling_from_probs`, greedy if `temperature == 0`);
@@ -138,13 +145,24 @@ active rows only.
 
 Trigger, per request independently (SGLang "method A"): after append,
 `phys_len[r] == budget + buffer` → for every layer: score with that request's window
-queries (post-RoPE, rolling buffer `[num_layers, bsz, num_q_heads, window, head_dim]`),
+queries (post-RoPE, rolling buffer `[num_layers, bsz, num_q_heads, window, head_dim]`,
+stored circularly and rotated back to temporal order at compaction — a pure
+permutation, so scoring is bit-identical to a shifted window),
 `select_indices`, gather kept K/V **per kv-head** (each head keeps its own token set —
 reference-faithful; slot i then holds different logical tokens per layer/head, which is
 fine because only counts must agree across layers) to the front of the region;
 `phys_len[r] = budget`. Not captured in any graph; runs eagerly on the main stream —
 correctness first, the overlap engineering of RKV-HS (dual threads, busy-wait
 `layer_flags`, graph-captured eviction) is deliberately dropped (phase 2).
+
+All (layer, row) pairs of a trigger step batch into few `update_kv` calls
+(`compressor.compact_batch`, chunked to keep the `[pairs, kv_heads, S, S]` scoring
+transients under ~512MB, ≤32 pairs — peak memory is a headline metric, so launch
+amortization must not eat the pool savings) instead of `num_layers × rows`
+sequential bsz=1 calls. Batched GEMMs
+are not provably bit-identical to bsz=1 calls, so the first compaction A/B-checks
+batched vs per-pair on the real pool data (`torch.equal`) and permanently falls back to
+per-pair if they differ; the per-(layer, request) `compact()` surface stays for tests.
 
 ### 5.4 Prefill
 
@@ -187,6 +205,9 @@ class GenOutput:
 
 `engine.stats` additionally exposes wall-clock prefill/decode seconds and
 `torch.cuda.max_memory_allocated()` snapshots for the benchmark scripts.
+`compaction_seconds` is attributed with CUDA event pairs read after the final
+sync (GPU time of the compaction kernels), so compaction rounds no longer
+bracket the decode pipeline with two host syncs each.
 
 ## 6. Models — `rkv/models.py` + `rkv/loader.py`
 
@@ -201,8 +222,15 @@ class GenOutput:
   `cos_sin_cache` `[max_pos, head_dim]` (cos ‖ sin halves), `is_neox=True`.
 - Kernels: `flashinfer.norm.rmsnorm` / `fused_add_rmsnorm`, `flashinfer.activation.silu_and_mul`;
   projections are plain `F.linear`. `tie_word_embeddings` honored.
+- q/k/v and gate/up are **fused GEMMs** (`qkv_proj`, `gate_up_proj`, Nano-vLLM-style);
+  `CausalLM.packed_map` declares the checkpoint-name → (fused param, row offset)
+  mapping the loader uses. Fusing changes GEMM shapes, so logits may differ from the
+  split-projection build at floating-point rounding level (algo scoring parity is
+  unaffected — it never consumes attention outputs).
 - `loader.py` streams safetensors shards straight into pre-allocated parameters
-  (nanovllm-style), no intermediate full-model materialization.
+  (nanovllm-style), no intermediate full-model materialization; `packed_map` rows are
+  scattered into their fused parameter slices, and a fused parameter counts as loaded
+  only when all of its sources landed.
 
 ## 7. Tests
 

@@ -48,10 +48,12 @@ def compute_attention_scores(
     kv_heads = key_states.shape[1]
     query_group_size = q_heads // kv_heads
 
+    # In-place scale on the fresh matmul output: same op, same rounding as
+    # the reference's out-of-place divide, one less full-size temporary.
     if query_group_size == 1:
         attn_weights = torch.matmul(
             query_states, key_states.transpose(2, 3)
-        ) / math.sqrt(head_dim)
+        ).div_(math.sqrt(head_dim))
     else:
         query_states = query_states.view(
             batch_size, kv_heads, query_group_size, q_len, head_dim
@@ -59,7 +61,7 @@ def compute_attention_scores(
         key_states = key_states.unsqueeze(2)
         attn_weights = torch.matmul(
             query_states, key_states.transpose(3, 4)
-        ) / math.sqrt(head_dim)
+        ).div_(math.sqrt(head_dim))
         if pooling == "mean":
             attn_weights = attn_weights.mean(dim=2)
         elif pooling == "max":
@@ -87,17 +89,25 @@ def cal_similarity(
     """
     _, _, seq_len, _ = key_states.shape
 
-    k_norm = key_states / (key_states.norm(dim=-1, keepdim=True) + 1e-8)
+    # add_ on the fresh norm output: identical values, one less temporary.
+    k_norm = key_states / key_states.norm(dim=-1, keepdim=True).add_(1e-8)
     similarity_cos = torch.matmul(k_norm, k_norm.transpose(-1, -2))
-    diag = torch.eye(seq_len, dtype=torch.bool, device=key_states.device)
-    similarity_cos.masked_fill_(diag.view(1, 1, seq_len, seq_len), 0.0)
+    # Bit-equal to the reference eye + masked_fill_: writes 0 to the same
+    # diagonal elements without materializing the [seq, seq] mask.
+    similarity_cos.diagonal(dim1=-2, dim2=-1).zero_()
 
     similarity_mask = similarity_cos > threshold
     k = max(1, int(seq_len * retain_ratio))
-    indices = torch.where(
-        similarity_mask,
-        torch.arange(seq_len, device=similarity_mask.device).view(1, 1, 1, seq_len),
-        torch.zeros_like(similarity_mask, dtype=torch.long),
+    # Bit-equal to the reference where(mask, arange, 0): integer multiply by
+    # the bool mask, skipping the full-size zeros_like temporary. int32 halves
+    # the largest transient of the whole scoring path (indices are < seq_len,
+    # far below 2^31); values are exact, so every retain-direction reduction
+    # below matches the reference bit-for-bit after the final cast.
+    indices = (
+        torch.arange(
+            seq_len, device=similarity_mask.device, dtype=torch.int32
+        ).view(1, 1, 1, seq_len)
+        * similarity_mask
     )
 
     if retain_direction == "last":
@@ -111,7 +121,9 @@ def cal_similarity(
     else:
         raise ValueError("retain_direction not supported")
 
-    similarity_cos.scatter_(-1, similarity_retain.unsqueeze(-1), 0)
+    # scatter_ requires int64 indices; the cast is on the small [.., seq]
+    # reduction result, not the [.., seq, seq] index tensor.
+    similarity_cos.scatter_(-1, similarity_retain.long().unsqueeze(-1), 0)
     return similarity_cos.mean(dim=-2).softmax(dim=-1)
 
 
@@ -224,15 +236,25 @@ def update_kv(
 
     # shape: (bsz, kv_heads, budget - window_size)
     indices = scores.topk(budget - window_size, dim=-1).indices
-    indices = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
 
-    k_past_compress = key_states[:, :, :-window_size, :].gather(dim=2, index=indices)
-    v_past_compress = value_states[:, :, :-window_size, :].gather(dim=2, index=indices)
-    k_cur = key_states[:, :, -window_size:, :]
-    v_cur = value_states[:, :, -window_size:, :]
-    key_states = torch.cat([k_past_compress, k_cur], dim=2)
-    value_states = torch.cat([v_past_compress, v_cur], dim=2)
-    return key_states, value_states
+    # Bit-equal to the reference gather-past + slice-window + cat: past
+    # indices address the same coordinates on the full tensor as on the
+    # [:-window] slice, and appending the absolute window indices yields the
+    # identical kept order — one gather per K/V, no intermediates.
+    bsz, kv_heads = indices.shape[0], indices.shape[1]
+    window_indices = (
+        torch.arange(
+            kv_cache_len - window_size, kv_cache_len, device=scores.device
+        )
+        .view(1, 1, -1)
+        .expand(bsz, kv_heads, -1)
+    )
+    kept = torch.cat([indices, window_indices], dim=-1)
+    kept = kept.unsqueeze(-1).expand(-1, -1, -1, head_dim)
+    return (
+        key_states.gather(dim=2, index=kept),
+        value_states.gather(dim=2, index=kept),
+    )
 
 
 class R1KV:

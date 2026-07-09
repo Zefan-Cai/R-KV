@@ -26,10 +26,14 @@ RKV-HS — read [`DESIGN.md`](./DESIGN.md) first.
 Summary; authoritative description in [`DESIGN.md`](./DESIGN.md) §5.2–5.3.
 
 1. One `plan()` per decode step (shared by all layers) on
-   `BatchDecodeWithPagedKVCacheWrapper`, active rows only.
-2. Per layer: rmsnorm → qkv → RoPE in-place at `logical_len` → write k/v to
-   slot `phys_len` of each region → push post-RoPE q into the window cache →
-   `decode_wrapper.run` → o proj → MLP.
+   `BatchDecodeWithPagedKVCacheWrapper`, active rows only. `kv_indptr` /
+   `last_page_len` are CPU tensors (0.6.x `plan()` reads them host-side;
+   device tensors would D2H-sync every step); `kv_indices` are slices of a
+   precomputed device arange; per-step scalars share one staged H2D copy.
+2. Per layer: rmsnorm → fused qkv GEMM (split + contiguous) → RoPE in-place at
+   `logical_len` → write k/v to slot `phys_len` of each region → push post-RoPE
+   q into the circular window cache → `decode_wrapper.run` → o proj → MLP
+   (fused gate_up GEMM → `silu_and_mul`).
 3. After the step: lengths advance, sampling, EOS/max-len bookkeeping, then the
    per-request compaction check (`phys_len == budget + buffer`).
 
@@ -42,8 +46,11 @@ collapses to `budget` at compaction); static per-request regions sized
 
 ## 4. Compaction path
 
-Per request, per layer, per kv-head gather of the kept token set to the front
-of the region; eager, main stream, not graph-captured. See
+All (layer, row) pairs of a trigger step batch into few `update_kv` calls via
+`compressor.compact_batch` (chunked to a ~512MB scoring-transient budget, ≤32
+pairs; first-call bit-parity gate vs the per-pair path with permanent fallback
+if batched GEMMs differ); kept token sets gather per kv-head to the front of
+each region; eager, main stream, not graph-captured. See
 [`DESIGN.md`](./DESIGN.md) §5.3.
 
 ## 5. Prefill and prefill compression

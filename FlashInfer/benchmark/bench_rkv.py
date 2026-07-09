@@ -104,6 +104,9 @@ def run_trial(engine: FlashInferEngine, prompts: list[list[int]], gen_len: int) 
         "decode_tok_s_per_seq": new_tokens / decode_s / len(prompts),
         "num_compactions": sum(out.num_compactions for out in outs),
         "compaction_s": float(stats.get("compaction_seconds") or 0.0),
+        # engine.generate resets peak stats per call, so per-call stats are
+        # the only correct source (a script-level reset would be dead code).
+        "peak_mem_gib": stat_seconds(stats, "peak_memory_bytes") / 2**30,
     }
 
 
@@ -125,20 +128,34 @@ def main() -> None:
     )
     prompts = build_prompts(args.batch_size, args.prompt_len, read_vocab_size(args.model))
 
-    engine.generate(
+    # Warmup (excluded from timing). In rkv mode it must also reach the first
+    # compaction trigger (budget + buffer - phys_after_prefill steps, since
+    # compress_prefill caps phys at budget) so trial 1 does not pay the cold
+    # compaction path — with defaults this is ~642 tokens instead of 32.
+    if rkv_cfg is not None:
+        phys_after_prefill = min(args.prompt_len, args.budget)
+        first_trigger = args.budget + args.buffer - phys_after_prefill + 2
+        warmup_tokens = min(args.gen_len, first_trigger)
+    else:
+        warmup_tokens = min(WARMUP_TOKENS, args.gen_len)
+    warm_outs = engine.generate(
         prompts,
-        max_new_tokens=min(WARMUP_TOKENS, args.gen_len),
+        max_new_tokens=warmup_tokens,
         temperature=TEMPERATURE,
         top_p=TOP_P,
         stop_token_ids=(),
         seed=SAMPLING_SEED,
     )
     torch.cuda.synchronize()
-    # Peak from here on covers weights + KV pool (already resident) + trial activations.
-    torch.cuda.reset_peak_memory_stats()
+    if rkv_cfg is not None and warmup_tokens >= first_trigger:
+        assert sum(out.num_compactions for out in warm_outs) >= 1, (
+            "rkv warmup generated past the trigger but never compacted"
+        )
 
     trials = [run_trial(engine, prompts, args.gen_len) for _ in range(args.trials)]
-    peak_mem_gib = torch.cuda.max_memory_allocated() / 2**30
+    # Peak per trial comes from engine.stats (generate() resets peak stats
+    # per call); report the max across trials.
+    peak_mem_gib = max(trial["peak_mem_gib"] for trial in trials)
 
     def mean(key: str) -> float:
         return statistics.fmean(trial[key] for trial in trials)
@@ -150,20 +167,23 @@ def main() -> None:
     )
     print(
         f"{'trial':>5} {'wall_s':>9} {'prefill_s':>10} {'decode_s':>9} "
-        f"{'decode_tok/s':>13} {'tok/s/seq':>10} {'compactions':>12} {'compaction_s':>13}"
+        f"{'decode_tok/s':>13} {'tok/s/seq':>10} {'compactions':>12} {'compaction_s':>13} "
+        f"{'peak_GiB':>9}"
     )
     for i, trial in enumerate(trials, start=1):
         print(
             f"{i:>5} {trial['wall_s']:>9.2f} {trial['prefill_s']:>10.3f} {trial['decode_s']:>9.2f} "
             f"{trial['decode_tok_s']:>13.1f} {trial['decode_tok_s_per_seq']:>10.1f} "
-            f"{trial['num_compactions']:>12d} {trial['compaction_s']:>13.3f}"
+            f"{trial['num_compactions']:>12d} {trial['compaction_s']:>13.3f} "
+            f"{trial['peak_mem_gib']:>9.2f}"
         )
     print(
         f"{'mean':>5} {mean('wall_s'):>9.2f} {mean('prefill_s'):>10.3f} {mean('decode_s'):>9.2f} "
         f"{mean('decode_tok_s'):>13.1f} {mean('decode_tok_s_per_seq'):>10.1f} "
-        f"{mean('num_compactions'):>12.1f} {mean('compaction_s'):>13.3f}"
+        f"{mean('num_compactions'):>12.1f} {mean('compaction_s'):>13.3f} "
+        f"{mean('peak_mem_gib'):>9.2f}"
     )
-    print(f"peak torch.cuda.max_memory_allocated: {peak_mem_gib:.2f} GiB")
+    print(f"peak memory (max over trials, engine stats): {peak_mem_gib:.2f} GiB")
 
     summary = {
         "script": "bench_rkv",

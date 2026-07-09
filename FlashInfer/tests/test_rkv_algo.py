@@ -401,6 +401,110 @@ def test_compressor_trigger_arithmetic() -> None:
     assert phys_len == [cfg.budget, cfg.budget]
 
 
+def test_compressor_window_rotation() -> None:
+    """Windows must reach scoring in temporal order when compaction fires
+    between window-aligned steps (regression for the circular window buffer;
+    also holds for any shift-based implementation)."""
+    compressor = _load("rkv.compressor", os.path.join(_PKG_DIR, "compressor.py"))
+
+    torch.manual_seed(1234)
+    cfg = RKVConfig(budget=16, buffer=8, window_size=8, kernel_size=7)
+    num_layers, q_heads, kv_heads, head_dim = 2, 4, 2, 16
+    phys = cfg.budget + cfg.buffer
+
+    comp = compressor.R1KV(
+        cfg,
+        num_layers=num_layers,
+        max_batch_size=1,
+        num_q_heads=q_heads,
+        head_dim=head_dim,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+
+    seed = torch.randn(cfg.window_size, num_layers, q_heads, head_dim)
+    for layer in range(num_layers):
+        comp.seed_window(layer, 0, seed[:, layer])
+    # Three decode steps: the write cursor sits mid-window at compaction time,
+    # so the temporal window is [seed[3:], push0, push1, push2].
+    pushes = torch.randn(3, num_layers, 1, q_heads, head_dim)
+    for step in range(3):
+        comp.begin_step([0])
+        for layer in range(num_layers):
+            comp.push_queries(layer, torch.tensor([0]), pushes[step, layer])
+
+    keys = torch.randn(num_layers, phys, kv_heads, head_dim)
+    values = torch.randn(num_layers, phys, kv_heads, head_dim)
+    for layer in range(num_layers):
+        kept_k, kept_v = comp.compact(0, layer, keys[layer], values[layer])
+        window = torch.cat([seed[3:, layer], pushes[:, layer, 0]], dim=0)
+        exp_k, exp_v = _algo.update_kv(
+            keys[layer].transpose(0, 1).unsqueeze(0),
+            window.transpose(0, 1).unsqueeze(0),
+            values[layer].transpose(0, 1).unsqueeze(0),
+            budget=cfg.budget,
+            window_size=cfg.window_size,
+            kernel_size=cfg.kernel_size,
+            mix_lambda=cfg.mix_lambda,
+            retain_ratio=cfg.retain_ratio,
+            retain_direction=cfg.retain_direction,
+        )
+        assert torch.equal(kept_k, exp_k.squeeze(0).transpose(0, 1))
+        assert torch.equal(kept_v, exp_v.squeeze(0).transpose(0, 1))
+
+
+def test_compressor_batch_matches_per_layer() -> None:
+    """compact_batch must return exactly what per-(layer, request) compact()
+    returns — the internal A/B gate guarantees this even on devices where
+    batched GEMMs differ, so the contract holds unconditionally."""
+    compressor = _load("rkv.compressor", os.path.join(_PKG_DIR, "compressor.py"))
+
+    torch.manual_seed(1234)
+    cfg = RKVConfig(budget=16, buffer=8, window_size=8, kernel_size=7)
+    num_layers, q_heads, kv_heads, head_dim = 3, 4, 2, 16
+    max_batch, rows = 3, [0, 2]  # non-contiguous request rows
+    phys = cfg.budget + cfg.buffer
+
+    def build() -> object:
+        comp = compressor.R1KV(
+            cfg,
+            num_layers=num_layers,
+            max_batch_size=max_batch,
+            num_q_heads=q_heads,
+            head_dim=head_dim,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        torch.manual_seed(77)
+        seed = torch.randn(cfg.window_size, num_layers, max_batch, q_heads, head_dim)
+        for layer in range(num_layers):
+            for r in range(max_batch):
+                comp.seed_window(layer, r, seed[:, layer, r])
+        pushes = torch.randn(3, num_layers, max_batch, q_heads, head_dim)
+        for step in range(3):  # cursor mid-window at compaction time
+            comp.begin_step(list(range(max_batch)))
+            for layer in range(num_layers):
+                comp.push_queries(
+                    layer, torch.arange(max_batch), pushes[step, layer]
+                )
+        return comp
+
+    comp_batch = build()
+    comp_loop = build()
+    keys = torch.randn(num_layers, len(rows), phys, kv_heads, head_dim)
+    values = torch.randn(num_layers, len(rows), phys, kv_heads, head_dim)
+
+    kept_k, kept_v = comp_batch.compact_batch(rows, keys.clone(), values.clone())
+    assert kept_k.shape == (num_layers, len(rows), cfg.budget, kv_heads, head_dim)
+    for layer in range(num_layers):
+        for i, row in enumerate(rows):
+            exp_k, exp_v = comp_loop.compact(row, layer, keys[layer, i], values[layer, i])
+            assert torch.equal(kept_k[layer, i], exp_k)
+            assert torch.equal(kept_v[layer, i], exp_v)
+    assert torch.as_tensor(comp_batch.num_compactions).tolist() == [1, 0, 1]
+    assert torch.as_tensor(comp_loop.num_compactions).tolist() == [1, 0, 1]
+
+
 TESTS = [
     test_config_defaults_and_validation,
     test_scatter_exemption_mutates_similarity,
@@ -410,6 +514,8 @@ TESTS = [
     test_dtypes_bf16_fp32,
     test_kernel_window_edges,
     test_compressor_trigger_arithmetic,
+    test_compressor_window_rotation,
+    test_compressor_batch_matches_per_layer,
 ]
 
 

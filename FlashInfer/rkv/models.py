@@ -158,14 +158,13 @@ class Attention(nn.Module):
         self.head_dim = head_dim
 
         hidden_size = config.hidden_size
-        self.q_proj = Linear(
-            hidden_size, self.num_q_heads * head_dim, qkv_bias, device, dtype
-        )
-        self.k_proj = Linear(
-            hidden_size, self.num_kv_heads * head_dim, qkv_bias, device, dtype
-        )
-        self.v_proj = Linear(
-            hidden_size, self.num_kv_heads * head_dim, qkv_bias, device, dtype
+        self.q_size = self.num_q_heads * head_dim
+        self.kv_size = self.num_kv_heads * head_dim
+        # q/k/v as one fused GEMM ([q; k; v] row blocks); the loader scatters
+        # the per-projection checkpoint tensors into the row slices declared
+        # by ``CausalLM.packed_map``.
+        self.qkv_proj = Linear(
+            hidden_size, self.q_size + 2 * self.kv_size, qkv_bias, device, dtype
         )
         self.o_proj = Linear(
             self.num_q_heads * head_dim, hidden_size, o_bias, device, dtype
@@ -185,9 +184,15 @@ class Attention(nn.Module):
         attention_fn: AttentionFn,
     ) -> torch.Tensor:
         num_tokens = hidden.shape[0]
-        q = self.q_proj(hidden).view(num_tokens, self.num_q_heads, self.head_dim)
-        k = self.k_proj(hidden).view(num_tokens, self.num_kv_heads, self.head_dim)
-        v = self.v_proj(hidden).view(num_tokens, self.num_kv_heads, self.head_dim)
+        qkv = self.qkv_proj(hidden)
+        q, k, v = qkv.split((self.q_size, self.kv_size, self.kv_size), dim=-1)
+        # The split slices are row-strided views of the fused GEMM output;
+        # reshape would keep them strided, and the flashinfer rope/attention
+        # kernels are only known-safe on packed [tokens, heads, head_dim]
+        # layouts — so materialize each once.
+        q = q.reshape(num_tokens, self.num_q_heads, self.head_dim).contiguous()
+        k = k.reshape(num_tokens, self.num_kv_heads, self.head_dim).contiguous()
+        v = v.reshape(num_tokens, self.num_kv_heads, self.head_dim).contiguous()
         if self.q_norm is not None:
             q = self.q_norm(q)
             k = self.k_norm(k)
@@ -204,19 +209,18 @@ class MLP(nn.Module):
     def __init__(self, config, device: torch.device, dtype: torch.dtype) -> None:
         super().__init__()
         bias = bool(getattr(config, "mlp_bias", False))
-        self.gate_proj = Linear(
-            config.hidden_size, config.intermediate_size, bias, device, dtype
-        )
-        self.up_proj = Linear(
-            config.hidden_size, config.intermediate_size, bias, device, dtype
+        # gate/up as one fused GEMM ([gate; up] row blocks, the layout
+        # ``silu_and_mul`` consumes directly — no concat copy per layer);
+        # checkpoint tensors land via ``CausalLM.packed_map``.
+        self.gate_up_proj = Linear(
+            config.hidden_size, 2 * config.intermediate_size, bias, device, dtype
         )
         self.down_proj = Linear(
             config.intermediate_size, config.hidden_size, bias, device, dtype
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up = torch.cat([self.gate_proj(x), self.up_proj(x)], dim=-1)
-        return self.down_proj(silu_and_mul(gate_up))
+        return self.down_proj(silu_and_mul(self.gate_up_proj(x)))
 
 
 class DecoderLayer(nn.Module):
@@ -364,6 +368,34 @@ class CausalLM(nn.Module):
             self.lm_head = Linear(
                 config.hidden_size, config.vocab_size, False, device, dtype
             )
+
+        # Checkpoint name -> (fused parameter name, row offset) for the merged
+        # qkv / gate_up projections; consumed by ``loader.load_weights``.
+        packed: dict[str, tuple[str, int]] = {}
+        intermediate = config.intermediate_size
+        for i, layer in enumerate(self.model.layers):
+            attn = layer.self_attn
+            attn_base = f"model.layers.{i}.self_attn."
+            mlp_base = f"model.layers.{i}.mlp."
+            attn_suffixes = ("weight", "bias") if qkv_bias else ("weight",)
+            for suffix in attn_suffixes:
+                target = f"{attn_base}qkv_proj.{suffix}"
+                packed[f"{attn_base}q_proj.{suffix}"] = (target, 0)
+                packed[f"{attn_base}k_proj.{suffix}"] = (target, attn.q_size)
+                packed[f"{attn_base}v_proj.{suffix}"] = (
+                    target,
+                    attn.q_size + attn.kv_size,
+                )
+            mlp_suffixes = (
+                ("weight", "bias")
+                if layer.mlp.gate_up_proj.bias is not None
+                else ("weight",)
+            )
+            for suffix in mlp_suffixes:
+                target = f"{mlp_base}gate_up_proj.{suffix}"
+                packed[f"{mlp_base}gate_proj.{suffix}"] = (target, 0)
+                packed[f"{mlp_base}up_proj.{suffix}"] = (target, intermediate)
+        self.packed_map = packed
 
     def forward(
         self,
