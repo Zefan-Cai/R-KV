@@ -1,0 +1,22 @@
+# R-KV on FlashInfer — pinned dependency stack.
+#
+# Validated on NVIDIA H100 80GB (SM90), Python 3.12, driver CUDA 12.8; see
+# docs/IMPLEMENTATION.md §8. Note flashinfer-python 0.6.12 requires
+# torch<2.11, so torch 2.10.0 (the default PyPI cu128 build) is the newest
+# torch this stack can hold — installing a cu129 torch first will simply be
+# downgraded by the flashinfer install. Plain install works:
+#
+#   pip install -r requirements-rkv.txt
+#
+# For a different CUDA version, use the matching torch wheel index and keep
+# flashinfer-python / flashinfer-cubin versions agreeing with each other.
+#
+# transformers is used for config/tokenizer only; eval data ships as committed
+# jsonl, so datasets has no hub dependency at run time.
+
+torch==2.10.0
+flashinfer-python==0.6.12
+flashinfer-cubin==0.6.12
+transformers==5.8.1
+safetensors
+datasets

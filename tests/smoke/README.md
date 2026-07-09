@@ -7,10 +7,12 @@ catches the two classic KV-corruption signatures: token salad (e.g.
 `GraphUnits`-style vocabulary soup) and tight repetition loops. Exit code
 0 = pass. Set `RKV_SMOKE_MODEL` to override the model.
 
-Each integration needs its own environment — the four stacks pin
-conflicting torch/transformers versions (see the per-tree requirements).
-All four were validated on A100-40GB (sm80), CUDA 12.4-12.6 wheels,
-Python 3.10, at repo `main`:
+Each integration needs its own environment — the stacks pin conflicting
+torch/transformers versions (see the per-tree requirements). The first
+five were validated on A100-40GB (sm80), CUDA 12.4-12.6 wheels,
+Python 3.10, at repo `main`. `flashinfer_smoke.py` targets the newer
+Python 3.12 / CUDA 12.9 / torch 2.11 stack pinned in
+`FlashInfer/requirements-rkv.txt` and is pending GPU validation:
 
 | Script | Env | Model (default) | R-KV switch |
 |---|---|---|---|
@@ -19,6 +21,7 @@ Python 3.10, at repo `main`:
 | `minisgl_smoke.py` | `cd Mini-SGLang && scripts/apply_rkv.sh`, then `pip install -e mini-sglang-src` | Qwen/Qwen3-0.6B | `RKV_ON=1` -> `rkv_enabled=True, rkv_budget=512, rkv_buffer=64`; instruments `RKVCompressor.maybe_compress` and fails if compression never fires |
 | `sglang_smoke.py` | `cd SGLang && scripts/apply_rkv.sh`, then `pip install -r requirements-rkv.txt && pip install -e sglang-src/python` | Qwen/Qwen2.5-0.5B-Instruct | `RKV_ON=1` -> `enable_rkv=True, rkv_budget=128`, FlashInfer, radix/cuda-graph/overlap off, `page_size=1`; `BATCH=2` for the batch variant |
 | `hf_smoke.py` | `pip install -e HuggingFace` + flash-attn (transformers must be `>=4.48.1,<4.56`) | deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B | `MODE=rkv` (monkeypatch) vs `MODE=fullkv` (stock forward) |
+| `flashinfer_smoke.py` | `pip install -r FlashInfer/requirements-rkv.txt` (standalone engine, no upstream checkout to patch) | Qwen/Qwen3-0.6B | `RKV_ON=1` -> `RKVConfig(budget=64, buffer=16, window_size=8)` (override via `RKV_SMOKE_BUDGET`/`RKV_SMOKE_BUFFER`); reads `GenOutput.num_compactions` and fails if compression never fires |
 
 Usage examples:
 
@@ -41,6 +44,10 @@ RKV_ON=1 BATCH=2 python tests/smoke/sglang_smoke.py
 # HuggingFace monkeypatch vs FullKV
 MODE=rkv python tests/smoke/hf_smoke.py
 MODE=fullkv python tests/smoke/hf_smoke.py
+
+# FlashInfer standalone engine (R-KV on, then FullKV baseline)
+RKV_ON=1 python tests/smoke/flashinfer_smoke.py
+RKV_ON=0 python tests/smoke/flashinfer_smoke.py
 ```
 
 Notes:
