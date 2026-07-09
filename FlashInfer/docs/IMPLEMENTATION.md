@@ -21,6 +21,7 @@ RKV-HS — read [`DESIGN.md`](./DESIGN.md) first.
 | [`benchmark/`](../benchmark/) | `bench_rkv.py` (throughput + peak memory matrix), `eval_math.py` (GSM8K / AIME24 / MATH-500), `RESULTS_*.md`. |
 | [`tests/`](../tests/) | `test_rkv_algo.py` (CPU unit tests), `test_cross_repo_parity.py` (bit-parity vs `../../rkv/compression/r1_kv.py`), and `test_fa3_engine.py` (CPU contracts for the optional FA3 adapter); importlib-by-path, no flashinfer import, wired into `.github/workflows/cpu-tests.yml`. |
 | `../../tests/smoke/flashinfer_smoke.py` | Repo-level GPU smoke: `RKV_ON=0/1`, health check, fails if `num_compactions == 0` with R-KV on. |
+| `../../tests/smoke/fa3_parity.py` | H100 teacher-forced FA3-vs-FlashInfer logits probe covering ragged prefill, non-contiguous active rows, and post-compaction decode. |
 
 ## 2. Per-step data flow
 
@@ -65,7 +66,8 @@ cache seeded from the prompt either way. See [`DESIGN.md`](./DESIGN.md) §5.4.
 - CPU: `python tests/test_rkv_algo.py`, `python tests/test_cross_repo_parity.py`,
   and `python tests/test_fa3_engine.py` — all print `all tests passed`;
   run on every push via `cpu-tests.yml`.
-- GPU: `RKV_ON=1 python tests/smoke/flashinfer_smoke.py` from the repo root,
+- GPU: `RKV_ON=1 python tests/smoke/flashinfer_smoke.py` and
+  `python tests/smoke/fa3_parity.py --model /path/to/model` from the repo root,
   then the validation plan in [`DESIGN.md`](./DESIGN.md) §8.
 
 ## 7. Bring-up log

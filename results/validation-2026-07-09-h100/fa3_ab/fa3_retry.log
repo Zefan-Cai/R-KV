@@ -1,0 +1,16 @@
+[retry] start 2026-07-09T18:05:15Z
+== fa3 introspection ==
+module: /mnt/localssd/zefan/rkv-fi/venv/lib/python3.12/site-packages/flash_attn_3-3.0.0-py3.12-linux-x86_64.egg/flash_attn_interface.py
+flash_attn_with_kvcache -> (q, k_cache, v_cache, k=None, v=None, qv=None, rotary_cos=None, rotary_sin=None, cache_seqlens: Union[torch.Tensor, int, NoneType] = None, cache_batch_idx: Optional[torch.Tensor] = None, cache_leftpad: Optional[torch.Tensor] = None, page_table: Optional[torch.Tensor] = None, cu_seqlens_q: Optional[torch.Tensor] = None, cu_seqlens_k_new: Optional[torch.Tensor] = None, max_seqlen_q: Optional[int] = None, rotary_seqlens: Optional[torch.Tensor] = None, q_descale: Optional[torch.Tensor] = None, k_descale: Optional[torch.Tensor] = None, v_descale: Optional[torch.Tensor] = None, softmax_scale=None, causal=False, window_size=(-1, -1), attention_chunk=0, softcap=0.0, rotary_interleaved=True, scheduler_metadata=None, num_splits=0, pack_gqa=None, sm_margin=0, return_softmax_lse=False)
+flash_attn_varlen_func -> (q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, seqused_q=None, seqused_k=None, softmax_scale=None, causal=False, qv=None, q_descale=None, k_descale=None, v_descale=None, window_size=(-1, -1), attention_chunk=0, softcap=0.0, num_splits=1, pack_gqa=None, deterministic=False, sm_margin=0, return_attn_probs=False)
+== smokes ==
+smoke_fa3_on1: exit=0 FLASHINFER_SMOKE_PASS
+smoke_fa3_on0: exit=0 FLASHINFER_SMOKE_PASS
+smoke_flashinfer_on1: exit=0 FLASHINFER_SMOKE_PASS
+smoke_flashinfer_on0: exit=0 FLASHINFER_SMOKE_PASS
+== bench A/B (same node, same code, attention only) ==
+bench_flashinfer_rkv: exit=0 {"script": "bench_rkv", "timestamp": "2026-07-09T11:08:40", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-1.5B", "mode": "rkv", "attention": "flashinfer", "budget": 1024, "buffer": 128, "mix_lambda": 0.1, "batch_size": 16, "prompt_len": 512, "ge
+bench_flashinfer_fullkv: exit=0 {"script": "bench_rkv", "timestamp": "2026-07-09T11:09:36", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-1.5B", "mode": "fullkv", "attention": "flashinfer", "budget": null, "buffer": null, "mix_lambda": null, "batch_size": 16, "prompt_len": 512
+bench_fa3_rkv: exit=0 {"script": "bench_rkv", "timestamp": "2026-07-09T11:10:51", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-1.5B", "mode": "rkv", "attention": "fa3", "budget": 1024, "buffer": 128, "mix_lambda": 0.1, "batch_size": 16, "prompt_len": 512, "gen_len":
+bench_fa3_fullkv: exit=0 {"script": "bench_rkv", "timestamp": "2026-07-09T11:11:55", "gpu": "NVIDIA H100 80GB HBM3", "model": "/mnt/localssd/zefan/rkv-fi/models/DeepSeek-R1-Distill-Qwen-1.5B", "mode": "fullkv", "attention": "fa3", "budget": null, "buffer": null, "mix_lambda": null, "batch_size": 16, "prompt_len": 512, "gen_
+FA3_RETRY_DONE rc=0 2026-07-09T18:11:56Z

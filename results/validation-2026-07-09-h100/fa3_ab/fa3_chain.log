@@ -1,0 +1,8 @@
+[chain] waiting for venv torch (2026-07-09T17:27:35Z)
+[chain] torch ready; building FA3 (2026-07-09T17:29:05Z)
+Cloning into 'flash-attention'...
+
+Using /mnt/localssd/zefan/rkv-fi/venv/lib/python3.12/site-packages
+Finished processing dependencies for flash-attn-3==3.0.0
+FA3_INSTALL_FAILED
+FA3_CHAIN_DONE rc=1

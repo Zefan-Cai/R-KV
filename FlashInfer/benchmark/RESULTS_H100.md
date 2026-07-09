@@ -6,6 +6,10 @@
 - **Sampling**: temperature 0.6, top_p 0.95, seed 42; R-KV `buffer=128`, `mix_lambda=0.1` unless noted
 - Raw artifacts: per-run logs, per-sample jsonl records, runlist, and `harvest.json` under
   `results/validation-2026-07-08-h100/flashinfer_sweep/`.
+- Completion accounting: all 62 commands reached a terminal state after both
+  workers reported `EXHAUSTED`; **57 exited OK and 5 diagnostic jobs exited
+  FAIL(1)**. Accuracy/performance records are complete. Thus “62/62” means
+  completed, not 62 passed.
 
 ## Accuracy
 
@@ -62,13 +66,19 @@ compression (p=4096, budget 512) runs at 270.6 / 257.0 tok/s (1.5B / 7B, b=4).
 - `probe_logits.py` (logit-level FlashInfer-vs-HF comparison): **PROBE_OK on
   all four architectures** — DeepSeek-R1-Distill-Qwen-7B, Qwen3-0.6B,
   Qwen3-8B, Llama-3.2-1B-Instruct.
-- `compare_hf` free-running text comparison: 7B passes verbatim; Qwen3-0.6B /
-  Llama-1B diverge after a short shared prefix — expected fp16 trajectory
-  divergence under sampling, not a numerical defect (see probe results).
+- `compare_hf` free-running greedy comparison: 7B passes verbatim; Qwen3-0.6B /
+  Llama-1B diverge after a short shared prefix. Their teacher-forced probes
+  pass (62/64 and 64/64 argmax agreement), identifying trajectory drift rather
+  than a broad numerical defect.
 - GPU smokes: all pass except sporadic small-model flakes (Qwen3-0.6B under a
   deliberately tiny smoke budget degenerates into repetition and trips the
   health heuristic; one Llama-1B run answered too briefly to trigger
   compaction). Same flake pattern on pre- and post-optimization code.
+- The five non-zero diagnostics were: the short Llama R-KV smoke (exact retry
+  passed with 19 compactions), the two free-running comparisons above (probe
+  replacements passed), a Qwen3-0.6B tiny-budget repetition flake that
+  reproduced post-opt, and a Llama FullKV lexical-health flake whose earlier
+  identical run passed. No expected log or accuracy record is missing.
 
 ## Post-sweep optimization pass (A/B on the same node)
 
@@ -96,22 +106,33 @@ repetition flake as the pre-opt code.
 
 ## FlashAttention-3 attention line (`--attention fa3`)
 
-Same engine, same code, only the two attention calls swapped
-(`flash_attn_varlen_func` prefill / `flash_attn_with_kvcache` decode; FA3
-3.0.0 built from `flash-attention/hopper` against this stack's torch 2.10).
-Measured on a fresh 2×H100 node (`rkv-fi-bench-1`, post-optimization code,
-1.5B, b=16, g=2048, 2 trials); all four smokes (fa3/flashinfer × rkv on/off)
-pass:
+`FA3Engine` is a drop-in comparison line over the same model, compactor, and
+interleaved KV pool; only ragged prefill and KV-cache decode switch to
+`flash_attn_varlen_func` / `flash_attn_with_kvcache`. This is therefore not a
+native planar-cache FA3 memory comparison. FA3 3.0.0 was built from hopper
+commit `5835c733` against torch 2.10 on a fresh 2×H100 node
+(`rkv-fi-bench-1`).
 
-| config | FlashInfer tok/s | FA3 tok/s | Δ |
-|---|---|---|---|
-| fullkv | 1365.6 | 1188.3 | −13.0% |
-| rkv 1024 | 1352.5 | 1134.5 | −16.1% |
+The benchmark uses 1.5B, b=16, prompt 512, forced decode 2048, two trials per
+cell. It was repeated in reverse backend order; the aggregate below is all
+four trials, which removes the visible order/thermal spread:
 
-Prefill time, compaction time, and peak memory are identical between the two
-lines (attention is not the bottleneck there). For single-token decode at
-these shapes, FlashInfer's tensor-core decode wrapper clearly outruns FA3's
-general kv-cache kernel — **FlashInfer stays the default**; the FA3 line is
-kept as an optional same-engine comparison and portability path.
-(FlashInfer rkv here, 1352.5, also reproduces the 1357.8 measured on the
-previous node — cross-node consistency check.)
+| config | primary FI / FA3 tok/s | reverse FI / FA3 tok/s | 4-trial FI / FA3 tok/s | FA3 Δ |
+|---|---:|---:|---:|---:|
+| fullkv | 1365.6 / 1188.3 | 1365.7 / 1145.8 | 1365.6 / 1167.0 | **−14.5%** |
+| rkv 1024 | 1352.5 / 1134.6 | 1305.0 / 1128.2 | 1328.8 / 1131.4 | **−14.9%** |
+
+All four health smokes (FA3/FlashInfer × R-KV/FullKV) pass. A stronger
+teacher-forced probe covers ragged prefill and the non-contiguous active set
+`[0, 2]`: FullKV and R-KV both reach **99/99 argmax agreement**; R-KV performs
+compactions `[2, 0, 3]`, so post-compaction decode is included. Peak allocated
+memory is backend-identical (5.063 GiB FullKV, 5.447 GiB R-KV).
+
+Kernel isolation finds the cause: planar vs interleaved FA3 cache views differ
+by ≤1.1%, but at B=16, QH=12, KVH=2, D=128 the per-layer decode call is about
+0.024 ms for FlashInfer versus 0.088 ms for FA3 (3.6–3.7×). `pack_gqa` /
+`num_splits` tuning does not close the gap. Reusing FA3 scheduler metadata
+helps the isolated call 3–7% but not the end-to-end engine, so that experiment
+was rejected. **FlashInfer stays the default**; FA3 remains an optional,
+correct comparison/portability line. Raw logs and the rejected experiment are
+under [`results/validation-2026-07-09-h100/fa3_ab/`](../../results/validation-2026-07-09-h100/fa3_ab/).

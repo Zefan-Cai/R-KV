@@ -1,0 +1,3 @@
+seq=1024 flat_stride=(262144, 256, 128, 1) interleaved_stride=(524288, 512, 128, 1) flat_ms=0.0918 interleaved_ms=0.0921 ratio=1.004
+seq=2048 flat_stride=(524288, 256, 128, 1) interleaved_stride=(1048576, 512, 128, 1) flat_ms=0.0927 interleaved_ms=0.0921 ratio=0.994
+seq=2560 flat_stride=(655360, 256, 128, 1) interleaved_stride=(1310720, 512, 128, 1) flat_ms=0.0913 interleaved_ms=0.0924 ratio=1.011

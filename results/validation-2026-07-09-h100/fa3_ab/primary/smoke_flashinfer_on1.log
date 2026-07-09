@@ -1,0 +1,8 @@
+
+===== FLASHINFER (rkv_on) =====
+Output(1737 chars): "First, I need to calculate the total distance the train traveled. The train moved 60 kilometers in the first part and 80 kilometers in the second part, so the total distance is 60 km plus 80 km, which equals 140 kilometers.\n\nNext, I'll determine the total time taken for the journey. The first part took 45 minutes and the second part took 75 minutes. Adding these together gives a total of 120 minutes. Since the question asks for the average speed in kilometers per hour, I'll convert the total time from minutes to hours by dividing by 60. This gives a total time of 2 hours.\n\nFinally, I'll use the formula for average speed, which is total distance divided by total time. The train traveled 140 kilometers in 2 hours, so its average speed is 70 kilometers per hour.\n</think>\n\nTo determine the ave"
+RKV_COMPACTIONS 33 finish=stop
+HEALTH_PASS flashinfer[rkv_on] chars=1737 distinct=65 rep20=1 printable=0.979
+LOAD_SECONDS 0.888
+GENERATE_SECONDS 81.355
+FLASHINFER_SMOKE_PASS

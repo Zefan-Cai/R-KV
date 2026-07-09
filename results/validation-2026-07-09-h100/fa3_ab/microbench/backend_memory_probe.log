@@ -1,0 +1,2 @@
+attention=flashinfer pid=22842 torch_allocated_mib=4692.5 torch_reserved_mib=5404.0 nvidia_smi_resident_mib=6082
+attention=fa3 pid=22955 torch_allocated_mib=4692.5 torch_reserved_mib=5404.0 nvidia_smi_resident_mib=6082

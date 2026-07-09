@@ -1,0 +1,3 @@
+fullkv: argmax_agree=99/99 mismatches=0 worst_maxdelta=0.2188 phys_len=[96, 56, 112] compactions=[0, 0, 0]
+rkv: argmax_agree=99/99 mismatches=0 worst_maxdelta=0.5000 phys_len=[64, 56, 64] compactions=[2, 0, 3]
+FA3_PARITY_PASS

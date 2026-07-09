@@ -270,6 +270,8 @@ without it.
   override (default Qwen3-0.6B), a few hundred sampled tokens at temp 0.6,
   `health_check.report()`, and **fail if compression never fired** when `RKV_ON=1`
   (Mini-SGLang convention).
+- `R-KV/tests/smoke/fa3_parity.py` (H100): teacher-forced FA3-vs-FlashInfer
+  logits over ragged prefill, non-contiguous active rows, and R-KV compaction.
 
 ## 8. GPU validation plan (H100 node)
 

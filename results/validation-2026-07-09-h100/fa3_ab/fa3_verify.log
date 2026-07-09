@@ -1,0 +1,12 @@
+[verify] start 2026-07-09T17:57:58Z
+[verify] import flash_attn_interface: PASS
+[verify] smoke_fa3_on1: FAIL
+[verify] smoke_fa3_on0: FAIL
+[verify] smoke_flashinfer_on1: FAIL
+[verify] smoke_flashinfer_on0: FAIL
+[verify] bench_flashinfer_rkv: FAIL
+[verify] bench_flashinfer_fullkv: FAIL
+[verify] bench_fa3_rkv: FAIL
+[verify] bench_fa3_fullkv: FAIL
+[verify] completion marker: FAIL
+FA3_VERIFIED_DONE rc=1 2026-07-09T18:01:59Z

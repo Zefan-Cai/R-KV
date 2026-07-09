@@ -1,0 +1,3 @@
+seq=1024 no_metadata_ms=0.0920 with_metadata_ms=0.0871 ratio=0.946
+seq=2048 no_metadata_ms=0.0925 with_metadata_ms=0.0892 ratio=0.965
+seq=2560 no_metadata_ms=0.0936 with_metadata_ms=0.0870 ratio=0.929
