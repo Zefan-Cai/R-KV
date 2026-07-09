@@ -93,3 +93,25 @@ stacked K/V copies + scoring buffers, the latter chunk-bounded to ~512MB via
 memory advantage. Post-opt GPU smokes pass on DeepSeek-1.5B (rkv on/off) and
 Llama-3.2-1B; Qwen3-0.6B reproduces the same pre-existing tiny-model
 repetition flake as the pre-opt code.
+
+## FlashAttention-3 attention line (`--attention fa3`)
+
+Same engine, same code, only the two attention calls swapped
+(`flash_attn_varlen_func` prefill / `flash_attn_with_kvcache` decode; FA3
+3.0.0 built from `flash-attention/hopper` against this stack's torch 2.10).
+Measured on a fresh 2×H100 node (`rkv-fi-bench-1`, post-optimization code,
+1.5B, b=16, g=2048, 2 trials); all four smokes (fa3/flashinfer × rkv on/off)
+pass:
+
+| config | FlashInfer tok/s | FA3 tok/s | Δ |
+|---|---|---|---|
+| fullkv | 1365.6 | 1188.3 | −13.0% |
+| rkv 1024 | 1352.5 | 1134.5 | −16.1% |
+
+Prefill time, compaction time, and peak memory are identical between the two
+lines (attention is not the bottleneck there). For single-token decode at
+these shapes, FlashInfer's tensor-core decode wrapper clearly outruns FA3's
+general kv-cache kernel — **FlashInfer stays the default**; the FA3 line is
+kept as an optional same-engine comparison and portability path.
+(FlashInfer rkv here, 1352.5, also reproduces the 1357.8 measured on the
+previous node — cross-node consistency check.)

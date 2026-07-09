@@ -14,11 +14,12 @@ RKV-HS — read [`DESIGN.md`](./DESIGN.md) first.
 | [`rkv/algo.py`](../rkv/algo.py) | Faithful port of the reference scoring/selection: `compute_attention_scores`, `cal_similarity` (`scatter_` exemption), `select_indices`, `update_kv`. No flashinfer import — CPU CI runs it. |
 | [`rkv/compressor.py`](../rkv/compressor.py) | `R1KV`: per-batch rolling window-query cache and the compaction driver that scores, selects, and gathers survivors per layer/kv-head. |
 | [`rkv/models.py`](../rkv/models.py) | Llama / Qwen2 / Qwen3 forward passes on FlashInfer kernels (`rmsnorm`, `fused_add_rmsnorm`, `silu_and_mul`, rope cache); family detected from `config.architectures[0]`; `head_dim` from config when present. |
-| [`rkv/engine.py`](../rkv/engine.py) | `FlashInferEngine`: paged KV pool (`page_size=1`, NHD), ragged prefill + optional prefill compression, per-step decode planning over active rows, sampling, compaction trigger, `generate()` / `GenOutput` / `stats`. |
+| [`rkv/engine.py`](../rkv/engine.py) | `FlashInferEngine`: paged KV pool (`page_size=1`, NHD), ragged prefill + optional prefill compression, per-step decode planning over active rows, sampling, compaction trigger, `generate()` / `GenOutput` / `stats`. Attention plan/run are overridable hooks (`_plan_prefill` / `_run_prefill_attention` / `_plan_decode` / `_run_decode_attention`). |
+| [`rkv/engine_fa3.py`](../rkv/engine_fa3.py) | `FA3Engine`: same engine with the two attention calls swapped to FlashAttention-3 (`flash_attn_varlen_func` prefill, `flash_attn_with_kvcache` decode over the per-request contiguous regions). Select with `--attention fa3` (benchmarks) or `RKV_ATTN=fa3` (smoke). Requires `flash_attn_interface` (hopper build, SM90). |
 | [`rkv/loader.py`](../rkv/loader.py) | Streams safetensors shards into pre-allocated parameters (no full-model 2x copy). |
 | [`examples/`](../examples/) | `example.py` (FullKV baseline) and `example_rkv.py` (same prompt, R-KV on). |
 | [`benchmark/`](../benchmark/) | `bench_rkv.py` (throughput + peak memory matrix), `eval_math.py` (GSM8K / AIME24 / MATH-500), `RESULTS_*.md`. |
-| [`tests/`](../tests/) | `test_rkv_algo.py` (CPU unit tests) and `test_cross_repo_parity.py` (bit-parity vs `../../rkv/compression/r1_kv.py`); both importlib-by-path, no flashinfer import, wired into `.github/workflows/cpu-tests.yml`. |
+| [`tests/`](../tests/) | `test_rkv_algo.py` (CPU unit tests), `test_cross_repo_parity.py` (bit-parity vs `../../rkv/compression/r1_kv.py`), and `test_fa3_engine.py` (CPU contracts for the optional FA3 adapter); importlib-by-path, no flashinfer import, wired into `.github/workflows/cpu-tests.yml`. |
 | `../../tests/smoke/flashinfer_smoke.py` | Repo-level GPU smoke: `RKV_ON=0/1`, health check, fails if `num_compactions == 0` with R-KV on. |
 
 ## 2. Per-step data flow
@@ -61,8 +62,8 @@ cache seeded from the prompt either way. See [`DESIGN.md`](./DESIGN.md) §5.4.
 
 ## 6. Tests
 
-- CPU: `python tests/test_rkv_algo.py` and
-  `python tests/test_cross_repo_parity.py` — both print `all tests passed`;
+- CPU: `python tests/test_rkv_algo.py`, `python tests/test_cross_repo_parity.py`,
+  and `python tests/test_fa3_engine.py` — all print `all tests passed`;
   run on every push via `cpu-tests.yml`.
 - GPU: `RKV_ON=1 python tests/smoke/flashinfer_smoke.py` from the repo root,
   then the validation plan in [`DESIGN.md`](./DESIGN.md) §8.

@@ -16,9 +16,18 @@ from health_check import report
 
 MODEL = os.environ.get("RKV_SMOKE_MODEL", "Qwen/Qwen3-0.6B")
 RKV_ON = os.environ.get("RKV_ON", "1") == "1"
+# RKV_ATTN=fa3 swaps the attention kernels to FlashAttention-3 (H100 line).
+ATTN = os.environ.get("RKV_ATTN", "flashinfer")
+if ATTN not in {"flashinfer", "fa3"}:
+    raise SystemExit(f"RKV_ATTN must be flashinfer or fa3, got {ATTN!r}")
 
 from transformers import AutoTokenizer  # noqa: E402
 from rkv import FlashInferEngine, RKVConfig  # noqa: E402
+
+if ATTN == "fa3":
+    from rkv import FA3Engine as EngineCls
+else:
+    EngineCls = FlashInferEngine
 
 if not os.path.isdir(MODEL):
     from huggingface_hub import snapshot_download
@@ -42,7 +51,7 @@ RKV_BUDGET = int(os.environ.get("RKV_SMOKE_BUDGET", "64"))
 RKV_BUFFER = int(os.environ.get("RKV_SMOKE_BUFFER", "16"))
 rkv = RKVConfig(budget=RKV_BUDGET, buffer=RKV_BUFFER, window_size=8) if RKV_ON else None
 t0 = time.time()
-engine = FlashInferEngine(MODEL, max_batch_size=1, max_seq_len=4096, rkv=rkv)
+engine = EngineCls(MODEL, max_batch_size=1, max_seq_len=4096, rkv=rkv)
 load_s = time.time() - t0
 
 t0 = time.time()
@@ -54,7 +63,7 @@ gen_s = time.time() - t0
 
 out = outs[0]
 text = tok.decode(out.token_ids, skip_special_tokens=True)
-tag = "rkv_on" if RKV_ON else "rkv_off"
+tag = ("rkv_on" if RKV_ON else "rkv_off") + ("+fa3" if ATTN == "fa3" else "")
 print(f"\n===== FLASHINFER ({tag}) =====")
 print(f"Output({len(text)} chars): {text[:800]!r}")
 print(f"RKV_COMPACTIONS {out.num_compactions} finish={out.finish_reason}")

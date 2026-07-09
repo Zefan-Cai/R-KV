@@ -46,6 +46,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gen-len", type=int, default=2048, help="forced decode length per request")
     parser.add_argument("--prompt-len", type=int, default=512, help="synthetic prompt length per request")
     parser.add_argument("--trials", type=int, default=3)
+    parser.add_argument(
+        "--attention", choices=("flashinfer", "fa3"), default="flashinfer",
+        help="attention kernels: FlashInfer wrappers or FlashAttention-3 (H100)",
+    )
     return parser.parse_args()
 
 
@@ -120,7 +124,11 @@ def main() -> None:
         if args.mode == "rkv"
         else None
     )
-    engine = FlashInferEngine(
+    if args.attention == "fa3":
+        from rkv import FA3Engine as engine_cls
+    else:
+        engine_cls = FlashInferEngine
+    engine = engine_cls(
         args.model,
         max_batch_size=args.batch_size,
         max_seq_len=args.prompt_len + args.gen_len,
@@ -162,8 +170,9 @@ def main() -> None:
 
     mode_label = f"rkv(budget={args.budget}, buffer={args.buffer})" if rkv_cfg else "fullkv"
     print(
-        f"model={args.model} mode={mode_label} batch={args.batch_size} "
-        f"prompt_len={args.prompt_len} gen_len={args.gen_len} trials={args.trials}"
+        f"model={args.model} mode={mode_label} attention={args.attention} "
+        f"batch={args.batch_size} prompt_len={args.prompt_len} "
+        f"gen_len={args.gen_len} trials={args.trials}"
     )
     print(
         f"{'trial':>5} {'wall_s':>9} {'prefill_s':>10} {'decode_s':>9} "
@@ -191,6 +200,7 @@ def main() -> None:
         "gpu": torch.cuda.get_device_name(0),
         "model": args.model,
         "mode": args.mode,
+        "attention": args.attention,
         "budget": args.budget if rkv_cfg else None,
         "buffer": args.buffer if rkv_cfg else None,
         "mix_lambda": args.mix_lambda if rkv_cfg else None,

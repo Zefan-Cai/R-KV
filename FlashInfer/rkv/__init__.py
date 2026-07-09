@@ -17,6 +17,7 @@ from .algo import (
 from .config import GenOutput, RKVConfig
 
 __all__ = [
+    "FA3Engine",
     "FlashInferEngine",
     "GenOutput",
     "R1KV",
@@ -28,7 +29,11 @@ __all__ = [
     "update_kv",
 ]
 
-_LAZY_ATTRS = {"FlashInferEngine": "engine", "R1KV": "compressor"}
+_LAZY_ATTRS = {
+    "FA3Engine": "engine_fa3",
+    "FlashInferEngine": "engine",
+    "R1KV": "compressor",
+}
 
 
 def __getattr__(name: str):

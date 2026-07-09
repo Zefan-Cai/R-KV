@@ -71,6 +71,10 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="skip generation; score an existing --output jsonl (e.g. merged shards)",
     )
+    parser.add_argument(
+        "--attention", choices=("flashinfer", "fa3"), default="flashinfer",
+        help="attention kernels: FlashInfer wrappers or FlashAttention-3 (H100)",
+    )
     return parser.parse_args()
 
 
@@ -86,17 +90,20 @@ def parse_shard(spec: str) -> tuple[int, int]:
 
 
 def default_output(args: argparse.Namespace, shard: tuple[int, int]) -> Path:
-    # Tag every rkv sweep axis so sweep points cannot silently clobber each
-    # other's records ({:g} keeps float lambdas repr-stable). A later
+    # Tag every rkv sweep axis and the optional attention backend so sweep
+    # points cannot silently clobber each other's records ({:g} keeps float
+    # lambdas repr-stable). Keep the historical FlashInfer filename stable;
+    # FA3 adds an explicit suffix. A later
     # default-named --score-only must pass the same --budget/--buffer/
     # --mix-lambda to resolve the same path (or use --output explicitly).
     if args.mode == "rkv":
         mode_tag = f"rkv{args.budget}b{args.buffer}lam{args.mix_lambda:g}"
     else:
         mode_tag = "fullkv"
+    attention_tag = "" if args.attention == "flashinfer" else f"_{args.attention}"
     idx, count = shard
     suffix = f"_shard{idx}of{count}" if count > 1 else ""
-    return SCRIPT_DIR / f"eval_{args.dataset}_{mode_tag}{suffix}.jsonl"
+    return SCRIPT_DIR / f"eval_{args.dataset}_{mode_tag}{attention_tag}{suffix}.jsonl"
 
 
 def load_records(path: Path, max_samples: int | None, shard: tuple[int, int]) -> list[dict]:
@@ -184,7 +191,11 @@ def generate(args: argparse.Namespace, records: list[dict], out_path: Path) -> t
         if args.mode == "rkv"
         else None
     )
-    engine = FlashInferEngine(
+    if args.attention == "fa3":
+        from rkv import FA3Engine as engine_cls
+    else:
+        engine_cls = FlashInferEngine
+    engine = engine_cls(
         args.model,
         max_batch_size=args.bsz,
         max_seq_len=max(len(ids) for ids in prompt_ids) + args.max_new_tokens,
@@ -240,6 +251,7 @@ def generate(args: argparse.Namespace, records: list[dict], out_path: Path) -> t
             for rec, out in zip(batch, outs):
                 row = {
                     **rec,
+                    "attention": args.attention,
                     "output": tokenizer.decode(out.token_ids, skip_special_tokens=True),
                     "prefill_tokens": out.num_prefill_tokens,
                     "output_tokens": out.num_output_tokens,
@@ -273,6 +285,16 @@ def main() -> None:
             records = [json.loads(line) for line in fin]
         if not records:
             raise SystemExit(f"no records in {out_path}")
+        recorded_attention = {rec.get("attention") for rec in records} - {None}
+        if len(recorded_attention) > 1:
+            raise SystemExit(
+                f"mixed attention backends in {out_path}: {sorted(recorded_attention)}"
+            )
+        if recorded_attention and recorded_attention != {args.attention}:
+            actual = next(iter(recorded_attention))
+            raise SystemExit(
+                f"{out_path} records attention={actual}, not --attention {args.attention}"
+            )
         totals = {
             "prefill_tokens": sum(rec.get("prefill_tokens", 0) for rec in records),
             "output_tokens": sum(rec.get("output_tokens", 0) for rec in records),
@@ -344,6 +366,7 @@ def main() -> None:
         "model": args.model,
         "dataset": args.dataset,
         "mode": args.mode,
+        "attention": args.attention,
         "budget": args.budget if args.mode == "rkv" else None,
         "buffer": args.buffer if args.mode == "rkv" else None,
         "mix_lambda": args.mix_lambda if args.mode == "rkv" else None,

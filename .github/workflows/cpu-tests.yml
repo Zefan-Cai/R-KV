@@ -29,7 +29,8 @@ jobs:
           python SGLang/tests/test_rkv_algo.py
           python SGLang/tests/test_rkv_integration.py
           python SGLang/tests/test_cross_repo_parity.py
-      - name: FlashInfer R-KV algorithm + cross-repo parity tests
+      - name: FlashInfer R-KV algorithm + adapter + cross-repo parity tests
         run: |
           python FlashInfer/tests/test_rkv_algo.py
           python FlashInfer/tests/test_cross_repo_parity.py
+          python FlashInfer/tests/test_fa3_engine.py

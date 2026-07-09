@@ -50,7 +50,8 @@ FlashInfer/
 │   └── IMPLEMENTATION.md       # code map + bring-up log (filled during GPU validation)
 └── tests/
     ├── test_rkv_algo.py            # CPU-only unit tests, __main__ runner
-    └── test_cross_repo_parity.py   # bit-parity vs ../../rkv/compression/r1_kv.py
+    ├── test_cross_repo_parity.py   # bit-parity vs ../../rkv/compression/r1_kv.py
+    └── test_fa3_engine.py          # CPU contracts for the FA3 adapter
 ```
 
 Companion (repo conventions): `R-KV/tests/smoke/flashinfer_smoke.py` + row in
@@ -232,6 +233,22 @@ bracket the decode pipeline with two host syncs each.
   scattered into their fused parameter slices, and a fused parameter counts as loaded
   only when all of its sources landed.
 
+### 6.1 FA3 attention line — `rkv/engine_fa3.py`
+
+`FA3Engine` subclasses `FlashInferEngine` and overrides only the four attention
+hooks: prefill runs `flash_attn_varlen_func` over the same ragged q/k/v, decode
+runs `flash_attn_with_kvcache` — the pool's `page_size=1` fixed regions viewed
+per layer *are* FA3's `[batch, seqlen, heads, head_dim]` cache layout, so the
+swap moves no data. RoPE / norms / activation / sampling / compaction stay on
+the shared code path, which makes `--attention flashinfer|fa3` a drop-in
+attention-backend A/B over the same engine and KV pool. It is not a native FA3
+memory-layout comparison: the zero-copy K/V views retain the shared pool's
+interleaved stride, and the subclass retains the base FlashInfer workspace.
+Row subsets (after early stops) use `cache_batch_idx` when the installed FA3
+exposes it, else a padded full-batch fallback. Requires the hopper
+`flash_attn_interface` build (SM90); exported lazily so the package imports fine
+without it.
+
 ## 7. Tests
 
 - `tests/test_rkv_algo.py` (CPU): config validation; score shapes/dtypes; scatter
@@ -242,6 +259,9 @@ bracket the decode pipeline with two host syncs each.
   pointed at `../../rkv/compression/r1_kv.py`, `torch.equal` bit-parity on
   `compute_attention_scores` / `cal_similarity` / `select_indices` / `update_kv`,
   seeds `1234+i`, class-default hyperparams (`mix_lambda=0.07`, `retain_ratio=0.1`).
+- `tests/test_fa3_engine.py` (CPU contract): ragged prefill metadata,
+  non-contiguous active-row mapping, no-`cache_batch_idx` padded fallback, and
+  fail-fast validation of the optional Hopper API.
 - Both: `importlib` by file path, **no flashinfer import**, `__main__` runner printing
   `all tests passed`; wired into `.github/workflows/cpu-tests.yml` (compileall excludes
   `engine.py`/`models.py`? No — compileall is syntax-only, include everything; only the

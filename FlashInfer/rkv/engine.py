@@ -275,8 +275,6 @@ class FlashInferEngine:
         model = self.model
         device = self.device
         indptr = [0, *accumulate(prompt_lens)]
-        # CPU tensor: flashinfer plan() reads indptr host-side (see __init__).
-        qo_indptr = torch.tensor(indptr, dtype=torch.int32)
         input_ids = torch.tensor(
             [t for p in prompts for t in p], dtype=torch.long, device=device
         )
@@ -286,16 +284,7 @@ class FlashInferEngine:
                 for length in prompt_lens
             ]
         )
-        self._prefill_wrapper.plan(
-            qo_indptr,
-            qo_indptr,
-            model.num_q_heads,
-            model.num_kv_heads,
-            model.head_dim,
-            causal=True,
-            q_data_type=self.dtype,
-            kv_data_type=self.dtype,
-        )
+        self._plan_prefill(indptr, prompt_lens)
         self._prefill_bounds = list(zip(indptr[:-1], indptr[1:]))
         for row, length in enumerate(prompt_lens):
             # Physical length after prefill: update_kv keeps exactly `budget`
@@ -311,6 +300,25 @@ class FlashInferEngine:
             [end - 1 for end in indptr[1:]], dtype=torch.long, device=device
         )
         return model.compute_logits(hidden[last])
+
+    def _plan_prefill(self, indptr: list[int], prompt_lens: list[int]) -> None:
+        # CPU tensor: flashinfer plan() reads indptr host-side (see __init__).
+        qo_indptr = torch.tensor(indptr, dtype=torch.int32)
+        self._prefill_wrapper.plan(
+            qo_indptr,
+            qo_indptr,
+            self.model.num_q_heads,
+            self.model.num_kv_heads,
+            self.model.head_dim,
+            causal=True,
+            q_data_type=self.dtype,
+            kv_data_type=self.dtype,
+        )
+
+    def _run_prefill_attention(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+    ) -> torch.Tensor:
+        return self._prefill_wrapper.run(q, k, v)
 
     def _prefill_attention(
         self, layer: int, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
@@ -341,19 +349,17 @@ class FlashInferEngine:
             self.kv_pool[layer, base : base + kept, 1, 0] = values
         # Prefill attention runs over the full (uncompressed) ragged prompt
         # K/V, exactly like the HF reference; only the cache is compressed.
-        return self._prefill_wrapper.run(q, k, v)
+        return self._run_prefill_attention(q, k, v)
 
     # ------------------------------------------------------------------
     # Decode
     # ------------------------------------------------------------------
-    def _decode_step(self, active: list[int], last_token: list[int]) -> torch.Tensor:
-        model = self.model
-        device = self.device
+    def _plan_decode(self, active: list[int], lens: list[int]) -> None:
         # Plan over post-append KV lengths: the step's k/v are written into
         # slot phys_len before the wrapper runs. indptr / last_page_len are
         # CPU tensors by design (see __init__); kv_indices are device slices
         # of the precomputed pool arange.
-        lens = [self._phys_len[r] + 1 for r in active]
+        model = self.model
         kv_indptr = torch.tensor([0, *accumulate(lens)], dtype=torch.int32)
         regions = [
             self._pool_indices[r * self.region_len : r * self.region_len + n]
@@ -372,6 +378,12 @@ class FlashInferEngine:
             q_data_type=self.dtype,
             kv_data_type=self.dtype,
         )
+
+    def _decode_step(self, active: list[int], last_token: list[int]) -> torch.Tensor:
+        model = self.model
+        device = self.device
+        lens = [self._phys_len[r] + 1 for r in active]
+        self._plan_decode(active, lens)
 
         # One H2D transfer for all per-step scalars instead of four.
         staged = torch.tensor(
@@ -401,6 +413,9 @@ class FlashInferEngine:
         self.kv_pool[layer, self._decode_slots, 1, 0] = v
         if self.compressor is not None:
             self.compressor.push_queries(layer, self._decode_rows, q)
+        return self._run_decode_attention(layer, q)
+
+    def _run_decode_attention(self, layer: int, q: torch.Tensor) -> torch.Tensor:
         return self._decode_wrapper.run(
             q,
             self.kv_pool[layer],

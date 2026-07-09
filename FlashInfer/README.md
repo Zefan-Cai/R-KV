@@ -73,6 +73,7 @@ pip install -r requirements-rkv.txt
 ```bash
 python tests/test_rkv_algo.py            # config validation + algorithm unit tests
 python tests/test_cross_repo_parity.py   # bit-parity vs this repo's rkv/ reference
+python tests/test_fa3_engine.py           # CPU contracts for the optional FA3 adapter
 ```
 
 ### Step 2 — examples
@@ -164,6 +165,7 @@ algorithm (house convention across backends).
 | --- | --- |
 | `batch = 1`, single GPU | ✅ |
 | `batch > 1`, single GPU (per-request compaction triggering) | ✅ |
+| FlashAttention-3 drop-in attention line (`--attention fa3` / `RKV_ATTN=fa3`; shared interleaved KV pool, needs the hopper `flash_attn_interface` build, SM90) | ✅ |
 | Data parallel — plain (one process per GPU, disjoint shards, via benchmark scripts) | ✅ |
 | Tensor parallel | ❌ **not supported — silently incorrect**: per-rank head shards would each keep their own token set with no cross-rank score reduction. Do not shard this engine across GPUs. |
 | Prefix / radix cache | ❌ not implemented (incompatible with destructive eviction) |
