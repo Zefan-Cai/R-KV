@@ -183,6 +183,14 @@ class TestConfig(unittest.TestCase):
         with self.assertRaises(ValueError):
             RKVPrefillConfig(budget=8, window_size=8)
 
+    def test_even_kernel_and_bad_dims_rejected(self):
+        with self.assertRaises(ValueError):
+            RKVPrefillConfig(kernel_size=8)  # even kernel breaks R1KV._scores
+        with self.assertRaises(ValueError):
+            RKVPrefillConfig(window_size=0)
+        with self.assertRaises(ValueError):
+            RKVPrefillConfig(row_block=0)
+
 
 class TestUnconditionalCompression(unittest.TestCase):
     def test_always_wants_compression(self):
@@ -231,7 +239,7 @@ class TestOneShotEndToEnd(unittest.TestCase):
         state = comp.states[idx]
         self.assertTrue(state.compressed)
         self.assertEqual(req.kv_committed_len, budget)
-        self.assertEqual(comp.take_pending_length_updates()[idx], budget)
+        self.assertEqual(comp.take_pending_length_updates()[idx][0], budget)
         # freed exactly n - budget slots; tail of req_to_token cleared.
         self.assertEqual(int(comp.kv_allocator.freed[0].numel()), n - budget)
         r2t = comp.req_to_token_pool.req_to_token
@@ -422,6 +430,59 @@ class TestDecodePositions(unittest.TestCase):
         comp.override_decode_positions(fb)
         # logical_position - 1 = 100 + 5 - 1 = 104
         self.assertEqual(int(fb.positions[0]), 104)
+
+
+class TestPrefillPendingLifecycle(unittest.TestCase):
+    """Issue 1 (prefill): a request that compacts at prefill end and finishes on
+    the same step (the normal prefill-finish path) must not leak its pending
+    length update to the next request reusing the slot."""
+
+    def _comp(self):
+        return _make_compressor("oneshot", 8, 2, 3, 2, 8, num_slots=64)
+
+    def _compact(self, comp, idx, n=20):
+        comp.req_to_token_pool.req_to_token[idx, :n] = torch.arange(
+            30, 30 + n, dtype=torch.int32
+        )
+        req = _MockReq(origin_len=n, req_pool_idx=idx)
+        comp.on_request_begin(req)
+        fb = _MockForwardBatch([idx], [n], [n])
+        q = torch.randn(n, 2, 8)
+        for layer_id in range(comp.num_layers):
+            comp.observe_prefill_layer(q, None, None, _MockLayer(layer_id), fb)
+        comp.maybe_compact(fb)
+        return req
+
+    def test_pending_update_carries_owner(self):
+        comp = self._comp()
+        req = self._compact(comp, 1)
+        new_len, owner = comp.pending_length_updates[1]
+        self.assertEqual(new_len, 8)
+        self.assertIs(owner, req)
+
+    def test_finish_clears_pending(self):
+        comp = self._comp()
+        req = self._compact(comp, 1)
+        self.assertIn(1, comp.pending_length_updates)
+        comp.on_request_end(req)
+        self.assertNotIn(1, comp.pending_length_updates)
+        self.assertNotIn(1, comp.states)
+
+    def test_retract_clears_pending(self):
+        comp = self._comp()
+        req = self._compact(comp, 1)
+        self.assertIn(1, comp.pending_length_updates)
+        comp.on_request_retract(req)
+        self.assertNotIn(1, comp.pending_length_updates)
+        self.assertNotIn(1, comp.states)
+
+    def test_slot_reuse_after_finish_no_stale(self):
+        comp = self._comp()
+        req_a = self._compact(comp, 1)
+        comp.on_request_end(req_a)
+        req_b = _MockReq(origin_len=5, req_pool_idx=1)
+        comp.on_request_begin(req_b)  # B reuses slot 1
+        self.assertEqual(comp.take_pending_length_updates(), {})
 
 
 if __name__ == "__main__":

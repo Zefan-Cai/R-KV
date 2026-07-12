@@ -24,32 +24,6 @@ _RKV_DIR = os.path.abspath(
     os.path.join(_HERE, "..", "rkv")
 )
 
-# Standalone layout (no installed ``sglang``): register the R-KV modules under
-# their real ``sglang.srt.mem_cache.rkv.*`` dotted names so the lazy cross-module
-# imports inside algo.py / prefill.py (redundancy_fused, prefill, algo) resolve.
-for _pkg in (
-    "sglang",
-    "sglang.srt",
-    "sglang.srt.mem_cache",
-    "sglang.srt.mem_cache.rkv",
-):
-    if _pkg not in sys.modules:
-        _placeholder = types.ModuleType(_pkg)
-        _placeholder.__path__ = []  # mark as package
-        sys.modules[_pkg] = _placeholder
-for _dotted, _fname in (
-    ("sglang.srt.mem_cache.rkv.redundancy_fused", "redundancy_fused.py"),
-    ("sglang.srt.mem_cache.rkv.algo", "algo.py"),
-    ("sglang.srt.mem_cache.rkv.prefill", "prefill.py"),
-):
-    if _dotted not in sys.modules:
-        _spec = importlib.util.spec_from_file_location(
-            _dotted, os.path.join(_RKV_DIR, _fname)
-        )
-        _module = importlib.util.module_from_spec(_spec)
-        sys.modules[_dotted] = _module
-        _spec.loader.exec_module(_module)
-
 _HAS_CUDA = torch.cuda.is_available()
 try:
     import triton  # noqa: F401
@@ -57,6 +31,36 @@ try:
     _HAS_TRITON = True
 except Exception:
     _HAS_TRITON = False
+
+# Standalone port (no installed ``sglang``): register the R-KV modules under
+# their real ``sglang.srt.mem_cache.rkv.*`` dotted names so the lazy cross-module
+# imports inside algo.py / prefill.py resolve. GUARDED by Triton availability,
+# because redundancy_fused.py imports Triton at module load and every test in
+# this file is skipped without CUDA+Triton anyway -- so on a CPU / no-Triton
+# runner this file self-skips instead of raising ModuleNotFoundError.
+if _HAS_TRITON:
+    for _pkg in (
+        "sglang",
+        "sglang.srt",
+        "sglang.srt.mem_cache",
+        "sglang.srt.mem_cache.rkv",
+    ):
+        if _pkg not in sys.modules:
+            _placeholder = types.ModuleType(_pkg)
+            _placeholder.__path__ = []  # mark as package
+            sys.modules[_pkg] = _placeholder
+    for _dotted, _fname in (
+        ("sglang.srt.mem_cache.rkv.redundancy_fused", "redundancy_fused.py"),
+        ("sglang.srt.mem_cache.rkv.algo", "algo.py"),
+        ("sglang.srt.mem_cache.rkv.prefill", "prefill.py"),
+    ):
+        if _dotted not in sys.modules:
+            _spec = importlib.util.spec_from_file_location(
+                _dotted, os.path.join(_RKV_DIR, _fname)
+            )
+            _module = importlib.util.module_from_spec(_spec)
+            sys.modules[_dotted] = _module
+            _spec.loader.exec_module(_module)
 
 
 def _load(name, filename):

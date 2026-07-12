@@ -351,7 +351,7 @@ index 1b34f0f54..ec0d962b3 100644
              else:
                  # Make sure at least one page is available
 diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
-index abba37441..22c8783fb 100644
+index abba37441..be7a1405c 100644
 --- a/python/sglang/srt/managers/scheduler.py
 +++ b/python/sglang/srt/managers/scheduler.py
 @@ -352,6 +352,10 @@ class Scheduler(
@@ -452,7 +452,7 @@ index abba37441..22c8783fb 100644
          initial_bs = batch.batch_size()
  
          batch.filter_batch()
-@@ -3078,10 +3132,75 @@ class Scheduler(
+@@ -3078,10 +3132,95 @@ class Scheduler(
          if batch.is_empty():
              return batch
  
@@ -480,11 +480,20 @@ index abba37441..22c8783fb 100644
 +        if not updates:
 +            return
 +        for i, req in enumerate(batch.reqs):
-+            new_len = updates.get(req.req_pool_idx)
-+            if new_len is not None:
-+                batch.seq_lens[i] = new_len
-+                batch.seq_lens_cpu[i] = new_len
-+                batch.orig_seq_lens[i] = new_len
++            upd = updates.get(req.req_pool_idx)
++            if upd is None:
++                continue
++            new_len, owner = upd
++            # Identity guard: skip an update whose pool slot was released/reused
++            # between the compaction and this drain (it belongs to a dead
++            # request). Without this a reused req_pool_idx would have the new
++            # occupant's seq_lens blindly rewritten to the old budget, letting
++            # attention read cleared/unallocated KV.
++            if owner is not req:
++                continue
++            batch.seq_lens[i] = new_len
++            batch.seq_lens_cpu[i] = new_len
++            batch.orig_seq_lens[i] = new_len
 +
 +    def _apply_rkv_pre_decode(self, batch: ScheduleBatch):
 +        """Register new R-KV requests and apply the previous step's physical KV
@@ -509,26 +518,37 @@ index abba37441..22c8783fb 100644
 +        if not updates:
 +            return
 +        for i, req in enumerate(batch.reqs):
-+            new_len = updates.get(req.req_pool_idx)
-+            if new_len is not None:
-+                # Cross-check the two length-tracking paths agree AND that this
-+                # runs before prepare_for_decode: the commit set both the pending
-+                # update and kv_committed_len to budget, and prepare_for_decode
-+                # (which would bump kv_committed_len to budget+1) has not run yet.
-+                assert new_len == req.kv_committed_len, (
++            upd = updates.get(req.req_pool_idx)
++            if upd is None:
++                continue
++            new_len, owner = upd
++            # Identity guard: a pending update whose pool slot was released and
++            # reused between commit and this drain belongs to a dead request.
++            # Skip it rather than rewrite the new occupant's seq_lens (which,
++            # under python -O with the check below stripped, would silently
++            # corrupt the reused request's length).
++            if owner is not req:
++                continue
++            # Cross-check the two length-tracking paths agree AND that this runs
++            # before prepare_for_decode: the commit set both the pending update
++            # and kv_committed_len to budget, and prepare_for_decode (which would
++            # bump kv_committed_len to budget+1) has not run yet. This is a hard
++            # invariant, so raise (not a debug assert that -O would strip).
++            if new_len != req.kv_committed_len:
++                raise RuntimeError(
 +                    f"R-KV length divergence for req_pool_idx={req.req_pool_idx}: "
 +                    f"pending update {new_len} != kv_committed_len "
 +                    f"{req.kv_committed_len} (compaction commit / decode-length "
 +                    f"ordering broken)"
 +                )
-+                batch.seq_lens[i] = new_len
-+                batch.seq_lens_cpu[i] = new_len
-+                batch.orig_seq_lens[i] = new_len
++            batch.seq_lens[i] = new_len
++            batch.seq_lens_cpu[i] = new_len
++            batch.orig_seq_lens[i] = new_len
 +
      def record_batch_in_overlap(self, batch: ScheduleBatch):
          # FIXME(lsyin): hacky way to keep a reference to avoid GPU tensors being freed by torch GC
          # NOTE: More Reliable: record all tensors into the forward stream
-@@ -3928,6 +4047,7 @@ class Scheduler(
+@@ -3928,6 +4067,7 @@ class Scheduler(
          if recv_req.mode == "retract" and not self.running_batch.is_empty():
              self.running_batch.filter_batch()
              if len(self.running_batch.reqs) != 0:
@@ -537,31 +557,49 @@ index abba37441..22c8783fb 100644
                  for req in retracted_reqs:
                      self._add_request_to_queue(req)
 diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
-index a9d5f0c28..6a2a1d11b 100644
+index a9d5f0c28..67501c680 100644
 --- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
 +++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
-@@ -91,6 +91,20 @@ class SchedulerBatchResultProcessor:
+@@ -79,6 +79,22 @@ class SchedulerBatchResultProcessor:
+     output_streamer: SchedulerOutputStreamer
+     abort_request: Callable
+ 
++    def _rkv_on_request_finished(self, req: Req) -> None:
++        """Notify the R-KV compressors that a request finished so they drop its
++        per-request state AND any pending compaction bookkeeping.
++
++        Must be called on EVERY path that releases a finished request's pool
++        slot -- including the normal ``process_batch_result_prefill`` finish path
++        -- otherwise a request that compacts and finishes on the same step
++        leaves a stale pending length update that gets applied to the next
++        request reusing its ``req_pool_idx``.
++        """
++        model_runner = getattr(self.model_worker, "model_runner", None)
++        for attr in ("rkv_compressor", "rkv_prefill_compressor"):
++            comp = getattr(model_runner, attr, None)
++            if comp is not None:
++                comp.on_request_end(req)
++
+     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
+         assert self.disaggregation_mode == DisaggregationMode.DECODE
+         use_free_group = self.server_args.disaggregation_decode_enable_radix_cache
+@@ -91,6 +107,7 @@ class SchedulerBatchResultProcessor:
                  req.time_stats.set_quick_finish_time()
                  if self.server_args.enable_hisparse:
                      self.hisparse_coordinator.request_finished(req)
-+                _rkv = getattr(
-+                    getattr(self.model_worker, "model_runner", None),
-+                    "rkv_compressor",
-+                    None,
-+                )
-+                if _rkv is not None:
-+                    _rkv.on_request_end(req)
-+                _rkv_prefill = getattr(
-+                    getattr(self.model_worker, "model_runner", None),
-+                    "rkv_prefill_compressor",
-+                    None,
-+                )
-+                if _rkv_prefill is not None:
-+                    _rkv_prefill.on_request_end(req)
++                self._rkv_on_request_finished(req)
                  release_kv_cache(req, self.tree_cache)
  
          # Note: Logprobs should be handled on the prefill engine.
-@@ -670,6 +684,20 @@ class SchedulerBatchResultProcessor:
+@@ -236,6 +253,7 @@ class SchedulerBatchResultProcessor:
+                     if req.finished():
+                         self._maybe_collect_routed_experts(req)
+                         self._maybe_collect_indexer_topk(req)
++                        self._rkv_on_request_finished(req)
+                         release_kv_cache(req, self.tree_cache)
+                         req.time_stats.set_completion_time()
+                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
+@@ -670,6 +688,20 @@ class SchedulerBatchResultProcessor:
                  value=can_run_cuda_graph
              )
  
@@ -582,24 +620,11 @@ index a9d5f0c28..6a2a1d11b 100644
          self.token_to_kv_pool_allocator.free_group_begin()
  
          for i, req in enumerate(batch.reqs):
-@@ -855,6 +883,20 @@ class SchedulerBatchResultProcessor:
+@@ -855,6 +887,7 @@ class SchedulerBatchResultProcessor:
              else:
                  if self.server_args.enable_hisparse:
                      self.hisparse_coordinator.request_finished(req)
-+                _rkv = getattr(
-+                    getattr(self.model_worker, "model_runner", None),
-+                    "rkv_compressor",
-+                    None,
-+                )
-+                if _rkv is not None:
-+                    _rkv.on_request_end(req)
-+                _rkv_prefill = getattr(
-+                    getattr(self.model_worker, "model_runner", None),
-+                    "rkv_prefill_compressor",
-+                    None,
-+                )
-+                if _rkv_prefill is not None:
-+                    _rkv_prefill.on_request_end(req)
++                self._rkv_on_request_finished(req)
                  prepare_release = getattr(
                      self.model_worker, "prepare_for_kv_cache_release", None
                  )
@@ -631,7 +656,7 @@ index 0feeca831..403e02c19 100644
              if isinstance(extend_seq_lens, list):
                  # Main path: H2D from host lists; populate *_cpu mirrors.
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index 1cff5c983..c2ed9133f 100644
+index 1cff5c983..071dd303b 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
 @@ -417,6 +417,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
@@ -656,7 +681,7 @@ index 1cff5c983..c2ed9133f 100644
          self._linear_attn_registry_cache: Any = _UNSET
  
          # Load model weights and configure
-@@ -846,6 +854,67 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+@@ -846,6 +854,99 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                  host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
              )
  
@@ -666,9 +691,24 @@ index 1cff5c983..c2ed9133f 100644
 +            from sglang.srt.mem_cache.rkv.integration import (
 +                RKVCompressor,
 +                RKVConfig,
++                rkv_runtime_support_error,
 +            )
 +
 +            sa = self.server_args
++            # Late, post-resolution hard gate: ServerArgs validation ran before
++            # the backend/model/page-size/spec were resolved. Fail now if the
++            # actual runtime is not one the R-KV hooks are wired for.
++            _rkv_reason = rkv_runtime_support_error(
++                mode="decode",
++                prefill_backend=sa.prefill_attention_backend or sa.attention_backend,
++                decode_backend=sa.decode_attention_backend or sa.attention_backend,
++                use_mla=self.use_mla_backend,
++                is_hybrid_swa=self.is_hybrid_swa,
++                spec_enabled=not self.spec_algorithm.is_none(),
++                page_size=sa.page_size,
++            )
++            if _rkv_reason is not None:
++                raise ValueError(_rkv_reason)
 +            # Base config from the per-field flags; --rkv-config JSON overrides.
 +            rkv_cfg_dict = {
 +                "budget": sa.rkv_budget,
@@ -694,16 +734,32 @@ index 1cff5c983..c2ed9133f 100644
 +                head_dim=self.model_config.head_dim,
 +                q_dtype=self.model_config.dtype,
 +                fused_validation=sa.rkv_fused_validation,
++                attn_tp_group=self.attention_tp_group,
 +            )
 +
 +        if self.enable_rkv_prefill:
 +            import json
 +
++            from sglang.srt.mem_cache.rkv.integration import (
++                rkv_runtime_support_error,
++            )
 +            from sglang.srt.mem_cache.rkv.prefill_integration import (
 +                RKVPrefillCompressor,
 +                RKVPrefillConfig,
 +            )
 +
++            sa = self.server_args
++            _rkv_reason = rkv_runtime_support_error(
++                mode="prefill",
++                prefill_backend=sa.prefill_attention_backend or sa.attention_backend,
++                decode_backend=sa.decode_attention_backend or sa.attention_backend,
++                use_mla=self.use_mla_backend,
++                is_hybrid_swa=self.is_hybrid_swa,
++                spec_enabled=not self.spec_algorithm.is_none(),
++                page_size=sa.page_size,
++            )
++            if _rkv_reason is not None:
++                raise ValueError(_rkv_reason)
 +            rkv_prefill_cfg_dict = {}
 +            if self.server_args.rkv_prefill_config:
 +                rkv_prefill_cfg_dict.update(
@@ -719,12 +775,13 @@ index 1cff5c983..c2ed9133f 100644
 +                device=self.device,
 +                enable_overlap=not self.server_args.disable_overlap_schedule,
 +                fused_validation=self.server_args.rkv_fused_validation,
++                attn_tp_group=self.attention_tp_group,
 +            )
 +
          self.init_routed_experts_capturer()
          self.init_indexer_capturer()
  
-@@ -3001,10 +3070,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+@@ -3001,10 +3102,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                  if self.device == "cpu"
                  else forward_batch.forward_mode.is_cuda_graph
              )
@@ -747,7 +804,7 @@ index 1cff5c983..c2ed9133f 100644
              )
  
              if (
-@@ -3072,6 +3153,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+@@ -3072,6 +3185,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
              ):
                  forward_batch.post_forward_mlp_sync_batch(ret)
  
@@ -774,7 +831,7 @@ index 1cff5c983..c2ed9133f 100644
  
      def _preprocess_logits(
 diff --git a/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py b/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
-index db4c8ad8e..10a3a688d 100644
+index db4c8ad8e..5aef18eaa 100644
 --- a/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
 +++ b/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
 @@ -1015,6 +1015,24 @@ class ModelRunnerKVCacheMixin:
@@ -802,7 +859,7 @@ index db4c8ad8e..10a3a688d 100644
          return max_num_reqs
  
      def _apply_memory_pool_config(self: ModelRunner, config: MemoryPoolConfig):
-@@ -1048,6 +1066,125 @@ class ModelRunnerKVCacheMixin:
+@@ -1048,6 +1066,132 @@ class ModelRunnerKVCacheMixin:
  
          self._init_pools()
  
@@ -888,16 +945,23 @@ index db4c8ad8e..10a3a688d 100644
 +        reduced = available_bytes - aux_bytes
 +        min_keep = getattr(configurator, "_cell_size", 0) or (1 << 20)
 +        if reduced < min_keep:
-+            logger.warning(
-+                "R-KV decode aux memory (%.2f GiB rolling-query + %.2f GiB "
-+                "compaction workspace) is too large for the KV budget (%.2f "
-+                "GiB); clamping its reservation. Lower --max-running-requests "
-+                "or --rkv-window-size.",
-+                rolling_bytes / (1 << 30),
-+                workspace_bytes / (1 << 30),
-+                available_bytes / (1 << 30),
++            # Do NOT clamp: shrinking the KV pool to one cell does not shrink the
++            # actual rolling_q / workspace allocation (they are sized from
++            # max_running_requests / the score-chunk bound, not the pool), so a
++            # clamp would just OOM later. Fail fast with an actionable message.
++            raise ValueError(
++                "R-KV decode aux memory (%.2f GiB rolling-query buffer + %.2f "
++                "GiB compaction workspace = %.2f GiB total) does not fit the "
++                "available KV budget (%.2f GiB). Lower --rkv-max-active-requests "
++                "or --rkv-window-size, raise --mem-fraction-static, or reduce the "
++                "model / context size."
++                % (
++                    rolling_bytes / (1 << 30),
++                    workspace_bytes / (1 << 30),
++                    aux_bytes / (1 << 30),
++                    available_bytes / (1 << 30),
++                )
 +            )
-+            reduced = min_keep
 +        logger.info(
 +            "R-KV decode: reserving %.2f GiB (%.2f GiB rolling-query buffer, "
 +            "%d rows x %d layers x window %d x %d heads x %d dim; + %.2f GiB "
@@ -928,7 +992,7 @@ index db4c8ad8e..10a3a688d 100644
      def _resolve_memory_pool_config(
          self: ModelRunner, pre_model_load_memory: int
      ) -> MemoryPoolConfig:
-@@ -1060,6 +1197,15 @@ class ModelRunnerKVCacheMixin:
+@@ -1060,6 +1204,15 @@ class ModelRunnerKVCacheMixin:
          page_size = self.server_args.page_size
  
          configurator = create_memory_pool_configurator(self)
@@ -945,7 +1009,7 @@ index db4c8ad8e..10a3a688d 100644
  
          # Apply external constraints (user cap, page alignment, PP sync)
 diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
-index c7162c16d..079621c32 100644
+index c7162c16d..71fe49ab5 100644
 --- a/python/sglang/srt/server_args.py
 +++ b/python/sglang/srt/server_args.py
 @@ -1848,6 +1848,77 @@ class ServerArgs:
@@ -1037,7 +1101,7 @@ index c7162c16d..079621c32 100644
          # Handle device-specific backends.
          self._handle_hpu_backends()
          self._handle_cpu_backends()
-@@ -2917,6 +2992,97 @@ class ServerArgs:
+@@ -2917,6 +2992,112 @@ class ServerArgs:
          self._apply_cuda_graph_compatibility()
          self._validate_cuda_graph_config()
  
@@ -1046,8 +1110,15 @@ index c7162c16d..079621c32 100644
 +
 +        See R-KV/doc/DESIGN.md: R-KV physically frees KV slots mid-generation,
 +        which is incompatible with prefix caching (the radix tree would keep
-+        references into freed slots), page_size > 1 (per-slot free), overlap
-+        scheduling (phase 1), and TP > 1 (per-rank eviction would diverge).
++        references into freed slots), page_size > 1 (per-slot free), and overlap
++        scheduling (phase 1).
++
++        Tensor parallelism (tp > 1) IS supported: each rank scores only its local
++        KV heads, so the per-token eviction score is all-reduced across the
++        attention-TP group before top-k (RKVCompressor._reduce_score_across_tp)
++        so every rank keeps the identical tokens. DP attention is NOT supported
++        (its padded / all-gathered forward_batch layout is untested against the
++        R-KV hooks).
 +
 +        Decode CUDA graph IS supported: a per-step hook
 +        (``RKVCompressor.begin_decode_step``) advances the compaction counters
@@ -1069,8 +1140,13 @@ index c7162c16d..079621c32 100644
 +            )
 +        if self.page_size not in (None, 1):
 +            raise ValueError("--enable-rkv requires --page-size 1 (per-slot free).")
-+        if self.tp_size > 1:
-+            raise ValueError("--enable-rkv does not support tensor parallelism yet.")
++        if self.enable_dp_attention:
++            raise ValueError(
++                "--enable-rkv supports tensor parallelism (tp>1) via a cross-rank "
++                "eviction-score all-reduce, but NOT --enable-dp-attention: its "
++                "padded / all-gathered forward_batch layout is untested against "
++                "R-KV's observe / override_decode_positions / maybe_compact hooks."
++            )
 +        if (
 +            self.rkv_max_active_requests is not None
 +            and self.rkv_max_active_requests <= 0
@@ -1127,9 +1203,12 @@ index c7162c16d..079621c32 100644
 +            raise ValueError(
 +                "--enable-rkv-prefill requires --page-size 1 (per-slot free)."
 +            )
-+        if self.tp_size > 1:
++        if self.enable_dp_attention:
 +            raise ValueError(
-+                "--enable-rkv-prefill does not support tensor parallelism yet."
++                "--enable-rkv-prefill supports tensor parallelism (tp>1) via a "
++                "cross-rank eviction-score all-reduce, but NOT "
++                "--enable-dp-attention (its padded / all-gathered forward_batch "
++                "layout is untested against the R-KV prefill hooks)."
 +            )
 +
      def _parse_cuda_graph_config(self):

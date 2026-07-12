@@ -25,7 +25,8 @@ See ``R-KV/doc/DESIGN.md`` and the A/B diff-test in
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Dict, List, Optional
+import os
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import msgspec
 import torch
@@ -65,6 +66,16 @@ class RKVPrefillConfig(msgspec.Struct):
         # can never silently start a corrupting server.
         if self.mode not in ("oneshot", "buffered"):
             raise ValueError("R-KV-prefill mode must be 'oneshot' or 'buffered'")
+        if self.window_size <= 0:
+            raise ValueError("R-KV-prefill window_size must be a positive integer")
+        if self.kernel_size <= 0 or self.kernel_size % 2 == 0:
+            raise ValueError(
+                "R-KV-prefill kernel_size must be a positive ODD integer "
+                "(an even kernel makes importance and redundancy lengths differ "
+                "by one and fails in R1KV._scores)"
+            )
+        if self.row_block <= 0:
+            raise ValueError("R-KV-prefill row_block must be a positive integer")
         if self.budget <= self.window_size:
             raise ValueError("R-KV-prefill budget must exceed window_size")
         if self.mode == "buffered" and self.buffer < 0:
@@ -117,6 +128,7 @@ class RKVPrefillCompressor:
         device: torch.device,
         enable_overlap: bool = False,
         fused_validation: str = "first-request",
+        attn_tp_group=None,
     ) -> None:
         self.config = config
         self.req_to_token_pool = req_to_token_pool
@@ -130,6 +142,17 @@ class RKVPrefillCompressor:
         # req.output_ids when the next ForwardBatch is built (one-step delay), so
         # the logical decode position must NOT subtract the extra 1.
         self.enable_overlap = enable_overlap
+
+        # Attention-TP group: each rank scores only its LOCAL kv heads, so the
+        # per-token score is summed across this group before top-k to keep the
+        # eviction decision identical on every rank (see _reduce_score_across_tp
+        # / _check_kept_consistent_across_tp). None / world_size==1 => no TP.
+        self.attn_tp_group = attn_tp_group
+        self.attn_tp_size = (
+            getattr(attn_tp_group, "world_size", 1) if attn_tp_group is not None else 1
+        )
+        self._tp_check_always = os.environ.get("SGLANG_RKV_TP_CHECK", "0") == "1"
+        self._tp_check_remaining = 8
 
         self.algo = RKVPrefill(
             budget=config.budget,
@@ -155,7 +178,7 @@ class RKVPrefillCompressor:
 
         self.states: Dict[int, RKVPrefillRequestState] = {}
         self._armed: set[int] = set()
-        self.pending_length_updates: Dict[int, int] = {}
+        self.pending_length_updates: Dict[int, Tuple[int, Req]] = {}
         # Batched-scoring A/B gate: None = not yet checked, True = batched selects
         # the same past tokens as the per-layer reference (adopted), False = they
         # differed on the first compaction (per-layer fallback forever).
@@ -189,8 +212,24 @@ class RKVPrefillCompressor:
         state.prompt_len = req.seqlen
         self.states[req.req_pool_idx] = state
 
+    def _clear_request_state(self, idx: int) -> bool:
+        """Drop all per-request prefill-R-KV bookkeeping for ``idx`` and return
+        whether a state existed. Every finish/retract path routes through here so
+        no stale pending length update / armed flag survives the release of
+        ``idx`` and gets applied to the next request that reuses the pool slot.
+        """
+        had = self.states.pop(idx, None) is not None
+        self.pending_length_updates.pop(idx, None)
+        self._armed.discard(idx)
+        return had
+
     def on_request_end(self, req: Req) -> None:
-        if req.req_pool_idx is not None and self.states.pop(req.req_pool_idx, None):
+        # Clear the pending length update / armed flag here too, not just the
+        # state: a prompt-phase request can compact at prefill end and FINISH on
+        # the same step (the normal process_batch_result_prefill finish path),
+        # releasing its pool slot. A leftover pending update would then be
+        # applied to the next request reusing this req_pool_idx.
+        if req.req_pool_idx is not None and self._clear_request_state(req.req_pool_idx):
             logger.debug(
                 "R-KV-prefill on_request_end req_pool_idx=%d states_left=%d",
                 req.req_pool_idx,
@@ -208,9 +247,7 @@ class RKVPrefillCompressor:
         idx = req.req_pool_idx
         if idx is None:
             return
-        self.states.pop(idx, None)
-        self.pending_length_updates.pop(idx, None)
-        self._armed.discard(idx)
+        self._clear_request_state(idx)
 
     def admission_steady_prompt_len(self, prompt_len: int) -> int:
         """Post-compaction resident prompt length, for compression-aware admission.
@@ -455,11 +492,16 @@ class RKVPrefillCompressor:
     ) -> torch.Tensor:
         """Cross-layer past-token score over ``slots``, batched with a first-call
         A/B gate against the per-layer reference (permanent fallback if the
-        selected past tokens differ, protecting accuracy).
+        selected past tokens differ, protecting accuracy). The score is summed
+        across the attention-TP group so every rank selects the same tokens.
         """
         if self._batched_ok is None:
-            ref = self._reference_scores(slots, window_q_all)
-            bat = self._batched_scores(slots, window_q_all)
+            ref = self._reduce_score_across_tp(
+                self._reference_scores(slots, window_q_all)
+            )
+            bat = self._reduce_score_across_tp(
+                self._batched_scores(slots, window_q_all)
+            )
             num_past = self.config.budget - self.config.window_size
             ok = ref.shape == bat.shape and ref.numel() >= num_past
             if ok:
@@ -476,11 +518,40 @@ class RKVPrefillCompressor:
                 ),
             )
             return bat if self._batched_ok else ref
-        return (
+        return self._reduce_score_across_tp(
             self._batched_scores(slots, window_q_all)
             if self._batched_ok
             else self._reference_scores(slots, window_q_all)
         )
+
+    def _reduce_score_across_tp(self, score: torch.Tensor) -> torch.Tensor:
+        """Sum the per-token score across the attention-TP group (no-op at
+        tp==1). R-KV's cross-head reduction is a linear MEAN over local heads, so
+        with uniform head sharding the all-reduced SUM is a positive scaling of
+        the true global score -> ``topk`` picks the identical tokens on every
+        rank. See ``RKVCompressor._reduce_score_across_tp`` for the full rationale.
+        """
+        if self.attn_tp_group is None or self.attn_tp_size <= 1:
+            return score
+        return self.attn_tp_group.all_reduce(score.float())
+
+    def _check_kept_consistent_across_tp(self, kept: torch.Tensor) -> None:
+        """Assert every attention-TP rank derived the identical kept set (loud
+        failure instead of silent KV divergence). Runs on the first few
+        compactions, or every one when ``SGLANG_RKV_TP_CHECK=1``."""
+        if self.attn_tp_group is None or self.attn_tp_size <= 1:
+            return
+        if not self._tp_check_always:
+            if self._tp_check_remaining <= 0:
+                return
+            self._tp_check_remaining -= 1
+        local = kept.to(torch.float32)
+        summed = self.attn_tp_group.all_reduce(local.clone())
+        if not torch.equal(summed, local * self.attn_tp_size):
+            raise RuntimeError(
+                "R-KV-prefill TP divergence: attention-TP ranks selected "
+                "different kept sets; continuing would corrupt the KV cache."
+            )
 
     # ------------------------------------------------------------------
     # Compaction (after an extend forward)
@@ -495,7 +566,9 @@ class RKVPrefillCompressor:
         if not self._armed:
             return
         r2t = self.req_to_token_pool.req_to_token
-        for req_pool_idx in list(self._armed):
+        # sorted() so every attention-TP rank issues the per-request score
+        # all-reduces in the same order.
+        for req_pool_idx in sorted(self._armed):
             state = self.states.get(req_pool_idx)
             if state is None or state.compressed or state.window_q is None:
                 continue
@@ -503,6 +576,7 @@ class RKVPrefillCompressor:
             slots = r2t[req_pool_idx, :seq_len].long()
             score = self._past_scores(slots, state.window_q)
             kept = self._assemble_kept(score, seq_len)
+            self._check_kept_consistent_across_tp(kept)
             self._compact_request(state, seq_len, kept, latch=True)
         self._armed.clear()
 
@@ -517,7 +591,9 @@ class RKVPrefillCompressor:
         one-shot, so the decode path is identical.
         """
         seq_len_by_req = self._seq_len_by_req(forward_batch)
-        for req_pool_idx, state in list(self.states.items()):
+        # sorted() so every attention-TP rank drives the per-request logical/
+        # physical compactions (and their score all-reduces) in the same order.
+        for req_pool_idx, state in sorted(self.states.items()):
             if state.compressed or state.kept_orig is None:
                 continue
             if state.prompt_len <= self.config.budget:
@@ -528,6 +604,7 @@ class RKVPrefillCompressor:
             # Final forced compaction to budget, against the true final window.
             if state.kept_orig.numel() > self.config.budget:
                 self._logical_compress(req_pool_idx, state)
+            self._check_kept_consistent_across_tp(state.kept_orig)
             self._compact_request(state, seq_len, state.kept_orig, latch=True)
 
     def _assemble_kept(self, score_accum: torch.Tensor, seq_len: int) -> torch.Tensor:
@@ -579,7 +656,7 @@ class RKVPrefillCompressor:
         if state.req is not None:
             state.req.kv_committed_len = budget
             state.req.kv_allocated_len = budget
-        self.pending_length_updates[idx] = budget
+        self.pending_length_updates[idx] = (budget, state.req)
 
         logger.info(
             "R-KV-prefill(%s) compacted req_pool_idx=%d: %d -> %d (freed %d)",
@@ -615,7 +692,7 @@ class RKVPrefillCompressor:
     def logical_position(req: Req) -> int:
         return len(req.origin_input_ids) + len(req.output_ids)
 
-    def take_pending_length_updates(self) -> Dict[int, int]:
+    def take_pending_length_updates(self) -> Dict[int, Tuple[int, Req]]:
         updates = self.pending_length_updates
         self.pending_length_updates = {}
         return updates
