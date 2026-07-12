@@ -8,7 +8,7 @@ disabled by default) is compared against
 
 Run directly::
 
-    python tests/test_rkv_algo.py
+    python test/srt/mem_cache/test_rkv_algo.py
 
 or under a test runner (unittest / pytest).
 """
@@ -28,7 +28,8 @@ import torch.nn.functional as F
 _ALGO_PATH = os.path.join(
     os.path.dirname(__file__),
     "..",
-    "rkv", "algo.py",
+    "rkv",
+    "algo.py",
 )
 _spec = importlib.util.spec_from_file_location("rkv_algo", os.path.abspath(_ALGO_PATH))
 _algo = importlib.util.module_from_spec(_spec)
@@ -66,7 +67,9 @@ def ref_compute_attention_scores(query_states, key_states, pooling="max"):
     return attn_weights
 
 
-def ref_cal_similarity(key_states, threshold=0.5, retain_ratio=0.2, retain_direction="last"):
+def ref_cal_similarity(
+    key_states, threshold=0.5, retain_ratio=0.2, retain_direction="last"
+):
     _, _, seq_len, _ = key_states.shape
 
     k_norm = key_states / (key_states.norm(dim=-1, keepdim=True) + 1e-8)
@@ -149,8 +152,12 @@ class RefR1KV:
         )
         indices = final_score.topk(self.budget - self.window_size, dim=-1).indices
         indices = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
-        k_past_compress = key_states[:, :, : -self.window_size, :].gather(dim=2, index=indices)
-        v_past_compress = value_states[:, :, : -self.window_size, :].gather(dim=2, index=indices)
+        k_past_compress = key_states[:, :, : -self.window_size, :].gather(
+            dim=2, index=indices
+        )
+        v_past_compress = value_states[:, :, : -self.window_size, :].gather(
+            dim=2, index=indices
+        )
         k_cur = key_states[:, :, -self.window_size :, :]
         v_cur = value_states[:, :, -self.window_size :, :]
         key_states = torch.cat([k_past_compress, k_cur], dim=2)
@@ -163,10 +170,42 @@ class RefR1KV:
 # --------------------------------------------------------------------------- #
 CONFIGS = [
     # (bsz, q_heads, kv_heads, seq_len, head_dim, budget, window_size)
-    dict(bsz=1, q_heads=8, kv_heads=8, seq_len=256, head_dim=64, budget=128, window_size=8),
-    dict(bsz=1, q_heads=32, kv_heads=8, seq_len=300, head_dim=128, budget=192, window_size=16),  # GQA
-    dict(bsz=2, q_heads=8, kv_heads=8, seq_len=200, head_dim=64, budget=100, window_size=8),
-    dict(bsz=1, q_heads=16, kv_heads=16, seq_len=100, head_dim=64, budget=128, window_size=8),  # below budget
+    dict(
+        bsz=1,
+        q_heads=8,
+        kv_heads=8,
+        seq_len=256,
+        head_dim=64,
+        budget=128,
+        window_size=8,
+    ),
+    dict(
+        bsz=1,
+        q_heads=32,
+        kv_heads=8,
+        seq_len=300,
+        head_dim=128,
+        budget=192,
+        window_size=16,
+    ),  # GQA
+    dict(
+        bsz=2,
+        q_heads=8,
+        kv_heads=8,
+        seq_len=200,
+        head_dim=64,
+        budget=100,
+        window_size=8,
+    ),
+    dict(
+        bsz=1,
+        q_heads=16,
+        kv_heads=16,
+        seq_len=100,
+        head_dim=64,
+        budget=128,
+        window_size=8,
+    ),  # below budget
 ]
 
 KWARGS = dict(kernel_size=7, mix_lambda=0.1, retain_ratio=0.1, retain_direction="last")
@@ -174,9 +213,15 @@ KWARGS = dict(kernel_size=7, mix_lambda=0.1, retain_ratio=0.1, retain_direction=
 
 def _make_inputs(cfg, seed):
     g = torch.Generator().manual_seed(seed)
-    q = torch.randn(cfg["bsz"], cfg["q_heads"], cfg["seq_len"], cfg["head_dim"], generator=g)
-    k = torch.randn(cfg["bsz"], cfg["kv_heads"], cfg["seq_len"], cfg["head_dim"], generator=g)
-    v = torch.randn(cfg["bsz"], cfg["kv_heads"], cfg["seq_len"], cfg["head_dim"], generator=g)
+    q = torch.randn(
+        cfg["bsz"], cfg["q_heads"], cfg["seq_len"], cfg["head_dim"], generator=g
+    )
+    k = torch.randn(
+        cfg["bsz"], cfg["kv_heads"], cfg["seq_len"], cfg["head_dim"], generator=g
+    )
+    v = torch.randn(
+        cfg["bsz"], cfg["kv_heads"], cfg["seq_len"], cfg["head_dim"], generator=g
+    )
     return q, k, v
 
 
@@ -185,18 +230,26 @@ class TestRKVAlgoParity(unittest.TestCase):
         for i, cfg in enumerate(CONFIGS):
             with self.subTest(config=i):
                 q, k, v = _make_inputs(cfg, seed=1000 + i)
-                mine = R1KV(budget=cfg["budget"], window_size=cfg["window_size"], **KWARGS)
-                ref = RefR1KV(budget=cfg["budget"], window_size=cfg["window_size"], **KWARGS)
+                mine = R1KV(
+                    budget=cfg["budget"], window_size=cfg["window_size"], **KWARGS
+                )
+                ref = RefR1KV(
+                    budget=cfg["budget"], window_size=cfg["window_size"], **KWARGS
+                )
 
                 mk, mv = mine.update_kv(k.clone(), q.clone(), v.clone())
                 rk, rv = ref.update_kv(k.clone(), q.clone(), v.clone())
 
                 self.assertEqual(mk.shape, rk.shape)
                 self.assertEqual(mv.shape, rv.shape)
-                self.assertTrue(torch.allclose(mk, rk, atol=1e-6, rtol=0),
-                                msg=f"key mismatch cfg {i}")
-                self.assertTrue(torch.allclose(mv, rv, atol=1e-6, rtol=0),
-                                msg=f"value mismatch cfg {i}")
+                self.assertTrue(
+                    torch.allclose(mk, rk, atol=1e-6, rtol=0),
+                    msg=f"key mismatch cfg {i}",
+                )
+                self.assertTrue(
+                    torch.allclose(mv, rv, atol=1e-6, rtol=0),
+                    msg=f"value mismatch cfg {i}",
+                )
 
     def test_below_budget_is_noop(self):
         cfg = CONFIGS[3]  # seq_len < budget
@@ -213,7 +266,9 @@ class TestRKVAlgoParity(unittest.TestCase):
                 continue
             with self.subTest(config=i):
                 q, k, v = _make_inputs(cfg, seed=2000 + i)
-                mine = R1KV(budget=cfg["budget"], window_size=cfg["window_size"], **KWARGS)
+                mine = R1KV(
+                    budget=cfg["budget"], window_size=cfg["window_size"], **KWARGS
+                )
 
                 idx = mine.select_indices(k, q, sort=True)
                 self.assertEqual(
@@ -229,12 +284,15 @@ class TestRKVAlgoParity(unittest.TestCase):
                 # compressed keys from update_kv.
                 mk, _ = mine.update_kv(k.clone(), q.clone(), v.clone())
                 gathered = torch.gather(
-                    k, dim=2,
+                    k,
+                    dim=2,
                     index=idx.unsqueeze(-1).expand(-1, -1, -1, cfg["head_dim"]),
                 )
                 # sort both along seq dim by a stable key to compare sets
                 self.assertEqual(gathered.shape, mk.shape)
-                gs, _ = torch.sort(gathered.reshape(*gathered.shape[:2], -1).sum(-1), dim=-1)
+                gs, _ = torch.sort(
+                    gathered.reshape(*gathered.shape[:2], -1).sum(-1), dim=-1
+                )
                 ms, _ = torch.sort(mk.reshape(*mk.shape[:2], -1).sum(-1), dim=-1)
                 self.assertTrue(torch.allclose(gs, ms, atol=1e-4))
 
@@ -248,6 +306,28 @@ class TestRKVAlgoParity(unittest.TestCase):
             for h in range(cfg["kv_heads"]):
                 kept = set(idx[b, h].tolist())
                 self.assertTrue(window.issubset(kept))
+
+
+class TestFusedValidationMode(unittest.TestCase):
+    """R4: the --rkv-fused-validation policy latched on R1KV construction."""
+
+    def test_off_forces_reference(self):
+        algo = R1KV(budget=64, window_size=8, fused_validation="off")
+        # "off" latches the reference fallback immediately (never uses fused).
+        self.assertIs(algo._fused_redundancy, False)
+
+    def test_default_is_lazy(self):
+        algo = R1KV(budget=64, window_size=8)  # default "first-request"
+        self.assertIsNone(algo._fused_redundancy)
+
+    def test_warmup_is_noop_on_cpu(self):
+        # startup warmup must not crash and must no-op off CUDA (the tests are
+        # CPU-only); the decision stays lazy for the CPU reference path.
+        algo = R1KV(budget=64, window_size=8, fused_validation="startup")
+        algo.warmup_fused_kernel(
+            kv_heads=2, head_dim=16, device="cpu", dtype=torch.float32
+        )
+        self.assertIsNone(algo._fused_redundancy)
 
 
 if __name__ == "__main__":

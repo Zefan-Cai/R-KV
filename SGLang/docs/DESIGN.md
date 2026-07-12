@@ -5,6 +5,13 @@ the R-KV port. It captures the architecture research and design decisions that
 are **not** obvious from the code alone. Read this first before touching the
 integration layer.
 
+> **Scope: decode-time R-KV.** This doc covers the original *decoding-time* R-KV
+> (`--enable-rkv`). R-KV also has a **prefill-time** mode (`--enable-rkv-prefill`,
+> code in [`prefill.py`](../rkv/prefill.py) /
+> [`prefill_integration.py`](../rkv/prefill_integration.py));
+> its design, results and roadmap are in
+> [`FINDINGS_AND_ROADMAP.md`](./OPTIMIZATIONS.md).
+
 ## 1. Goal
 
 Port **R-KV** (Redundancy-aware KV Cache Compression for reasoning models,
@@ -17,15 +24,23 @@ tokens, giving large memory savings and throughput gains at near-full accuracy.
 `rkv/compression/r1_kv.py` (+ `rkv/utils.py`). We port that faithfully rather
 than reworking a previous (buggy, slow) integration.
 
-## 2. Branch layout (repo: wanke1997/sglang-compress)
+## 2. Where this port comes from
 
-| Branch | Purpose |
-| --- | --- |
-| `dev-v0.5.14` | Active development. Clean SGLang v0.5.14 baseline + this port. |
-| `release/sglang-v0.5.14` | Pristine v0.5.14 reference. **Do not modify.** |
-| `dev` / `main` | Old CustomKV/SnapKV implementation on SGLang v0.4.3 (buggy + slow). Kept only for reference. |
+This directory is a **patch-style distribution**: it does not vendor SGLang.
+Instead it ships the self-contained R-KV package ([`../rkv/`](../rkv)) plus a
+small wiring diff ([`../patch/rkv-sglang-0.5.14.patch`](../patch/rkv-sglang-0.5.14.patch)),
+and [`../scripts/apply_rkv.sh`](../scripts/apply_rkv.sh) reproducibly rebuilds a
+patched tree:
 
-`upstream` remote points to official `sgl-project/sglang` for future syncs.
+1. clone upstream SGLang at the **exact pinned commit**
+   `49e384ce9d304648e9959666ecb8ce8cd98d0deb` (release/v0.5.14) into `sglang-src/`;
+2. copy `rkv/*.py` into `sglang-src/python/sglang/srt/mem_cache/rkv/`;
+3. apply the 9-file wiring patch.
+
+The port was developed on a full SGLang fork sitting **directly** on that pinned
+commit with zero unrelated upstream drift, so the tree produced by `apply_rkv.sh`
+is byte-identical to the development tree (see
+[`./REPRODUCE.md`](./REPRODUCE.md) for the equivalence check).
 
 ## 3. The R-KV algorithm (what `algo.py` implements)
 
@@ -133,8 +148,9 @@ File paths are relative to the repo root.
    process, so `Req` length fields are updated in place; the batch `seq_lens`
    tensor is updated from `RKVCompressor.take_pending_length_updates()`.
 5. **O(budget²) similarity** — `cal_similarity` builds a `budget × budget`
-   matrix per layer per trigger. Fine for correctness; a target for phase-2
-   optimization (chunking / cheaper redundancy estimate).
+   matrix per layer per trigger. The per-layer scoring is now **batched across
+   layers** (one pass instead of `num_layers` GEMMs); the O(budget²) matrix
+   itself is still a phase-2 target (chunking / cheaper redundancy estimate).
 
 ## 8. `sparsity/` framework — evaluated, not reused (2026-07)
 
@@ -181,9 +197,9 @@ adaptor), the lifecycle hook names (`on_request_begin/end`,
 ## 9. Status & roadmap
 
 - **[DONE] Phase 1 · step 1** — pure algorithm layer (`algo.py`) + CPU parity
-  tests (`tests/test_rkv_algo.py`). Verified bit-for-bit against an
+  tests (`test/srt/mem_cache/test_rkv_algo.py`). Verified bit-for-bit against an
   inline reference (4 configs incl. GQA and below-budget). Run:
-  `python3 tests/test_rkv_algo.py` (no GPU, no PYTHONPATH needed —
+  `python3 test/srt/mem_cache/test_rkv_algo.py` (no GPU, no PYTHONPATH needed —
   the test loads `algo.py` by file path to bypass the heavy `sglang/__init__.py`).
 - **[DONE] Phase 1 · step 2** — integration layer (route A, §8), wired and
   **verified end-to-end** on Qwen2.5-0.5B (FlashInfer, `batch=1`, `page_size=1`,
@@ -199,7 +215,7 @@ adaptor), the lifecycle hook names (`on_request_begin/end`,
   `observe_decode_layer` in `forward_decode`; end-of-forward `maybe_compact` in
   model_runner; scheduler `_apply_rkv_pre_decode` (on_request_begin + apply the
   physical-length shrink). CPU unit tests:
-  `tests/test_rkv_integration.py`.
+  `test/srt/mem_cache/test_rkv_integration.py`.
 - **[DONE] Phase 1 · step 3** — multi-request batching (`batch >= 1`, method A:
   per-request triggering) + accuracy validation. `observe_decode_layer` loops
   over every request in the decode batch and each request arms / compacts
@@ -214,7 +230,12 @@ adaptor), the lifecycle hook names (`on_request_begin/end`,
   Plain data parallelism (`--dp-size N --tp-size 1`) is also validated — each
   rank runs its own R-KV; throughput scales up to 5.2× on 8× H100 (see
   benchmark/RESULTS_dp.md). TP and dp-attention remain unsupported/untested.
-- **[LATER] Phase 2** — performance: avoid redundant read-back, optimize the
-  O(budget²) similarity, CUDA-graph compatibility, reduce host/device syncs, and
-  **TP ≥ 2 support** (cross-rank all-reduce of per-token scores; see
-  IMPLEMENTATION.md §11.2). Then larger-sample accuracy on MATH-500 / AIME-24.
+- **[DONE] Phase 2 (partial)** — **decode CUDA-graph compatibility** (hybrid
+  eager/graph path) and **batched cross-layer scoring** (one pass instead of
+  `num_layers` GEMMs; +80% decode throughput at `buffer_size=16`, and 8× prefill
+  scoring on a 2174-token prompt) are shipped.
+- **[LATER] Phase 2 (remaining)** — performance: optimize the O(budget²)
+  redundancy matrix, reduce host/device syncs, let the forced-eager window steps
+  replay the graph, and **TP ≥ 2 support** (cross-rank all-reduce of per-token
+  scores; see IMPLEMENTATION.md §11.2). Then larger-sample accuracy on
+  MATH-500 / AIME-24.

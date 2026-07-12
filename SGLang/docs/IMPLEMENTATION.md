@@ -7,6 +7,12 @@ findings, rejected alternatives, the `sparsity/` framework evaluation), read
 the components, the per-step data flow, the exact wiring points, and the
 decisions baked into them.
 
+> **Scope: decode-time R-KV.** This file documents the *decoding-time* path
+> (`--enable-rkv`). The **prefill-time** mode (`--enable-rkv-prefill`) is a
+> separate integration
+> ([`prefill_integration.py`](../rkv/prefill_integration.py));
+> see [`FINDINGS_AND_ROADMAP.md`](./OPTIMIZATIONS.md).
+
 ## 1. Overview
 
 R-KV is a **decoding-time** KV-cache compressor. While a model generates a long
@@ -56,10 +62,12 @@ past tokens plus the trailing `window` observation tokens.
   the per-request states. Public surface:
   - `on_request_begin(req)` / `on_request_end(req)` — lifecycle.
   - `observe_decode_layer(q, k, v, layer, forward_batch)` — called per layer
-    during decode: caches the query, and (when a compaction is armed) computes
-    and accumulates this layer's per-token score.
+    during decode: caches the query into the observation window. (Scoring is
+    **not** done here; it is batched across all layers in `maybe_compact`.)
   - `maybe_compact(forward_batch)` — called after the full forward pass; for any
-    armed request, assembles the global kept set and physically compacts.
+    armed request, scores all layers in **one batched pass** (with an A/B gate
+    against the per-layer reference), assembles the global kept set, and
+    physically compacts.
   - `override_decode_positions(forward_batch)` — replaces decode positions with
     *logical* positions (see §5).
   - `take_pending_length_updates()` — hands the scheduler the new physical
@@ -80,12 +88,13 @@ FlashInferAttnBackend.init_forward_metadata(fb)   # fb = the REAL decode batch
 
 model.forward → per layer → RadixAttention → FlashInferAttnBackend.forward_decode
   └─ after set_kv_buffer:
-       observe_decode_layer(q, k, v, layer, fb)   # cache query; accumulate score
+       observe_decode_layer(q, k, v, layer, fb)   # cache query into window
                                                    # arm compaction every buffer_size
                                                    # steps once seq_len >= budget
 
 model_runner.forward (after all layers)
-  └─ maybe_compact(fb)                          # for armed reqs: compact
+  └─ maybe_compact(fb)                          # for armed reqs:
+        ├─ score all layers in ONE batched pass (A/B gate vs per-layer ref)
         ├─ assemble kept = top(budget-window) past + trailing window
         └─ _compact_request(...)                # see §6
 ```
@@ -135,15 +144,21 @@ request occupying physical slots `slots = req_to_token[idx, :seq_len]`:
 5. Shrink `req.kv_committed_len / kv_allocated_len = budget`; publish the new
    physical length via `pending_length_updates`.
 
-## 7. Wiring points (5 core files)
+## 7. Wiring points (9 core files)
+
+All changes are additive and applied by [`../patch/rkv-sglang-0.5.14.patch`](../patch/rkv-sglang-0.5.14.patch).
 
 | File | Change |
 | --- | --- |
-| `server_args.py` | `--enable-rkv`; per-field flags `--rkv-budget`, `--rkv-window-size`, `--rkv-kernel-size`, `--rkv-mix-lambda`, `--rkv-retain-ratio`, `--rkv-retain-direction`, `--rkv-buffer-size`, `--rkv-min-seq-len`; `--rkv-config '{...}'` JSON overrides the per-field flags |
-| `model_executor/model_runner.py` | Build `RKVCompressor` in `alloc_memory_pool` (after pools exist); call `maybe_compact` after the decode forward pass |
-| `layers/attention/flashinfer_backend.py` | Backend holds `rkv_compressor`; in `init_forward_metadata` bind it onto the real decode batch + `override_decode_positions`; call `observe_decode_layer` in `forward_decode` after `set_kv_buffer` |
-| `managers/scheduler.py` | Re-bind `rkv_compressor` in `init_memory_pools` (see §8); `_apply_rkv_pre_decode` before `prepare_for_decode` |
-| `managers/scheduler_components/batch_result_processor.py` | Call `on_request_end` at the two real-finished points (beside `hisparse.request_finished`, **not** at retract points) |
+| `server_args.py` | `--enable-rkv` + per-field flags (`--rkv-budget`, `--rkv-window-size`, `--rkv-kernel-size`, `--rkv-mix-lambda`, `--rkv-retain-ratio`, `--rkv-retain-direction`, `--rkv-buffer-size`, `--rkv-min-seq-len`), `--rkv-config` JSON override, `--rkv-max-active-requests`, `--rkv-fused-validation`; prefill mode `--enable-rkv-prefill` + `--rkv-prefill-config`. `_handle_rkv_validation` / `_handle_rkv_prefill_validation` reject unsafe combos at startup |
+| `model_executor/model_runner.py` | Build `RKVCompressor` (and the prefill compressor) in `alloc_memory_pool` after the pools exist; call `maybe_compact` after the decode forward pass |
+| `model_executor/model_runner_kv_cache_mixin.py` | Reserve the R-KV auxiliary GPU memory (the `rolling_q` observation-query buffer **and** the transient compaction workspace) inside KV-pool sizing so admission accounting is correct; apply the `--rkv-max-active-requests` cap on `max_running_requests` |
+| `model_executor/forward_batch_info.py` | Restore **logical** rotary positions (`override_decode_positions`) at `ForwardBatch` construction so both eager and captured-CUDA-graph decode read the correct positions |
+| `layers/attention/flashinfer_backend.py` | Backend holds `rkv_compressor` / `rkv_prefill_compressor`; bind onto the real decode batch in `init_forward_metadata`; call `observe_decode_layer` (decode) / `observe_prefill_layer` (prefill) after `set_kv_buffer` |
+| `managers/scheduler.py` | Re-bind the compressor in `init_memory_pools` (see §8); `_apply_rkv_pre_decode` before `prepare_for_decode`; `commit_compactions` after the decode forward (two-phase compaction, §6) |
+| `managers/scheduler_components/batch_result_processor.py` | Call `on_request_end` at the two real-finished points (beside `hisparse.request_finished`); commit any queued compaction frees before the finished-request release loop |
+| `managers/schedule_batch.py` | `on_request_retract` hooks so a retracted request drops its per-request compressor state while `req_pool_idx` is still valid (avoids stale bookkeeping / KV leak on the next prefill) |
+| `managers/schedule_policy.py` | **Compression-aware admission**: `PrefillAdder` reserves a request's *constant* compressed KV ceiling (`min(prompt, budget) + output`) instead of `prompt + output`, so many more requests are admitted concurrently |
 
 ## 8. Bugs fixed during bring-up
 
@@ -171,9 +186,10 @@ request occupying physical slots `slots = req_to_token[idx, :seq_len]`:
    subtract 1 (see §5).
 5. **No startup validation of R-KV-incompatible flags (owner review, 2026-07-02).**
    `--enable-rkv` silently corrupted the KV pool when combined with the radix
-   cache, a captured decode CUDA graph, overlap scheduling, `page_size > 1`, or
-   `tp > 1`. Fix: `ServerArgs._handle_rkv_validation` now rejects those combos at
-   startup with an explicit error.
+   cache, overlap scheduling, `page_size > 1`, or `tp > 1`. Fix:
+   `ServerArgs._handle_rkv_validation` now rejects those combos at startup with an
+   explicit error. (Decode CUDA graph was **later made compatible** via the
+   hybrid eager/graph path and is no longer rejected.)
 
 ## 9. Environment (dev-v0.5.14 needs a newer stack than v0.5.3-era wheels)
 
@@ -185,16 +201,18 @@ request occupying physical slots `slots = req_to_token[idx, :seq_len]`:
 
 ## 10. Running & validation
 
-Launch (phase-1 flags are required — R-KV runs only on the **eager decode**
-path, so decode CUDA graph must be off; `page_size=1` for clean slot free;
-overlap off for simple timing):
+Launch (required flags — radix cache off so R-KV can free slots, overlap off,
+`page_size=1` for clean slot free). **Decode CUDA graph is supported and left on**
+via the hybrid eager/graph path (the `window_size` steps ending at each
+compaction, plus the compaction step, run eager; every other decode step replays
+the captured graph). Pass `--disable-decode-cuda-graph` only if you want the
+fully-eager path:
 
 ```bash
-PYTHONPATH=sglang-src/python HF_HUB_DISABLE_XET=1 python3 -m sglang.launch_server \
+PYTHONPATH=$PWD/python HF_HUB_DISABLE_XET=1 python3 -m sglang.launch_server \
   --model-path /data/model/Qwen2.5-0.5B-Instruct \
   --attention-backend flashinfer \
-  --disable-decode-cuda-graph --disable-prefill-cuda-graph \
-  --disable-overlap-schedule --page-size 1 \
+  --disable-radix-cache --disable-overlap-schedule --page-size 1 \
   --enable-rkv --rkv-config '{"budget":64,"window_size":8,"buffer_size":16}' \
   --mem-fraction-static 0.6 --host 127.0.0.1 --port 30000
 ```
@@ -208,7 +226,7 @@ CPU unit tests (no GPU, no installed `sglang` needed — modules are loaded by
 path):
 
 ```bash
-python3 tests/test_rkv_integration.py
+python3 test/srt/mem_cache/test_rkv_integration.py
 ```
 
 9 cases: kept-set assembly, slot relocation, overlap safety, physical-length
@@ -304,18 +322,18 @@ hooks.
 | DP attention (`--enable-dp-attention`) | ❌ untested | implies tp>1 (blocked); padded forward_batch layout unverified |
 
 > **Enforced at startup:** `ServerArgs._handle_rkv_validation` rejects
-> `--enable-rkv` together with `--tp > 1` (and radix cache / decode CUDA graph /
-> overlap schedule / `page_size > 1`), so the silently-incorrect TP path cannot
+> `--enable-rkv` together with `--tp > 1` (and radix cache / overlap schedule /
+> `page_size > 1`), so the silently-incorrect TP path cannot
 > be launched by accident. Plain DP (`--dp-size N --tp-size 1`) is allowed and
 > validated (§11.3); implementing the §11.2 cross-rank all-reduce is what would
 > lift the TP block.
 
 ## 12. Other limitations / next
 
-- **O(budget²) similarity** in `cal_similarity` — a phase-2 perf target
-  (chunking / a cheaper redundancy estimate).
-- **No CUDA-graph decode** yet (dynamic eviction can't live in a captured
-  graph). Phase-2 would need a graph-compatible compaction scheme.
+- **O(budget²) similarity** in `cal_similarity` — the per-layer scoring GEMMs are
+  now **batched across layers** (one pass instead of `num_layers`); the per-token
+  O(budget²) redundancy matrix itself is still a phase-2 target (chunking / a
+  cheaper redundancy estimate).
 - **`on_request_end`** is wired at finish, but state is otherwise only cleared
   lazily on `req_pool_idx` reuse — fine for phase 1.
 - Larger-sample accuracy (MATH-500 / AIME-24) and a long-sequence throughput

@@ -17,6 +17,7 @@ R-KV supports grouped-query attention: ``q_heads`` may be a multiple of
 
 from __future__ import annotations
 
+import logging
 import math
 
 import torch
@@ -24,6 +25,30 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 __all__ = ["R1KV", "cal_similarity", "compute_attention_scores"]
+
+logger = logging.getLogger(__name__)
+
+# Lazily-loaded fused Triton redundancy kernel (CUDA-only). ``None`` = untried,
+# ``False`` = unavailable (no CUDA / no Triton), else the callable. Adopted per
+# R1KV instance via a one-time smoke check against the full-matrix reference.
+_FUSED_REDUNDANCY = None
+
+
+def _get_fused_redundancy():
+    global _FUSED_REDUNDANCY
+    if _FUSED_REDUNDANCY is None:
+        try:
+            if torch.cuda.is_available():
+                from sglang.srt.mem_cache.rkv.redundancy_fused import (
+                    cal_similarity_fused,
+                )
+
+                _FUSED_REDUNDANCY = cal_similarity_fused
+            else:
+                _FUSED_REDUNDANCY = False
+        except Exception:  # pragma: no cover - triton/build issue -> fallback
+            _FUSED_REDUNDANCY = False
+    return _FUSED_REDUNDANCY
 
 
 def compute_attention_scores(query_states, key_states, pooling="max"):
@@ -126,15 +151,48 @@ class R1KV:
         mix_lambda=0.07,
         retain_ratio=0.1,
         retain_direction="last",
+        fused_validation="first-request",
         **kwargs,
     ):
-        assert budget - window_size > 0, "budget must be greater than window_size"
+        if budget - window_size <= 0:
+            raise ValueError("R-KV budget must be greater than window_size")
         self.budget = budget
         self.window_size = window_size
         self.kernel_size = kernel_size
         self.mix_lambda = mix_lambda
         self.retain_ratio = retain_ratio
         self.retain_direction = retain_direction
+        # Fused redundancy backend: None=untried, False=reference fallback, else fn.
+        self._fused_redundancy = None
+        # Fused-kernel adoption policy: "off" (never use the fused kernel),
+        # "startup" (validate once with a synthetic tensor via
+        # warmup_fused_kernel, so the first real compaction pays no gate cost),
+        # or "first-request" (lazy — validate on the first real compaction).
+        self._fused_validation = fused_validation
+        if fused_validation == "off":
+            self._fused_redundancy = False
+
+    def warmup_fused_kernel(self, kv_heads, head_dim, device, dtype, seq_len=None):
+        """Startup validation of the fused redundancy kernel.
+
+        Runs the fused-vs-reference A/B gate once on a synthetic key tensor so
+        the first real compaction does not pay the gate cost, and a broken /
+        unavailable kernel is caught at startup instead of on a user's first
+        (possibly long) request. No-op unless ``fused_validation == "startup"``,
+        ``retain_direction == "last"``, and the device is CUDA; the adoption
+        decision it latches uses the real model's ``kv_heads`` / ``head_dim`` /
+        ``dtype``, which is what the kernel's correctness depends on.
+        """
+        if self._fused_validation != "startup":
+            return
+        dev = torch.device(device)
+        if self.retain_direction != "last" or dev.type != "cuda":
+            return
+        if self._fused_redundancy is not None:  # already decided (e.g. "off")
+            return
+        n = int(seq_len or max(self.budget, self.window_size + 1))
+        keys = torch.randn((1, kv_heads, n, head_dim), device=dev, dtype=dtype)
+        self._redundancy(keys)  # triggers the lazy gate, latches the decision
 
     def _scores(self, key_states, query_states):
         """Compute the per-past-token joint R-KV score.
@@ -161,16 +219,86 @@ class R1KV:
             stride=1,
         )
 
-        similarity_cos = cal_similarity(
-            key_states,
-            retain_ratio=self.retain_ratio,
-            retain_direction=self.retain_direction,
-        )[:, :, : -self.window_size]
+        similarity_cos = self._redundancy(key_states)[:, :, : -self.window_size]
 
         final_score = attn_cache * self.mix_lambda - similarity_cos * (
             1 - self.mix_lambda
         )
         return final_score
+
+    def _reference_redundancy(self, key_states):
+        # Reference redundancy for the fused-kernel smoke gate. On CUDA use the
+        # O(n)-memory tiled implementation: the full n x n matrix built by
+        # ``cal_similarity`` OOMs on long sequences (e.g. decode-mode compaction
+        # of a long prompt, where n = prompt length). ``cal_similarity_tiled`` is
+        # bit-parity with ``cal_similarity`` for ``retain_direction="last"``. On
+        # CPU (small test tensors, and no serving package on the import path) the
+        # full-matrix reference is fine.
+        if self.retain_direction == "last" and key_states.is_cuda:
+            from sglang.srt.mem_cache.rkv.prefill import cal_similarity_tiled
+
+            return cal_similarity_tiled(
+                key_states, threshold=0.5, retain_direction="last"
+            )
+        return cal_similarity(
+            key_states,
+            retain_ratio=self.retain_ratio,
+            retain_direction=self.retain_direction,
+        )
+
+    def _redundancy(self, key_states):
+        """Key-similarity redundancy per past token. On CUDA with
+        ``retain_direction='last'`` this uses the fused Triton kernel, adopted
+        once via a smoke gate against the full-matrix reference (a gross
+        mismatch -> permanent reference fallback, logged). On CPU, without
+        Triton, or for other retain directions it uses ``cal_similarity``.
+        """
+        if self.retain_direction != "last" or not key_states.is_cuda:
+            return self._reference_redundancy(key_states)
+        if self._fused_redundancy is False:
+            return self._reference_redundancy(key_states)
+        if self._fused_redundancy is not None:
+            # Guard the adopted kernel against SYNCHRONOUS failures (Triton
+            # compile / shape / launch errors, wrapper bugs): degrade to the
+            # reference permanently instead of crashing. Note the failure model:
+            # an ASYNCHRONOUS CUDA fault (illegal access / device-side assert)
+            # from the kernel does NOT surface here — it poisons the CUDA context
+            # and raises at a later sync point, which is (correctly) worker-fatal;
+            # we do not try to recover a poisoned context.
+            try:
+                return self._fused_redundancy(key_states, threshold=0.5)
+            except Exception as e:  # pragma: no cover - hardware/shape dependent
+                logger.warning(
+                    "R-KV decode fused-redundancy kernel failed at runtime (%s); "
+                    "falling back to the reference permanently.",
+                    e,
+                )
+                self._fused_redundancy = False
+                return self._reference_redundancy(key_states)
+        fn = _get_fused_redundancy()
+        if fn is False:
+            self._fused_redundancy = False
+            return self._reference_redundancy(key_states)
+        ref = self._reference_redundancy(key_states)
+        try:
+            got = fn(key_states, threshold=0.5)
+        except Exception as e:  # pragma: no cover - hardware/shape dependent
+            logger.warning(
+                "R-KV decode fused-redundancy kernel unavailable at runtime (%s); "
+                "using the reference permanently.",
+                e,
+            )
+            self._fused_redundancy = False
+            return ref
+        ok = ref.shape == got.shape and torch.allclose(
+            ref.float(), got.float(), atol=1e-3, rtol=1e-2
+        )
+        self._fused_redundancy = fn if ok else False
+        logger.info(
+            "R-KV decode fused-redundancy gate: %s",
+            "OK -> fused adopted" if ok else "DIVERGED -> reference fallback",
+        )
+        return got if ok else ref
 
     def select_indices(self, key_states, query_states, sort=True):
         """Return the token indices to keep, per (batch, kv head).
@@ -197,11 +325,15 @@ class R1KV:
         past_indices = final_score.topk(self.budget - self.window_size, dim=-1).indices
 
         bsz, kv_heads = past_indices.shape[0], past_indices.shape[1]
-        window_indices = torch.arange(
-            kv_cache_len - self.window_size,
-            kv_cache_len,
-            device=past_indices.device,
-        ).view(1, 1, -1).expand(bsz, kv_heads, -1)
+        window_indices = (
+            torch.arange(
+                kv_cache_len - self.window_size,
+                kv_cache_len,
+                device=past_indices.device,
+            )
+            .view(1, 1, -1)
+            .expand(bsz, kv_heads, -1)
+        )
 
         kept = torch.cat([past_indices, window_indices], dim=-1)
         if sort:

@@ -5,7 +5,7 @@
 # What it does (all pinned, no surprises):
 #   1. Clones upstream SGLang at the EXACT commit R-KV was ported against.
 #   2. Copies the standalone R-KV package (rkv/) into the SGLang source tree.
-#   3. Applies the small wiring patch (5 files) that hooks R-KV into the runtime.
+#   3. Applies the small wiring patch (9 files) that hooks R-KV into the runtime.
 #
 # After this, run the server with benchmark/launch_server.sh (it points
 # PYTHONPATH at the tree produced here).
@@ -52,7 +52,7 @@ mkdir -p "$DEST"
 cp "$HERE"/rkv/*.py "$DEST"/
 echo "         copied $(ls "$HERE"/rkv/*.py | wc -l | tr -d ' ') files -> $DEST"
 
-echo ">> [3/3] Applying R-KV wiring patch (5 files)"
+echo ">> [3/3] Applying R-KV wiring patch (9 files)"
 git -C "$SGLANG_SRC" apply --check "$PATCH"     # fail loudly if it won't apply cleanly
 git -C "$SGLANG_SRC" apply --whitespace=nowarn "$PATCH"
 echo "         patch applied cleanly"
