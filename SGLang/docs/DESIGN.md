@@ -229,13 +229,14 @@ adaptor), the lifecycle hook names (`on_request_begin/end`,
   at the two real-finished points; verified per-request state clears to 0.)
   Plain data parallelism (`--dp-size N --tp-size 1`) is also validated — each
   rank runs its own R-KV; throughput scales up to 5.2× on 8× H100 (see
-  benchmark/RESULTS_dp.md). TP and dp-attention remain unsupported/untested.
+  benchmark/RESULTS_dp.md). Tensor parallelism is supported too (cross-rank
+  score all-reduce, §11.2); only dp-attention remains untested.
 - **[DONE] Phase 2 (partial)** — **decode CUDA-graph compatibility** (hybrid
-  eager/graph path) and **batched cross-layer scoring** (one pass instead of
+  eager/graph path), **batched cross-layer scoring** (one pass instead of
   `num_layers` GEMMs; +80% decode throughput at `buffer_size=16`, and 8× prefill
-  scoring on a 2174-token prompt) are shipped.
+  scoring on a 2174-token prompt), and **tensor-parallel support** (cross-rank
+  all-reduce of per-token scores before top-k, so every rank evicts the identical
+  tokens; see IMPLEMENTATION.md §11.2) are shipped.
 - **[LATER] Phase 2 (remaining)** — performance: optimize the O(budget²)
-  redundancy matrix, reduce host/device syncs, let the forced-eager window steps
-  replay the graph, and **TP ≥ 2 support** (cross-rank all-reduce of per-token
-  scores; see IMPLEMENTATION.md §11.2). Then larger-sample accuracy on
-  MATH-500 / AIME-24.
+  redundancy matrix, reduce host/device syncs, and let the forced-eager window
+  steps replay the graph. Then larger-sample accuracy on MATH-500 / AIME-24.

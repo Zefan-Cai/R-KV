@@ -158,9 +158,11 @@ false-fired, no OOM, correct answers.
 - **Prefill CUDA graph must be OFF** for `--enable-rkv-prefill` (prompt-phase
   scoring/compaction are dynamic shapes); it gives ~0% benefit on long prompts
   anyway (compute-bound). Decode CUDA graph is supported for both modes.
-- **TP ≥ 2 is not supported** (silently incorrect without a cross-rank score
-  all-reduce; hard-blocked at startup). Plain DP (`--dp-size N --tp-size 1`) is
-  validated. See [`IMPLEMENTATION.md`](./IMPLEMENTATION.md) §11.
+- **TP ≥ 2 is supported** (the per-token eviction score is all-reduced across the
+  attention-TP group before top-k, so every rank evicts the identical tokens);
+  plain DP (`--dp-size N --tp-size 1`) is also validated. Only DP attention
+  (`--enable-dp-attention`) is unsupported. See
+  [`IMPLEMENTATION.md`](./IMPLEMENTATION.md) §11.
 - Use **`--ignore-eos`** for clean equal-work throughput A/B (compression changes
   output length, which otherwise confounds `gen_throughput`).
 

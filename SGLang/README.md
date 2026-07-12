@@ -83,10 +83,10 @@ support**, two-phase compaction, and full KV-pool memory accounting (see
 2. **Startup validation** (`server_args.py`, `_handle_rkv_validation`):
    `--enable-rkv` rejects configurations the port's memory safety depends on but
    previously did not enforce (radix cache on, overlap schedule on,
-   `page_size > 1`, `tp_size > 1`) instead of silently corrupting the KV pool;
-   plus `RKVConfig` guard checks (`buffer_size >= window_size`,
-   `min_seq_len >= budget`). (Decode CUDA graph was **later made compatible** and
-   is no longer rejected.)
+   `page_size > 1`) instead of silently corrupting the KV pool; plus `RKVConfig`
+   guard checks (`buffer_size >= window_size`, `min_seq_len >= budget`). (Decode
+   CUDA graph was **later made compatible** and is no longer rejected;
+   **tensor parallelism was later implemented** — see the support matrix.)
 
 ---
 
@@ -283,9 +283,9 @@ server configuration (all set for you by `launch_server.sh`):
 | --- | --- |
 | `batch = 1`, `tp = 1`, `dp = 1` | ✅ validated |
 | `batch > 1` (`tp = 1`, `dp = 1`) | ✅ validated (per-request triggering) |
-| Tensor parallel (`tp ≥ 2`) | ❌ **not supported — silently incorrect** without a cross-rank score all-reduce (see [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §11.2). Do not combine `--enable-rkv` with `--tp > 1`. |
+| Tensor parallel (`tp ≥ 2`) | ✅ supported — the per-token eviction score is all-reduced across the attention-TP group before top-k, so every rank evicts the identical tokens (see [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §11.2); validated on 8× H100 |
 | Data parallel — plain (`dp ≥ 2`, `tp = 1`) | ✅ validated — each replica runs its own R-KV over a disjoint request set; throughput scales up to 5.2× on 8× H100 (see [`benchmark/RESULTS_dp.md`](benchmark/RESULTS_dp.md)) |
-| DP attention (`--enable-dp-attention`) | ❌ untested — implies `tp > 1` (currently blocked at startup); padded `forward_batch` layout unverified |
+| DP attention (`--enable-dp-attention`) | ❌ unsupported — padded `forward_batch` layout unverified against the R-KV hooks |
 | CUDA-graph decode | ✅ supported (in-graph observation + hybrid eager compaction steps) |
 
 ---

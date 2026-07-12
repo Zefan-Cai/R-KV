@@ -161,11 +161,13 @@ JSON; `mode` is `oneshot` or `buffered`). It additionally requires
 ### Required flags
 
 Decode R-KV (`--enable-rkv`): `--disable-radix-cache --disable-overlap-schedule
---page-size 1`, `tp == 1`. **Decode CUDA graph is supported** (enabled by default;
+--page-size 1`. **Decode CUDA graph is supported** (enabled by default;
 pass `--disable-decode-cuda-graph` only for a fully-eager, bit-reproducible run).
-Prefill R-KV (`--enable-rkv-prefill`) additionally needs
-`--disable-prefill-cuda-graph` and cannot combine with `--enable-rkv`. These are
-enforced at startup by `_handle_rkv_validation` / `_handle_rkv_prefill_validation`.
+**Tensor parallel (`--tp-size N`) and plain data parallel (`--dp-size N`) are
+supported**; only DP attention (`--enable-dp-attention`) is not. Prefill R-KV
+(`--enable-rkv-prefill`) additionally needs `--disable-prefill-cuda-graph` and
+cannot combine with `--enable-rkv`. Unsupported runtimes (non-FlashInfer backend,
+MLA, hybrid-SWA, speculative decoding) are rejected at startup.
 
 ---
 
