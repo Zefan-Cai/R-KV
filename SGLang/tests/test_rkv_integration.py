@@ -1110,6 +1110,28 @@ class TestRuntimeSupportGate(unittest.TestCase):
         self.assertIsNone(self._reason(page_size=1))
         self.assertIsNone(self._reason(page_size=None))
 
+    def test_fp8_e4m3_kv_cache_rejected(self):
+        reason = self._reason(kv_cache_dtype=torch.float8_e4m3fn)
+        self.assertIsNotNone(reason)
+        self.assertIn("fp8_e4m3", reason)
+
+    def test_fp8_e5m2_kv_cache_rejected(self):
+        self.assertIsNotNone(self._reason(kv_cache_dtype=torch.float8_e5m2))
+
+    def test_fp4_e2m1_kv_cache_rejected(self):
+        # torch.float4_e2m1fn_x2 exists only on newer torch builds.
+        fp4 = getattr(torch, "float4_e2m1fn_x2", None)
+        if fp4 is None:
+            self.skipTest("torch build has no float4_e2m1fn_x2")
+        self.assertIsNotNone(self._reason(kv_cache_dtype=fp4))
+
+    def test_unquantized_kv_cache_dtypes_supported(self):
+        for dt in (torch.float16, torch.bfloat16, torch.float32):
+            self.assertIsNone(self._reason(kv_cache_dtype=dt), msg=str(dt))
+
+    def test_kv_cache_dtype_none_skips_check(self):
+        self.assertIsNone(self._reason(kv_cache_dtype=None))
+
 
 class TestServingConfigValidation(unittest.TestCase):
     """Issue 3: config-level guards + serving restricted to the bounded path."""

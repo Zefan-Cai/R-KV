@@ -69,6 +69,18 @@ RKV_SCORE_CHUNK_BYTES: int = 512 << 20
 # every layer's KV buffer with full ``req_to_token`` slots.
 _RKV_SUPPORTED_ATTENTION_BACKENDS = ("flashinfer",)
 
+# KV-cache dtypes R-KV scoring can consume directly. The compressor reads the
+# raw K/V buffer (``token_to_kv_pool.get_key_buffer``) and feeds it straight into
+# RMSNorm / ``q @ k^T`` importance+redundancy scoring with NO dequantization
+# path, so a quantized KV cache (fp8/fp4) would be scored in the wrong numeric
+# representation. Restrict to unquantized float KV until scoring learns to apply
+# the per-layer ``k_scale``/``v_scale`` dequant.
+_RKV_SUPPORTED_KV_CACHE_DTYPES = (
+    torch.float16,
+    torch.bfloat16,
+    torch.float32,
+)
+
 
 def rkv_runtime_support_error(
     *,
@@ -79,6 +91,7 @@ def rkv_runtime_support_error(
     is_hybrid_swa: bool,
     spec_enabled: bool,
     page_size: Optional[int],
+    kv_cache_dtype: Optional[torch.dtype] = None,
 ) -> Optional[str]:
     """Return a reason the *resolved* runtime cannot support R-KV, else ``None``.
 
@@ -97,8 +110,13 @@ def rkv_runtime_support_error(
     * speculative decoding (e.g. TARGET_VERIFY) drives extra forwards the hooks
       do not account for;
     * page_size must be 1 for per-slot free.
+    * quantized KV-cache dtypes (fp8_e4m3 / fp8_e5m2 / fp4_e2m1) cannot be
+      scored: the compressor reads the raw K/V buffer and feeds it into RMSNorm
+      / ``q @ k^T`` with no ``k_scale``/``v_scale`` dequantization path.
 
     ``mode`` is ``"decode"`` or ``"prefill"`` (used only in the message).
+    ``kv_cache_dtype`` is the *resolved* KV-cache ``torch.dtype`` (from
+    ``ModelRunner.configure_kv_cache_dtype``); ``None`` skips the dtype check.
     """
     if (
         prefill_backend not in _RKV_SUPPORTED_ATTENTION_BACKENDS
@@ -131,6 +149,18 @@ def rkv_runtime_support_error(
         )
     if page_size not in (None, 1):
         return f"R-KV ({mode}) requires page_size == 1 (per-slot free)."
+    if (
+        kv_cache_dtype is not None
+        and kv_cache_dtype not in _RKV_SUPPORTED_KV_CACHE_DTYPES
+    ):
+        return (
+            f"R-KV ({mode}) does not support a quantized KV cache dtype "
+            f"({kv_cache_dtype}): the compressor reads the raw K/V buffer and "
+            "scores it with RMSNorm / q @ k^T with no dequantization path, so "
+            "fp8_e4m3 / fp8_e5m2 / fp4_e2m1 would be ranked in the wrong "
+            "representation. Use an unquantized KV cache (fp16/bf16/fp32) until "
+            "R-KV scoring learns to dequantize (k_scale/v_scale)."
+        )
     return None
 
 

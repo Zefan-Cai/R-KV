@@ -681,7 +681,7 @@ index 1cff5c983..071dd303b 100644
          self._linear_attn_registry_cache: Any = _UNSET
  
          # Load model weights and configure
-@@ -846,6 +854,99 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+@@ -846,6 +854,101 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                  host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
              )
  
@@ -706,6 +706,7 @@ index 1cff5c983..071dd303b 100644
 +                is_hybrid_swa=self.is_hybrid_swa,
 +                spec_enabled=not self.spec_algorithm.is_none(),
 +                page_size=sa.page_size,
++                kv_cache_dtype=self.kv_cache_dtype,
 +            )
 +            if _rkv_reason is not None:
 +                raise ValueError(_rkv_reason)
@@ -757,6 +758,7 @@ index 1cff5c983..071dd303b 100644
 +                is_hybrid_swa=self.is_hybrid_swa,
 +                spec_enabled=not self.spec_algorithm.is_none(),
 +                page_size=sa.page_size,
++                kv_cache_dtype=self.kv_cache_dtype,
 +            )
 +            if _rkv_reason is not None:
 +                raise ValueError(_rkv_reason)
@@ -781,7 +783,7 @@ index 1cff5c983..071dd303b 100644
          self.init_routed_experts_capturer()
          self.init_indexer_capturer()
  
-@@ -3001,10 +3102,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+@@ -3001,10 +3104,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                  if self.device == "cpu"
                  else forward_batch.forward_mode.is_cuda_graph
              )
@@ -804,7 +806,7 @@ index 1cff5c983..071dd303b 100644
              )
  
              if (
-@@ -3072,6 +3185,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+@@ -3072,6 +3187,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
              ):
                  forward_batch.post_forward_mlp_sync_batch(ret)
  
