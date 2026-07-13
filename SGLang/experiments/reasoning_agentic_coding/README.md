@@ -7,8 +7,10 @@ This campaign compares the latest R-KV SGLang port at repository commit
 
 The checkpoint is the strongest official open-weight model we found that fits
 the implementation's actual gate: standard full-attention GQA, no MLA, no
-hybrid sliding/linear attention, and single-node TP8. FP8 applies to weights;
-the KV cache remains BF16/FP16 (`--kv-cache-dtype auto`).
+hybrid sliding/linear attention, and single-node TP8. The launch also uses EP8
+so the checkpoint's 128-wide FP8 expert blocks are not split across tensor
+parallel ranks. FP8 applies to weights; the KV cache remains BF16/FP16
+(`--kv-cache-dtype auto`).
 
 ## Paired lanes
 
@@ -40,7 +42,8 @@ The Pluto entrypoints provision one H200 P1 node and one H200 P2 node. Each
 stages the checkpoint on local NVMe after a 600 GiB free-space preflight; only
 small, resumable results live under
 `/sensei-fs/users/zcai/rkv-sglang-eval-20260713`. They run the CPU and H200
-fused-kernel parity suites, then execute a crossover so node/project effects do
+fused-kernel parity suites, installing SGLang's pinned Rust/protoc build
+prerequisites first, then execute a crossover so node/project effects do
 not masquerade as R-KV effects:
 
 - P1 order: `d-full`, `d-4k`, `p-full`, `p-4k`

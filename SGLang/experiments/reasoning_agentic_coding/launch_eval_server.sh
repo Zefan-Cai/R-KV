@@ -23,6 +23,7 @@ SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8}
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-30000}"
 TP="${TP:-8}"
+EP_SIZE="${EP_SIZE:-$TP}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-32768}"
 MEM_FRAC="${MEM_FRAC:-0.90}"
 MAX_ACTIVE_REQUESTS="${MAX_ACTIVE_REQUESTS:-16}"
@@ -37,6 +38,7 @@ COMMON=(
   --trust-remote-code
   --attention-backend flashinfer
   --tp-size "$TP"
+  --ep-size "$EP_SIZE"
   --kv-cache-dtype auto
   --context-length "$CONTEXT_LENGTH"
   --mem-fraction-static "$MEM_FRAC"
@@ -116,5 +118,5 @@ case "$ARM" in
     ;;
 esac
 
-echo "arm=$ARM model=$MODEL revision=$MODEL_REVISION tp=$TP context=$CONTEXT_LENGTH kv_cache=auto"
+echo "arm=$ARM model=$MODEL revision=$MODEL_REVISION tp=$TP ep=$EP_SIZE context=$CONTEXT_LENGTH kv_cache=auto"
 exec python3 -m sglang.launch_server "${COMMON[@]}" "${MODE_ARGS[@]}" "$@"

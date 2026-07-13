@@ -43,6 +43,16 @@ python -m pip install --upgrade pip
 
 cd "$REPO_ROOT/SGLang"
 bash scripts/apply_rkv.sh --force
+
+# Editable SGLang builds its bundled gRPC extension from Rust. Use upstream's
+# idempotent installer so both its pinned toolchain and protoc are available.
+bash sglang-src/scripts/ci/utils/install_rust_protoc.sh
+export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
+rustc --version
+cargo --version
+protoc --version
+command -v cc
+
 python -m pip install -e sglang-src/python --extra-index-url https://docs.sglang.ai/whl/cu129/
 python -m pip install -r requirements-rkv.txt --extra-index-url https://docs.sglang.ai/whl/cu129/
 python -m pip install "huggingface_hub[cli]" "evalplus==0.3.1"
