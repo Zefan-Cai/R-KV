@@ -21,7 +21,12 @@ MODEL_ROOT="${MODEL_ROOT:-/mnt/localssd/rkv-models}"
 MODEL_DIR="$MODEL_ROOT/Qwen3-Coder-480B-A35B-Instruct-FP8-$MODEL_REVISION"
 VENV="/mnt/localssd/rkv-sglang-venv"
 SGLANG_INSTALL_MODE="${SGLANG_INSTALL_MODE:-wheel}"
-mkdir -p "$RESULT_ROOT" "$MODEL_ROOT"
+export HF_HOME="${HF_HOME:-/mnt/localssd/.cache/huggingface}"
+mkdir -p "$RESULT_ROOT" "$MODEL_ROOT" "$HF_HOME"
+default_hf_token="$HOME/.cache/huggingface/token"
+if [[ "$HF_HOME/token" != "$default_hf_token" && -s "$default_hf_token" && ! -s "$HF_HOME/token" ]]; then
+  install -m 600 "$default_hf_token" "$HF_HOME/token"
+fi
 exec > >(tee -a "$RESULT_ROOT/node.log") 2>&1
 
 echo "role=$ROLE arms=${ARMS[*]} host=$(hostname) started_utc=$(date -u +%FT%TZ)"
@@ -128,7 +133,6 @@ export TP=8
 export CONTEXT_LENGTH="${CONTEXT_LENGTH:-65536}"
 export MEM_FRAC="${MEM_FRAC:-0.90}"
 export MAX_ACTIVE_REQUESTS="${MAX_ACTIVE_REQUESTS:-16}"
-export HF_HOME="${HF_HOME:-/mnt/localssd/hf-home}"
 
 cat >"$RESULT_ROOT/provenance.txt" <<EOF
 rkv_commit=$(git -C "$REPO_ROOT" rev-parse HEAD)
