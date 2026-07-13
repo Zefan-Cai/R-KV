@@ -1,7 +1,7 @@
 # Independent validation — Qwen2.5-Math-7B-Instruct, n=100, 1×A100-80G
 
 Independent rerun of the H100 n=20 benchmark
-([`RESULTS_math7b.md`](./RESULTS_math7b.md)) with a 5× larger sample, on a
+([`RESULTS.md`](./RESULTS.md)) with a 5× larger sample, on a
 different GPU, from a clean environment — run 2026-07-01 as part of verifying
 this port against the repo's reference implementation before publishing.
 
@@ -11,7 +11,7 @@ this port against the repo's reference implementation before publishing.
   `9ed5f084`, batch>=1 per-request triggering). "fixed" rows additionally
   carry the two correctness fixes now shipped here (rotary position
   off-by-one in `rkv/integration.py` + `--enable-rkv` startup validation in
-  the wiring patch — see the README's *Independent verification* section).
+  the wiring patch).
 - **GPU**: 1× NVIDIA A100-SXM4-80GB (`tp=1`), driver CUDA 13.0.
 - **Env**: PyPI `sglang==0.5.14` dependency stack (torch 2.11.0+cu130,
   flashinfer 0.6.12, sglang-kernel 0.4.4, transformers 5.8.1), port source via
@@ -43,9 +43,8 @@ this port against the repo's reference implementation before publishing.
    leak-checker aborts at idle.
 2. **The H100 n=20 numbers reproduce in trend, not in letter.** The original
    pre-fix n=20 run showed an optimistic "100% vs 95%" (serial) that was
-   small-sample luck; the post-fix n=20 re-run is a flat 95% (see
-   [`RESULTS_math7b.md`](./RESULTS_math7b.md)), and at n=100 here the honest
-   statement is *parity within noise* (90 vs 91).
+   small-sample luck; the post-fix n=20 re-run was a flat 95%, and at n=100
+   here the honest statement is *parity within noise* (90 vs 91).
 3. **The rotary off-by-one fix does not change GSM8K accuracy** (89 → 90 is
    one item, well within noise) — consistent with a uniform +1 position shift
    of all decode tokens being nearly invisible to relative-position attention.
@@ -57,5 +56,7 @@ this port against the repo's reference implementation before publishing.
    (90/100) and 4.1× end-to-end throughput (181.8 vs 44.2 tok/s serial).
 5. **Compression overhead on the eager path is ~10% at these lengths**
    (49.2 → 44.2 tok/s serial; shorter generations than the H100 run, where it
-   was ~25%). The O(budget²) similarity + full KV read-back per trigger remain
-   the phase-2 optimization targets.
+   was ~25%). The O(budget²) similarity + full KV read-back per trigger were the
+   phase-2 optimization targets, since addressed by the fused Triton redundancy
+   kernel and batched cross-layer scoring (see
+   [`../docs/OPTIMIZATIONS.md`](../docs/OPTIMIZATIONS.md)).
