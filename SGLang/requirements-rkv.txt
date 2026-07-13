@@ -2,16 +2,17 @@
 #
 # These are the EXACT versions R-KV was developed and validated against on an
 # NVIDIA H100 (CUDA 12.9, Python 3.12). Install with the SGLang cu129 wheel
-# index so the torch C10 ABI matches the prebuilt kernels:
+# index so the torch C10 ABI matches the prebuilt kernels. The current index
+# publishes the PyTorch trio without a local ``+cu129`` version suffix:
 #
 #   pip install -r requirements-rkv.txt --extra-index-url https://docs.sglang.ai/whl/cu129/
 #
 # For a different CUDA version, use the matching SGLang wheel index and the
 # torch/flashinfer/kernel builds pinned to that CUDA (versions must agree).
 
-torch==2.11.0+cu129
-torchvision==0.26.0+cu129
-torchaudio==2.11.0+cu129
+torch==2.11.0
+torchvision==0.26.0
+torchaudio==2.11.0
 sglang-kernel==0.4.4+cu129
 flashinfer-python==0.6.12
 flashinfer-cubin==0.6.12
