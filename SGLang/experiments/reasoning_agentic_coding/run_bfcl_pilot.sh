@@ -57,4 +57,8 @@ export REMOTE_OPENAI_TOKENIZER_PATH="$MODEL_DIR"
   --test-category multi_turn_long_context,memory_kv,memory_vector,memory_rec_sum \
   --partial-eval
 
+"$BFCL_VENV/bin/python" "$HERE/validate_bfcl_pilot.py" \
+  "$OUT_DIR" \
+  --output "$OUT_DIR/validation.json"
+
 touch "$OUT_DIR/BFCL_PILOT_COMPLETE"

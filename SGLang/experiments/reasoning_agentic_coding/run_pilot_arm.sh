@@ -89,5 +89,8 @@ case "$ARM" in
 esac
 
 sleep 5
-python "$HERE/summarize_server_log.py" "$SERVER_LOG" --output "$OUT_DIR/server_summary.json"
+python "$HERE/summarize_server_log.py" \
+  "$SERVER_LOG" \
+  --output "$OUT_DIR/server_summary.json" \
+  --require-arm "$ARM"
 touch "$OUT_DIR/PILOT_COMPLETE"
