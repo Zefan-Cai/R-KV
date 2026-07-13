@@ -222,15 +222,17 @@ adaptor), the lifecycle hook names (`on_request_begin/end`,
   **independently** (state keyed by `req_pool_idx`; `maybe_compact` resolves each
   armed request's own `seq_len`). Validated end-to-end on
   Qwen2.5-Math-7B-Instruct (FlashInfer, `budget=512`, 8 concurrent requests,
-  decode `#running-req` up to 8): **19/20 = 95% accuracy** (== eager baseline),
-  **~235 physical compactions** (2026-07-02 re-run, post rotary-fix), no crashes.
+  decode `#running-req` up to 8): accuracy is **lossless at budget=512** on GSM8K
+  and dozens–hundreds of physical compactions run with no crashes (see
+  [`../benchmark/RESULTS.md`](../benchmark/RESULTS.md)).
   (`on_request_end` cleanup is
   **DONE**: wired in `batch_result_processor` beside `hisparse.request_finished`
   at the two real-finished points; verified per-request state clears to 0.)
   Plain data parallelism (`--dp-size N --tp-size 1`) is also validated — each
-  rank runs its own R-KV; throughput scales up to 5.2× on 8× H100 (see
+  rank runs its own R-KV; throughput scales up to 5.1× on 8× H100 (see
   benchmark/RESULTS_dp.md). Tensor parallelism is supported too (cross-rank
-  score all-reduce, §11.2); only dp-attention remains untested.
+  score all-reduce, §11.2; see benchmark/RESULTS_tp.md); only dp-attention
+  remains untested.
 - **[DONE] Phase 2 (partial)** — **decode CUDA-graph compatibility** (hybrid
   eager/graph path), **batched cross-layer scoring** (one pass instead of
   `num_layers` GEMMs; +80% decode throughput at `buffer_size=16`, and 8× prefill

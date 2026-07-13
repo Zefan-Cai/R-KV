@@ -15,24 +15,29 @@ This directory ports R-KV onto a **pinned** SGLang v0.5.14 baseline.
   positions consistent after the sequence physically shrinks. Runs on the
   FlashInfer decode path.
 
-## Headline result — Qwen2.5-Math-7B-Instruct (single NVIDIA H100)
+## Headline result — Qwen2.5-Math-7B-Instruct (NVIDIA H100)
 
-GSM8K-style math harness, first 20 items, **8 concurrent requests** (server-side
-`batch` up to 8):
+SGLang's own GSM8K harness (`bench_sglang.py`, 5-shot, first 200 questions,
+`--parallel 32`), comparing R-KV to a **Full-KV baseline under the same required
+flags** (radix/overlap off, `page_size 1`) so the delta is purely compression:
 
-| Config | Accuracy | KV compactions |
-| --- | --- | --- |
-| baseline (R-KV off) | 95% | — |
-| **R-KV, budget=512** | **95% (19/20)** | **~235** |
+| Config | Accuracy | Throughput | KV compactions |
+| --- | --- | --- | --- |
+| Full-KV (same flags, no compression) | 0.910 | 1792 tok/s | — |
+| **R-KV, budget=256, buffer=128** | **0.900** | **1679 tok/s** | **64** |
+| **R-KV, budget=512, buffer=64** | **0.910** | 1549 tok/s | 245 |
 
-R-KV kept full accuracy while running **~235 physical KV compactions with zero
-crashes**, each shrinking a request from ~700+ tokens back to the 512-token
-budget. See [`benchmark/RESULTS_math7b.md`](benchmark/RESULTS_math7b.md).
+R-KV holds accuracy **lossless at budget=512** while running dozens–hundreds of
+physical KV compactions, at **within ~3–14 % of the fair Full-KV throughput**. See
+[`benchmark/RESULTS.md`](benchmark/RESULTS.md) for the full `budget × buffer_size`
+sweep and the production-vs-constrained baseline discussion.
 
-**Data parallel** (`DP=N ./benchmark/launch_server.sh rkv 512`, plain DP with
-`tp=1`) is validated: each replica runs its own R-KV over a disjoint request set,
-and throughput scales up to **5.2× on 8× H100** with unchanged accuracy — see
-[`benchmark/RESULTS_dp.md`](benchmark/RESULTS_dp.md).
+**Data parallel** (`DP=N ./benchmark/launch_server.sh rkv 256`, plain DP with
+`tp=1`) scales throughput up to **5.1× on 8× H100** with unchanged accuracy
+([`benchmark/RESULTS_dp.md`](benchmark/RESULTS_dp.md)). **Tensor parallel** is
+supported too — the per-token eviction score is all-reduced across the attention-TP
+group so every rank evicts identical tokens — scaling to **1.56× at tp=4**
+([`benchmark/RESULTS_tp.md`](benchmark/RESULTS_tp.md)).
 
 ---
 
@@ -284,7 +289,7 @@ server configuration (all set for you by `launch_server.sh`):
 | `batch = 1`, `tp = 1`, `dp = 1` | ✅ validated |
 | `batch > 1` (`tp = 1`, `dp = 1`) | ✅ validated (per-request triggering) |
 | Tensor parallel (`tp ≥ 2`) | ✅ supported — the per-token eviction score is all-reduced across the attention-TP group before top-k, so every rank evicts the identical tokens (see [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §11.2); validated on 8× H100 |
-| Data parallel — plain (`dp ≥ 2`, `tp = 1`) | ✅ validated — each replica runs its own R-KV over a disjoint request set; throughput scales up to 5.2× on 8× H100 (see [`benchmark/RESULTS_dp.md`](benchmark/RESULTS_dp.md)) |
+| Data parallel — plain (`dp ≥ 2`, `tp = 1`) | ✅ validated — each replica runs its own R-KV over a disjoint request set; throughput scales up to 5.1× on 8× H100 (see [`benchmark/RESULTS_dp.md`](benchmark/RESULTS_dp.md)) |
 | DP attention (`--enable-dp-attention`) | ❌ unsupported — padded `forward_batch` layout unverified against the R-KV hooks |
 | CUDA-graph decode | ✅ supported (in-graph observation + hybrid eager compaction steps) |
 
@@ -299,8 +304,10 @@ server configuration (all set for you by `launch_server.sh`):
 - [`docs/OPTIMIZATIONS.md`](docs/OPTIMIZATIONS.md) — performance optimizations and
   production-hardening (CUDA graph, fused kernel, two-phase compaction, admission).
 - [`docs/REPRODUCE.md`](docs/REPRODUCE.md) — exact, validated reproduction & usage.
-- [`benchmark/RESULTS.md`](benchmark/RESULTS.md) — Qwen2.5-0.5B sanity numbers.
-- [`benchmark/RESULTS_math7b.md`](benchmark/RESULTS_math7b.md) — Math-7B results.
+- [`benchmark/RESULTS.md`](benchmark/RESULTS.md) — Math-7B GSM8K `budget × buffer_size` sweep (two baselines).
+- [`benchmark/RESULTS_dp.md`](benchmark/RESULTS_dp.md) — data-parallel scaling (up to 5.1× on 8× H100).
+- [`benchmark/RESULTS_tp.md`](benchmark/RESULTS_tp.md) — tensor-parallel scaling & cross-rank correctness.
+- [`benchmark/RESULTS_a100_n100.md`](benchmark/RESULTS_a100_n100.md) — independent A100 n=100 rerun.
 
 ## Manual apply (without the script)
 
