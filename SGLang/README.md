@@ -63,8 +63,12 @@ implementation before being published here:
   4.1× throughput. Details:
   [`benchmark/RESULTS_a100_n100.md`](benchmark/RESULTS_a100_n100.md).
 
-Two correctness fixes found during verification are included here on top of
-the ported source (`wanke1997/sglang-compress` @ `9ed5f084`):
+This distribution tracks the hardened R-KV source (upstream fork
+`wanke1997/sglang-compress`); two correctness fixes found during the original
+verification (below) are now baked into the source, along with substantial later
+work — prefill-phase R-KV, a fused Triton redundancy kernel, **decode CUDA-graph
+support**, two-phase compaction, and full KV-pool memory accounting (see
+[`docs/OPTIMIZATIONS.md`](docs/OPTIMIZATIONS.md)).
 
 1. **Rotary position off-by-one** (`rkv/integration.py`,
    `override_decode_positions`): the override used
@@ -76,24 +80,24 @@ the ported source (`wanke1997/sglang-compress` @ `9ed5f084`):
    decode step — a uniform shift that measurably did not hurt GSM8K accuracy
    (89 vs 90 at n=100), but made `--enable-rkv` non-equivalent to baseline
    even before any compression fires.
-2. **Startup validation** (in the wiring patch, `server_args.py`,
-   `_handle_rkv_validation`): `--enable-rkv` now rejects configurations the
-   port's memory safety depends on but previously did not enforce (radix
-   cache on, decode CUDA graph on, overlap schedule on, `page_size > 1`,
-   `tp_size > 1`) instead of silently corrupting the KV pool; plus
-   `RKVConfig` guard asserts (`buffer_size >= window_size`,
-   `min_seq_len >= budget`) and docstring corrections.
+2. **Startup validation** (`server_args.py`, `_handle_rkv_validation`):
+   `--enable-rkv` rejects configurations the port's memory safety depends on but
+   previously did not enforce (radix cache on, overlap schedule on,
+   `page_size > 1`) instead of silently corrupting the KV pool; plus `RKVConfig`
+   guard checks (`buffer_size >= window_size`, `min_seq_len >= budget`). (Decode
+   CUDA graph was **later made compatible** and is no longer rejected;
+   **tensor parallelism was later implemented** — see the support matrix.)
 
 ---
 
 ## Why a patch, not a fork?
 
-R-KV touches SGLang in a **tiny, purely additive** way: one self-contained
-package (`rkv/`) plus ~137 lines of wiring across **5** existing files. Instead
+R-KV touches SGLang in a **small, purely additive** way: one self-contained
+package (`rkv/`) plus ~780 lines of wiring across **9** existing files. Instead
 of vendoring the entire (~6700-file) SGLang tree, this directory ships:
 
 - `rkv/` — the R-KV code (browsable, the source of truth);
-- `patch/` — the 5-file wiring diff;
+- `patch/` — the 9-file wiring diff;
 - `scripts/apply_rkv.sh` — clones the **exact pinned** SGLang commit, drops in
   `rkv/`, and applies the patch.
 
@@ -104,12 +108,12 @@ upstream commit.
 SGLang/
 ├── README.md                      # you are here
 ├── requirements-rkv.txt           # pinned, verified dependency stack
-├── rkv/                           # R-KV package (algo.py, integration.py)
-├── patch/rkv-sglang-0.5.14.patch  # wiring diff (5 upstream files)
+├── rkv/                           # R-KV package (algo, integration, prefill, redundancy_fused)
+├── patch/rkv-sglang-0.5.14.patch  # wiring diff (9 upstream files)
 ├── scripts/apply_rkv.sh           # clone pinned SGLang + drop in rkv/ + apply patch
 ├── benchmark/                     # eval.py, launch_server.sh, prepare_data.sh, data/, RESULTS*.md
-├── docs/                          # DESIGN.md, IMPLEMENTATION.md (deep-dive)
-└── tests/                         # GPU-free CPU unit tests
+├── docs/                          # DESIGN, IMPLEMENTATION, OPTIMIZATIONS, REPRODUCE
+└── tests/                         # GPU-free CPU unit tests (+ fused-kernel GPU test)
 ```
 
 ---
@@ -171,12 +175,16 @@ pip install -r requirements-rkv.txt \
 
 ### Step 3 — Smoke test (no GPU needed)
 
-The algorithm and integration logic have GPU-free CPU unit tests:
+The algorithm and integration logic have GPU-free CPU unit tests (the fused-kernel
+test needs a GPU + Triton and self-skips otherwise):
 
 ```bash
-python3 tests/test_rkv_algo.py           # 4 tests — algorithm parity vs reference
-python3 tests/test_rkv_integration.py    # 9 tests — compaction, lifecycle, batch>=2
-python3 tests/test_cross_repo_parity.py  # bit-level parity vs this repo's rkv/ reference
+python3 tests/test_rkv_algo.py                 #  7 tests — algorithm parity vs reference
+python3 tests/test_rkv_integration.py          # 24 tests — compaction, lifecycle, memory, batch>=2
+python3 tests/test_rkv_prefill.py              #  9 tests — prefill algorithm (oneshot/buffered)
+python3 tests/test_rkv_prefill_integration.py  # 11 tests — prefill compaction & admission
+python3 tests/test_rkv_redundancy_fused.py     # 11 tests — fused Triton redundancy kernel (GPU)
+python3 tests/test_cross_repo_parity.py        # bit-level parity vs this repo's rkv/ reference
 ```
 
 All should print `OK` / `ALL PARITY CHECKS PASSED`.
@@ -233,13 +241,19 @@ mirror the R-KV reference); a `--rkv-config` JSON string **overrides** the flags
 | `--rkv-buffer-size` | `128` | compress every N newly generated tokens per request |
 | `--rkv-min-seq-len` | `budget` | min KV length before compression is considered |
 | `--rkv-config` | — | JSON that overrides any of the above, e.g. `'{"budget":512,"buffer_size":16}'` |
+| `--rkv-max-active-requests` | — | cap concurrent R-KV requests → shrinks the `rolling_q` observation buffer (trades peak concurrency for memory) |
+| `--rkv-fused-validation` | `startup` | when to validate the fused redundancy kernel: `startup` / `first-request` / `off` |
 
-Example:
+Prompt-phase compression is a separate mode: `--enable-rkv-prefill` (+
+`--rkv-prefill-config` JSON, `mode` = `oneshot` or `buffered`). It cannot combine
+with `--enable-rkv` and additionally requires `--disable-prefill-cuda-graph`.
+
+Example (decode R-KV, CUDA-graph decode left **on** — now supported):
 
 ```bash
 python3 -m sglang.launch_server --model-path <model> \
   --attention-backend flashinfer \
-  --disable-decode-cuda-graph --disable-prefill-cuda-graph \
+  --disable-prefill-cuda-graph \
   --disable-overlap-schedule --disable-radix-cache --page-size 1 \
   --enable-rkv --rkv-budget 512 --rkv-buffer-size 16
 ```
@@ -254,9 +268,12 @@ server configuration (all set for you by `launch_server.sh`):
 - `--disable-radix-cache` — R-KV frees KV slots the radix/prefix cache would
   still reference; leaving it on double-counts the pool and crashes the leak
   checker. Prefix reuse assumes KV is immutable; R-KV evicts it.
-- `--disable-decode-cuda-graph --disable-prefill-cuda-graph` — dynamic eviction
-  cannot live inside a captured CUDA graph, so R-KV runs eager.
-- `--disable-overlap-schedule` — simpler, deterministic timing for phase 1.
+- **Decode CUDA graph is supported** and left on (the observation-window queries
+  are collected inside the captured graph, with a hybrid eager path only for the
+  compaction steps). `--enable-rkv-prefill` additionally requires
+  `--disable-prefill-cuda-graph` (prompt-phase scoring is dynamic-shape).
+- `--disable-overlap-schedule` — simpler, deterministic timing, and it avoids an
+  allocator free-list race during compaction (see [`docs/OPTIMIZATIONS.md`](docs/OPTIMIZATIONS.md) §2.2/§3).
 - `--page-size 1` — clean per-slot `free()` (the paged allocator frees at page
   granularity otherwise).
 
@@ -266,10 +283,10 @@ server configuration (all set for you by `launch_server.sh`):
 | --- | --- |
 | `batch = 1`, `tp = 1`, `dp = 1` | ✅ validated |
 | `batch > 1` (`tp = 1`, `dp = 1`) | ✅ validated (per-request triggering) |
-| Tensor parallel (`tp ≥ 2`) | ❌ **not supported — silently incorrect** without a cross-rank score all-reduce (see [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §11.2). Do not combine `--enable-rkv` with `--tp > 1`. |
+| Tensor parallel (`tp ≥ 2`) | ✅ supported — the per-token eviction score is all-reduced across the attention-TP group before top-k, so every rank evicts the identical tokens (see [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §11.2); validated on 8× H100 |
 | Data parallel — plain (`dp ≥ 2`, `tp = 1`) | ✅ validated — each replica runs its own R-KV over a disjoint request set; throughput scales up to 5.2× on 8× H100 (see [`benchmark/RESULTS_dp.md`](benchmark/RESULTS_dp.md)) |
-| DP attention (`--enable-dp-attention`) | ❌ untested — implies `tp > 1` (currently blocked at startup); padded `forward_batch` layout unverified |
-| CUDA-graph decode | ❌ eager only (phase 1) |
+| DP attention (`--enable-dp-attention`) | ❌ unsupported — padded `forward_batch` layout unverified against the R-KV hooks |
+| CUDA-graph decode | ✅ supported (in-graph observation + hybrid eager compaction steps) |
 
 ---
 
@@ -278,7 +295,10 @@ server configuration (all set for you by `launch_server.sh`):
 - [`docs/DESIGN.md`](docs/DESIGN.md) — architecture, the paged-pool tension, the
   rotary/position scheme, and why the `sparsity/` framework was not reused.
 - [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) — the practical code map:
-  wiring points, bring-up bugs, and the parallelism/batching support matrix.
+  the 9 wiring points, bring-up bugs, and the parallelism/batching support matrix.
+- [`docs/OPTIMIZATIONS.md`](docs/OPTIMIZATIONS.md) — performance optimizations and
+  production-hardening (CUDA graph, fused kernel, two-phase compaction, admission).
+- [`docs/REPRODUCE.md`](docs/REPRODUCE.md) — exact, validated reproduction & usage.
 - [`benchmark/RESULTS.md`](benchmark/RESULTS.md) — Qwen2.5-0.5B sanity numbers.
 - [`benchmark/RESULTS_math7b.md`](benchmark/RESULTS_math7b.md) — Math-7B results.
 

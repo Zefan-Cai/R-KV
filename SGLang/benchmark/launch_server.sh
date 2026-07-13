@@ -35,9 +35,13 @@ fi
 export PYTHONPATH="$SGLANG_SRC/python"
 export HF_HUB_DISABLE_XET=1  # HF Xet transfer can hang on large files
 
-# R-KV requires: eager decode (no captured CUDA graph), radix/prefix cache OFF
-# (R-KV frees slots the radix tree still references -> pool double-count crash),
-# overlap OFF (simple timing), page_size=1 (clean per-slot free).
+# R-KV requires: radix/prefix cache OFF (R-KV frees slots the radix tree still
+# references -> pool double-count crash), overlap OFF (avoids an allocator
+# free-list race during compaction), page_size=1 (clean per-slot free).
+# NOTE: decode CUDA graph is now SUPPORTED (in-graph observation + hybrid eager
+# compaction steps). This harness keeps it eager (--disable-decode-cuda-graph)
+# only for a bit-reproducible baseline; drop that flag to run with the graph on
+# (faster). Prefill graph stays off.
 RKV_FLAGS=(--disable-decode-cuda-graph --disable-prefill-cuda-graph
            --disable-overlap-schedule --disable-radix-cache --page-size 1)
 

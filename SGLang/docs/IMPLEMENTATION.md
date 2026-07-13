@@ -7,6 +7,12 @@ findings, rejected alternatives, the `sparsity/` framework evaluation), read
 the components, the per-step data flow, the exact wiring points, and the
 decisions baked into them.
 
+> **Scope: decode-time R-KV.** This file documents the *decoding-time* path
+> (`--enable-rkv`). The **prefill-time** mode (`--enable-rkv-prefill`) is a
+> separate integration
+> ([`prefill_integration.py`](../rkv/prefill_integration.py));
+> see [`FINDINGS_AND_ROADMAP.md`](./OPTIMIZATIONS.md).
+
 ## 1. Overview
 
 R-KV is a **decoding-time** KV-cache compressor. While a model generates a long
@@ -56,10 +62,12 @@ past tokens plus the trailing `window` observation tokens.
   the per-request states. Public surface:
   - `on_request_begin(req)` / `on_request_end(req)` — lifecycle.
   - `observe_decode_layer(q, k, v, layer, forward_batch)` — called per layer
-    during decode: caches the query, and (when a compaction is armed) computes
-    and accumulates this layer's per-token score.
+    during decode: caches the query into the observation window. (Scoring is
+    **not** done here; it is batched across all layers in `maybe_compact`.)
   - `maybe_compact(forward_batch)` — called after the full forward pass; for any
-    armed request, assembles the global kept set and physically compacts.
+    armed request, scores all layers in **one batched pass** (with an A/B gate
+    against the per-layer reference), assembles the global kept set, and
+    physically compacts.
   - `override_decode_positions(forward_batch)` — replaces decode positions with
     *logical* positions (see §5).
   - `take_pending_length_updates()` — hands the scheduler the new physical
@@ -80,12 +88,13 @@ FlashInferAttnBackend.init_forward_metadata(fb)   # fb = the REAL decode batch
 
 model.forward → per layer → RadixAttention → FlashInferAttnBackend.forward_decode
   └─ after set_kv_buffer:
-       observe_decode_layer(q, k, v, layer, fb)   # cache query; accumulate score
+       observe_decode_layer(q, k, v, layer, fb)   # cache query into window
                                                    # arm compaction every buffer_size
                                                    # steps once seq_len >= budget
 
 model_runner.forward (after all layers)
-  └─ maybe_compact(fb)                          # for armed reqs: compact
+  └─ maybe_compact(fb)                          # for armed reqs:
+        ├─ score all layers in ONE batched pass (A/B gate vs per-layer ref)
         ├─ assemble kept = top(budget-window) past + trailing window
         └─ _compact_request(...)                # see §6
 ```
@@ -135,15 +144,21 @@ request occupying physical slots `slots = req_to_token[idx, :seq_len]`:
 5. Shrink `req.kv_committed_len / kv_allocated_len = budget`; publish the new
    physical length via `pending_length_updates`.
 
-## 7. Wiring points (5 core files)
+## 7. Wiring points (9 core files)
+
+All changes are additive and applied by [`../patch/rkv-sglang-0.5.14.patch`](../patch/rkv-sglang-0.5.14.patch).
 
 | File | Change |
 | --- | --- |
-| `server_args.py` | `--enable-rkv`; per-field flags `--rkv-budget`, `--rkv-window-size`, `--rkv-kernel-size`, `--rkv-mix-lambda`, `--rkv-retain-ratio`, `--rkv-retain-direction`, `--rkv-buffer-size`, `--rkv-min-seq-len`; `--rkv-config '{...}'` JSON overrides the per-field flags |
-| `model_executor/model_runner.py` | Build `RKVCompressor` in `alloc_memory_pool` (after pools exist); call `maybe_compact` after the decode forward pass |
-| `layers/attention/flashinfer_backend.py` | Backend holds `rkv_compressor`; in `init_forward_metadata` bind it onto the real decode batch + `override_decode_positions`; call `observe_decode_layer` in `forward_decode` after `set_kv_buffer` |
-| `managers/scheduler.py` | Re-bind `rkv_compressor` in `init_memory_pools` (see §8); `_apply_rkv_pre_decode` before `prepare_for_decode` |
-| `managers/scheduler_components/batch_result_processor.py` | Call `on_request_end` at the two real-finished points (beside `hisparse.request_finished`, **not** at retract points) |
+| `server_args.py` | `--enable-rkv` + per-field flags (`--rkv-budget`, `--rkv-window-size`, `--rkv-kernel-size`, `--rkv-mix-lambda`, `--rkv-retain-ratio`, `--rkv-retain-direction`, `--rkv-buffer-size`, `--rkv-min-seq-len`), `--rkv-config` JSON override, `--rkv-max-active-requests`, `--rkv-fused-validation`; prefill mode `--enable-rkv-prefill` + `--rkv-prefill-config`. `_handle_rkv_validation` / `_handle_rkv_prefill_validation` reject unsafe combos at startup |
+| `model_executor/model_runner.py` | Build `RKVCompressor` (and the prefill compressor) in `alloc_memory_pool` after the pools exist; call `maybe_compact` after the decode forward pass |
+| `model_executor/model_runner_kv_cache_mixin.py` | Reserve the R-KV auxiliary GPU memory (the `rolling_q` observation-query buffer **and** the transient compaction workspace) inside KV-pool sizing so admission accounting is correct; apply the `--rkv-max-active-requests` cap on `max_running_requests` |
+| `model_executor/forward_batch_info.py` | Restore **logical** rotary positions (`override_decode_positions`) at `ForwardBatch` construction so both eager and captured-CUDA-graph decode read the correct positions |
+| `layers/attention/flashinfer_backend.py` | Backend holds `rkv_compressor` / `rkv_prefill_compressor`; bind onto the real decode batch in `init_forward_metadata`; call `observe_decode_layer` (decode) / `observe_prefill_layer` (prefill) after `set_kv_buffer` |
+| `managers/scheduler.py` | Re-bind the compressor in `init_memory_pools` (see §8); `_apply_rkv_pre_decode` before `prepare_for_decode`; `commit_compactions` after the decode forward (two-phase compaction, §6) |
+| `managers/scheduler_components/batch_result_processor.py` | Call `on_request_end` at the two real-finished points (beside `hisparse.request_finished`); commit any queued compaction frees before the finished-request release loop |
+| `managers/schedule_batch.py` | `on_request_retract` hooks so a retracted request drops its per-request compressor state while `req_pool_idx` is still valid (avoids stale bookkeeping / KV leak on the next prefill) |
+| `managers/schedule_policy.py` | **Compression-aware admission**: `PrefillAdder` reserves a request's *constant* compressed KV ceiling (`min(prompt, budget) + output`) instead of `prompt + output`, so many more requests are admitted concurrently |
 
 ## 8. Bugs fixed during bring-up
 
@@ -171,9 +186,10 @@ request occupying physical slots `slots = req_to_token[idx, :seq_len]`:
    subtract 1 (see §5).
 5. **No startup validation of R-KV-incompatible flags (owner review, 2026-07-02).**
    `--enable-rkv` silently corrupted the KV pool when combined with the radix
-   cache, a captured decode CUDA graph, overlap scheduling, `page_size > 1`, or
-   `tp > 1`. Fix: `ServerArgs._handle_rkv_validation` now rejects those combos at
-   startup with an explicit error.
+   cache, overlap scheduling, `page_size > 1`, or `tp > 1`. Fix:
+   `ServerArgs._handle_rkv_validation` now rejects those combos at startup with an
+   explicit error. (Decode CUDA graph was **later made compatible** via the
+   hybrid eager/graph path and is no longer rejected.)
 
 ## 9. Environment (dev-v0.5.14 needs a newer stack than v0.5.3-era wheels)
 
@@ -185,16 +201,18 @@ request occupying physical slots `slots = req_to_token[idx, :seq_len]`:
 
 ## 10. Running & validation
 
-Launch (phase-1 flags are required — R-KV runs only on the **eager decode**
-path, so decode CUDA graph must be off; `page_size=1` for clean slot free;
-overlap off for simple timing):
+Launch (required flags — radix cache off so R-KV can free slots, overlap off,
+`page_size=1` for clean slot free). **Decode CUDA graph is supported and left on**
+via the hybrid eager/graph path (the `window_size` steps ending at each
+compaction, plus the compaction step, run eager; every other decode step replays
+the captured graph). Pass `--disable-decode-cuda-graph` only if you want the
+fully-eager path:
 
 ```bash
-PYTHONPATH=sglang-src/python HF_HUB_DISABLE_XET=1 python3 -m sglang.launch_server \
+PYTHONPATH=$PWD/python HF_HUB_DISABLE_XET=1 python3 -m sglang.launch_server \
   --model-path /data/model/Qwen2.5-0.5B-Instruct \
   --attention-backend flashinfer \
-  --disable-decode-cuda-graph --disable-prefill-cuda-graph \
-  --disable-overlap-schedule --page-size 1 \
+  --disable-radix-cache --disable-overlap-schedule --page-size 1 \
   --enable-rkv --rkv-config '{"budget":64,"window_size":8,"buffer_size":16}' \
   --mem-fraction-static 0.6 --host 127.0.0.1 --port 30000
 ```
@@ -208,7 +226,7 @@ CPU unit tests (no GPU, no installed `sglang` needed — modules are loaded by
 path):
 
 ```bash
-python3 tests/test_rkv_integration.py
+python3 test/srt/mem_cache/test_rkv_integration.py
 ```
 
 9 cases: kept-set assembly, slot relocation, overlap safety, physical-length
@@ -217,10 +235,10 @@ bookkeeping, logical-position decoupling, request lifecycle
 
 ## 11. Parallelism & batching support
 
-**Current status: single-GPU, `batch >= 1`** — validated at
-`tp_size=1, dp_size=1` for both `batch=1` and `batch > 1`. Tensor parallel (TP)
-and data parallel (DP) are **not** supported. The integration layer contains
-**no distributed code** (no `tp_group`, no `all_reduce`, no `torch.distributed`).
+**Current status: `batch >= 1`, `tp >= 1`, plain `dp >= 1`.** Validated for
+`batch=1` and `batch > 1`; **tensor parallel (TP) is supported** via a cross-rank
+score all-reduce (§11.2); **plain data parallel (DP) is supported** (§11.3). The
+only unsupported multi-GPU mode is **DP attention** (`--enable-dp-attention`).
 
 ### 11.1 `batch > 1` — supported (method A: per-request triggering)
 
@@ -238,43 +256,56 @@ accumulators, query ring buffers, and compaction are all keyed by
 > method A while adding wasted checks on short requests and ragged-slot batching
 > overhead — no speedup.
 
-### 11.2 Tensor parallel (TP ≥ 2) — NOT supported, silently incorrect ⚠️
-
-This is the dangerous case: it will not crash, it will **corrupt the KV cache**.
+### 11.2 Tensor parallel (TP ≥ 2) — supported (cross-rank score all-reduce)
 
 Under TP, each rank holds only a **subset of the KV heads**. R-KV's importance /
-redundancy score is reduced with a **mean over heads** — but each rank can only
-see *its own* heads. Therefore:
+redundancy score is reduced with a **mean over heads**, so each rank's *local*
+score sees only its own heads. Left uncoordinated this is the dangerous case: it
+does not crash, it **corrupts the KV cache**. Each rank would select a
+**different** `kept` set, yet KV-slot allocation and `req_to_token` are
+synchronized and identical across ranks — so `_compact_request` would rewrite
+`req_to_token` differently and `free()` different physical slots per rank, and
+the physical KV layout would **silently diverge** (wrong attention outputs,
+eventual pool corruption; nothing detects it because each rank is internally
+self-consistent).
 
-1. each rank computes a **different** per-token score → selects a **different**
-   `kept` set;
-2. yet KV-slot allocation and `req_to_token` are **synchronized and identical**
-   across ranks (every rank gets the same `out_cache_loc` each step, and the
-   scheduler drives one logical sequence);
-3. so `_compact_request` rewrites `req_to_token` **differently** and calls
-   `free()` on **different physical slots** on each rank → the physical KV
-   layout **diverges between ranks**.
+**Fix (implemented).** The per-token score is **all-reduced (SUM) across the
+attention-TP group before `_assemble_kept`**, so every rank tops-k the *same*
+global score and evicts the *identical* tokens, keeping the replicated
+`req_to_token` consistent. This is correct because the score is a cross-head
+**mean** and every softmax/pool inside it is **per-head** (over the sequence
+axis) → the cross-head reduction is **linear**. Head sharding is uniform
+(`num_kv_heads % tp == 0` for distinct heads, or `tp % num_kv_heads == 0` with
+uniform replication), so the all-reduced SUM equals the true global cross-head
+mean scaled by a positive constant; `topk` is invariant to positive scaling, so
+the kept set is identical on every rank.
 
-Once the layout diverges, FlashInfer reads the wrong slots on some ranks and the
-allocator's slot accounting no longer matches the (shared) `req_to_token` — i.e.
-wrong attention outputs and, eventually, pool corruption. **Nothing detects
-this**, because each rank is internally self-consistent; only the *cross-rank*
-agreement is broken.
+Implementation:
 
-**To support TP**, the per-token score must be **all-reduced across the
-attention-TP group** (summing each rank's head contributions) into one global
-score *before* `kept` is assembled, so every rank evicts the **exact same**
-tokens and keeps `req_to_token` identical. Concretely the compressor would need:
+- the compressor takes an `attn_tp_group` handle
+  (`model_runner.attention_tp_group`, i.e. `get_attention_tp_group()`), stored as
+  `self.attn_tp_group` / `self.attn_tp_size`; `None` / `world_size == 1` makes
+  the path a no-op, so the single-GPU code is unchanged;
+- `_reduce_score_across_tp(score)` does `attn_tp_group.all_reduce(score.float())`
+  (fp32 so ties break identically on every rank) on each score right before
+  `_assemble_kept`, in both the decode (`maybe_compact`) and prefill paths;
+- armed requests are iterated in **sorted `req_pool_idx` order** so every rank
+  issues its collectives in the same order (a mismatched order would mis-pair
+  tensors or hang);
+- `_check_kept_consistent_across_tp(kept)` all-reduces the kept indices and
+  raises `RuntimeError` if any rank disagrees — self-validating on the first few
+  compactions, or on **every** compaction when `SGLANG_RKV_TP_CHECK=1`.
 
-- a handle to the attention-TP process group (e.g. `model_runner.tp_group` /
-  `attention_tp_group`);
-- an `all_reduce(SUM)` of the accumulated per-token score in `maybe_compact`,
-  right before `_assemble_kept`;
-- (ideally) an assertion that every rank derived the identical `kept` indices.
+**Validated (8x H100)** with `SGLANG_RKV_TP_CHECK=1` forcing the consistency
+check on every compaction, across all three head-sharding regimes:
 
-None of this exists today, so **`--tp 2` or higher will silently produce wrong
-results.** If TP is attempted before this is implemented, it should be hard-
-blocked in `server_args` (reject `enable_rkv && tp_size > 1`).
+| tp | model (Q/KV heads) | local KV heads | phase | result |
+| --- | --- | --- | --- | --- |
+| 2 | Qwen2.5-Math-7B (28/4) | 2/rank (distinct) | decode | both ranks compact the same `req_pool_idx` at the same step, identical freed count; assertion never fired |
+| 4 | Qwen2.5-Math-7B (28/4) | 1/rank (distinct) | decode | all 4 ranks 6 compactions each in lockstep; outputs byte-identical to tp=2 |
+| 8 | Qwen3-30B-A3B (32/4) | 4 KV replicated x2 | prefill | all 8 ranks 4 compactions each in lockstep (`1163 -> 512`, freed 651); assertion never fired |
+
+**DP attention** (`--enable-dp-attention`) is still unsupported (§11.3).
 
 ### 11.3 Data parallel (DP ≥ 2)
 
@@ -286,12 +317,12 @@ Qwen2.5-Math-7B (8× H100): every rank compresses independently, accuracy matche
 single-GPU, no leaks/crashes, and throughput scales up to **5.2× on 8 GPUs**. See
 [`../benchmark/RESULTS_dp.md`](../benchmark/RESULTS_dp.md).
 
-**DP attention (`--enable-dp-attention`) — still untested.** This mode makes
-attention data-parallel while MoE/FFN stay tensor-parallel (it implies `tp>1`,
-which the startup guard currently rejects). Its padded/scattered `forward_batch`
-layout (per-rank `num_real_reqs`, all-gather of attention inputs) has **not been
+**DP attention (`--enable-dp-attention`) — still unsupported.** This mode makes
+attention data-parallel while MoE/FFN stay tensor-parallel. While plain TP is now
+supported (§11.2), DP attention's padded/scattered `forward_batch` layout
+(per-rank `num_real_reqs`, all-gather of attention inputs) has **not been
 tested** against R-KV's `observe` / `override_decode_positions` / `maybe_compact`
-hooks.
+hooks, so it is left unsupported.
 
 ### Support matrix
 
@@ -299,23 +330,23 @@ hooks.
 | --- | --- | --- |
 | `batch=1, tp=1, dp=1` | ✅ validated | — |
 | `batch > 1` (tp=1, dp=1) | ✅ supported | per-request triggering (method A) |
-| **TP ≥ 2** | ❌ **silently incorrect** | **missing cross-rank all-reduce of scores** (fundamental) |
+| **TP ≥ 2** | ✅ supported | cross-rank score all-reduce before top-k (§11.2) |
 | DP ≥ 2 (plain, `tp=1`) | ✅ validated | per-rank independent R-KV (see benchmark/RESULTS_dp.md) |
-| DP attention (`--enable-dp-attention`) | ❌ untested | implies tp>1 (blocked); padded forward_batch layout unverified |
+| DP attention (`--enable-dp-attention`) | ❌ unsupported | padded forward_batch layout unverified against the hooks |
 
-> **Enforced at startup:** `ServerArgs._handle_rkv_validation` rejects
-> `--enable-rkv` together with `--tp > 1` (and radix cache / decode CUDA graph /
-> overlap schedule / `page_size > 1`), so the silently-incorrect TP path cannot
-> be launched by accident. Plain DP (`--dp-size N --tp-size 1`) is allowed and
-> validated (§11.3); implementing the §11.2 cross-rank all-reduce is what would
-> lift the TP block.
+> **Enforced at startup:** `ServerArgs._handle_rkv_validation` requires
+> `--disable-radix-cache` / `--disable-overlap-schedule` / `--page-size 1`, and a
+> late, post-resolution gate in `ModelRunner` rejects runtimes the hooks are not
+> wired for (non-FlashInfer backend, MLA, hybrid-SWA, speculative decoding).
+> **Plain TP and plain DP are allowed and validated** (§11.2 / §11.3);
+> DP attention remains unsupported.
 
 ## 12. Other limitations / next
 
-- **O(budget²) similarity** in `cal_similarity` — a phase-2 perf target
-  (chunking / a cheaper redundancy estimate).
-- **No CUDA-graph decode** yet (dynamic eviction can't live in a captured
-  graph). Phase-2 would need a graph-compatible compaction scheme.
+- **O(budget²) similarity** in `cal_similarity` — the per-layer scoring GEMMs are
+  now **batched across layers** (one pass instead of `num_layers`); the per-token
+  O(budget²) redundancy matrix itself is still a phase-2 target (chunking / a
+  cheaper redundancy estimate).
 - **`on_request_end`** is wired at finish, but state is otherwise only cleared
   lazily on `req_pool_idx` reuse — fine for phase 1.
 - Larger-sample accuracy (MATH-500 / AIME-24) and a long-sequence throughput
