@@ -15,6 +15,31 @@ This directory ports R-KV onto a **pinned** SGLang v0.5.14 baseline.
   positions consistent after the sequence physically shrinks. Runs on the
   FlashInfer decode path.
 
+## Highlights
+
+**Accuracy *and* performance — both strong.** R-KV keeps generation quality
+**lossless at `budget=512`** (0.90–0.915 vs Full-KV's 0.910 on GSM8K) while
+compressing the KV cache to a fixed budget — and the port is engineered to make
+that compression cheap:
+
+- **Fused Triton redundancy kernel** — computes the O(n²) key-similarity term as
+  a single row-blocked kernel (no full n×n matrix), bit-parity-validated with a
+  permanent reference fallback.
+- **CUDA-graph decode** — observation queries are gathered *inside* the captured
+  decode graph; only the compaction steps run eager (hybrid graph/eager path).
+- **Batched cross-layer scoring** — one GEMM pass instead of `num_layers`
+  (up to 8× faster scoring on short prompts).
+- **Two-phase compaction** — relocate-in-forward + free-in-scheduler decouples KV
+  eviction from the allocator, so it stays race-free at scale.
+- **Compression-aware admission** — the scheduler reserves each request's
+  *constant* compressed footprint, admitting many more concurrent requests under
+  a fixed KV pool.
+- **Tensor & data parallel** (validated on 8× H100) — DP scales to **5.1×**; TP is
+  supported via a cross-rank eviction-score all-reduce, so every rank evicts
+  identical tokens.
+
+Full list with measured effects: [`docs/OPTIMIZATIONS.md`](docs/OPTIMIZATIONS.md).
+
 ## Headline result — Qwen2.5-Math-7B-Instruct (NVIDIA H100)
 
 SGLang's own GSM8K harness (`bench_sglang.py`, 5-shot, first 200 questions,
