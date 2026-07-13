@@ -91,47 +91,42 @@ files (6 `rkv/` + 9 wiring) matched by `sha256`.
 ## 4. Serve + evaluate (Qwen2.5-Math-7B, single H100)
 
 ```bash
-bash benchmark/prepare_data.sh                                   # bundled GSM8K few-shot data
-MODEL=/data/model/Qwen2.5-Math-7B-Instruct bash benchmark/launch_server.sh rkv 512
-# in another shell (same env):
-python3 benchmark/eval.py --n 20 --concurrency 8 --label rkv_b512
+# Full-KV baseline under R-KV's flags (fair A/B) | R-KV | production Full-KV:
+MODEL=/data/model/Qwen2.5-Math-7B-Instruct bash benchmark/launch_server.sh constrained
+MODEL=/data/model/Qwen2.5-Math-7B-Instruct BUFFER=128 bash benchmark/launch_server.sh rkv 256
+MODEL=/data/model/Qwen2.5-Math-7B-Instruct bash benchmark/launch_server.sh fullkv
+
+# Evaluate with SGLang's own GSM8K harness (5-shot; downloads the test set), in
+# another shell (same env):
+PYTHONPATH=sglang-src/python python3 \
+  sglang-src/benchmark/gsm8k/bench_sglang.py \
+  --num-questions 200 --num-shots 5 --parallel 32 --max-new-tokens 512 --port 30000
 ```
 
-`launch_server.sh` sets `PYTHONPATH=sglang-src/python` and the required flags.
+`launch_server.sh` sets `PYTHONPATH=sglang-src/python` and the required flags; the
+`rkv` mode runs the fastest path (decode **and** prefill CUDA graphs ON, fused
+redundancy kernel adopted). Set `DP=N` or `TP=N` for multi-GPU:
+
+```bash
+DP=4 MODEL=/data/model/Qwen2.5-Math-7B-Instruct BUFFER=128 bash benchmark/launch_server.sh rkv 256  # 4-way data parallel
+TP=4 MODEL=/data/model/Qwen2.5-Math-7B-Instruct BUFFER=128 bash benchmark/launch_server.sh rkv 256  # 4-way tensor parallel
+```
 
 ### Validated numbers
 
-**Decode R-KV, budget 512, `n=20`, concurrency 8** — three back-to-back runs
-(eager decode path):
+The full, refreshed results (Qwen2.5-Math-7B, 8× H100, `bench_sglang.py` / GSM8K
+5-shot) live in the benchmark reports:
 
-| Run | Accuracy | avg_tokens | Throughput | KV compactions |
-| --- | --- | --- | --- | --- |
-| 1 | 19/20 = 0.950 | 195 | 423.6 tok/s | 232 |
-| 2 | 19/20 = 0.950 | 195 | 427.1 tok/s | 232 |
-| 3 | 19/20 = 0.950 | 195 | 424.4 tok/s | 232 |
-
-Stable at **95 % (== eager baseline)** with **~232 physical KV compactions per
-run, zero crashes / leaks / double-frees**.
-
-**Decode R-KV + decode CUDA graph ON** (the hardening headline — the old port was
-eager-only). Launch without `--disable-decode-cuda-graph`:
-
-```bash
-export PYTHONPATH="$PWD/sglang-src/python"
-python3 -m sglang.launch_server \
-  --model-path /data/model/Qwen2.5-Math-7B-Instruct \
-  --attention-backend flashinfer \
-  --disable-radix-cache --disable-overlap-schedule --disable-prefill-cuda-graph \
-  --page-size 1 --mem-fraction-static 0.6 --host 127.0.0.1 --port 30011 \
-  --enable-rkv --rkv-config '{"budget":512,"window_size":8,"buffer_size":16}'
-python3 benchmark/eval.py --n 20 --concurrency 8 --port 30011 --label rkv_graphON
-```
-
-Result: decode graph captures all 36 batch sizes and the decode loop runs under
-it (`cuda graph: True`); **18/20 = 0.900** (a single-item flip vs eager, within
-n=20 noise), **579.6 tok/s (+37 % over eager)**, 228 compactions, **zero errors**.
-The server log shows `R-KV decode fused-redundancy gate: OK -> fused adopted`
-(the `--rkv-fused-validation startup` gate).
+- [`../benchmark/RESULTS.md`](../benchmark/RESULTS.md) — `budget × buffer_size`
+  sweep with **two** Full-KV baselines (production + constrained). R-KV is
+  **lossless at budget=512** and costs only ~3–7 % vs the fair constrained
+  baseline at `buffer ≥ 128`; the server logs
+  `R-KV fused-redundancy gate: OK -> fused adopted`.
+- [`../benchmark/RESULTS_dp.md`](../benchmark/RESULTS_dp.md) — data-parallel
+  scaling up to **5.1× on 8× H100**, accuracy flat.
+- [`../benchmark/RESULTS_tp.md`](../benchmark/RESULTS_tp.md) — tensor-parallel
+  scaling (**1.56× at tp=4**) and the cross-rank lockstep-compaction correctness
+  proof (every rank evicts identical tokens).
 
 ---
 
