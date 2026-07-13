@@ -20,6 +20,7 @@ MODEL_REVISION="003f183a92fbe5b9a8325aaa8b2ae797c91dd90f"
 MODEL_ROOT="${MODEL_ROOT:-/mnt/localssd/rkv-models}"
 MODEL_DIR="$MODEL_ROOT/Qwen3-Coder-480B-A35B-Instruct-FP8-$MODEL_REVISION"
 VENV="/mnt/localssd/rkv-sglang-venv"
+SGLANG_INSTALL_MODE="${SGLANG_INSTALL_MODE:-wheel}"
 mkdir -p "$RESULT_ROOT" "$MODEL_ROOT"
 exec > >(tee -a "$RESULT_ROOT/node.log") 2>&1
 
@@ -43,19 +44,61 @@ python -m pip install --upgrade pip
 
 cd "$REPO_ROOT/SGLang"
 bash scripts/apply_rkv.sh --force
-
-# Editable SGLang builds its bundled gRPC extension from Rust. Use upstream's
-# idempotent installer so both its pinned toolchain and protoc are available.
-bash sglang-src/scripts/ci/utils/install_rust_protoc.sh
-export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
-rustc --version
-cargo --version
-protoc --version
-command -v cc
-
-python -m pip install -e sglang-src/python --extra-index-url https://docs.sglang.ai/whl/cu129/
+case "$SGLANG_INSTALL_MODE" in
+  wheel)
+    # Use the release wheel for dependencies/native artifacts, then put the
+    # exact patched 49e384ce Python tree first. The campaign is HTTP-only;
+    # gRPC's wheel-only nested extension is intentionally not imported.
+    python -m pip install --only-binary=sglang "sglang==0.5.14" \
+      --extra-index-url https://docs.sglang.ai/whl/cu129/
+    ;;
+  source)
+    # Conservative full-source fallback, including the bundled gRPC extension.
+    bash sglang-src/scripts/ci/utils/install_rust_protoc.sh
+    export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
+    rustc --version
+    cargo --version
+    protoc --version
+    command -v cc
+    python -m pip install -e sglang-src/python \
+      --extra-index-url https://docs.sglang.ai/whl/cu129/
+    ;;
+  *)
+    echo "unknown SGLANG_INSTALL_MODE: $SGLANG_INSTALL_MODE" >&2
+    exit 2
+    ;;
+esac
 python -m pip install -r requirements-rkv.txt --extra-index-url https://docs.sglang.ai/whl/cu129/
 python -m pip install "huggingface_hub[cli]" "evalplus==0.3.1"
+
+export RKV_SGLANG_SRC="$REPO_ROOT/SGLang/sglang-src"
+export PYTHONPATH="$RKV_SGLANG_SRC/python${PYTHONPATH:+:$PYTHONPATH}"
+unset SGLANG_ENABLE_GRPC SGLANG_GRPC_PORT
+python - <<'PY'
+import importlib.metadata as metadata
+import importlib.util
+import os
+from pathlib import Path
+
+import sglang
+from sglang.srt.environ import envs
+from sglang.srt.entrypoints.http_server import launch_server
+from sglang.srt.server_args import ServerArgs
+
+source = (Path(os.environ["RKV_SGLANG_SRC"]) / "python").resolve()
+assert Path(sglang.__file__).resolve().is_relative_to(source)
+assert metadata.version("sglang") in {"0.5.14", "0.0.0.dev1+g49e384ce9.d20260713"}
+assert hasattr(ServerArgs, "enable_rkv")
+assert hasattr(ServerArgs, "enable_rkv_prefill")
+assert callable(launch_server)
+assert envs.SGLANG_ENABLE_GRPC.get() is False
+assert importlib.util.find_spec("sgl_kernel") is not None
+assert importlib.util.find_spec("flashinfer") is not None
+print("HTTP_OVERLAY_OK", sglang.__file__, metadata.version("sglang"))
+PY
+python -m sglang.launch_server --help >"$RESULT_ROOT/sglang-launch-help.txt"
+grep -q -- '--enable-rkv' "$RESULT_ROOT/sglang-launch-help.txt"
+grep -q -- '--enable-rkv-prefill' "$RESULT_ROOT/sglang-launch-help.txt"
 
 python tests/test_rkv_algo.py
 python tests/test_rkv_integration.py
@@ -91,6 +134,7 @@ cat >"$RESULT_ROOT/provenance.txt" <<EOF
 rkv_commit=$(git -C "$REPO_ROOT" rev-parse HEAD)
 model=$MODEL_ID
 model_revision=$MODEL_REVISION
+sglang_install_mode=$SGLANG_INSTALL_MODE
 arms=${ARMS[*]}
 role=$ROLE
 attempt=$ATTEMPT_ID

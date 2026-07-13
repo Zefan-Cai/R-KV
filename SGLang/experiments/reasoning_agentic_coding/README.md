@@ -42,9 +42,12 @@ The Pluto entrypoints provision one H200 P1 node and one H200 P2 node. Each
 stages the checkpoint on local NVMe after a 600 GiB free-space preflight; only
 small, resumable results live under
 `/sensei-fs/users/zcai/rkv-sglang-eval-20260713`. They run the CPU and H200
-fused-kernel parity suites, installing SGLang's pinned Rust/protoc build
-prerequisites first, then execute a crossover so node/project effects do
-not masquerade as R-KV effects:
+fused-kernel parity suites. To survive reclaimable-node churn, the default
+bootstrap uses the v0.5.14 wheel for dependencies/native artifacts and overlays
+the exact patched `49e384ce` Python tree for this HTTP-only campaign; a full
+Rust/protoc source build remains available with `SGLANG_INSTALL_MODE=source`.
+The nodes then execute a crossover so node/project effects do not masquerade as
+R-KV effects:
 
 - P1 order: `d-full`, `d-4k`, `p-full`, `p-4k`
 - P2 order: `d-4k`, `d-full`, `p-4k`, `p-full`
