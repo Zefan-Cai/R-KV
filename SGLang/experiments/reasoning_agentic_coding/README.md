@@ -57,6 +57,10 @@ HumanEval+ through EvalPlus. Each prefill arm runs the same health probes plus a
 deterministic BFCL V4 long-context/memory pilot with all required memory setup
 dependencies. The server context cap is 65,536 tokens for these pilot slices.
 
+For a reclaimed P2 allocation, `MODEL_RSYNC_HOST=<P1 pod IP>` and optional
+`MODEL_RSYNC_PORT` stage the already-verified public checkpoint from P1 over the
+pod network instead of repeating the 450 GiB Hugging Face transfer.
+
 Results are written to the shared filesystem and, when pod credentials allow,
 incrementally mirrored to
 `s3://phidias/zcai/codex/rkv-sglang-eval-20260713/results/`.

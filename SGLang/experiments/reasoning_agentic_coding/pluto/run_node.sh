@@ -116,10 +116,18 @@ python tests/test_rkv_redundancy_fused.py
   flock -x 9
   if [[ ! -f "$MODEL_DIR/MODEL_READY" ]]; then
     mkdir -p "$MODEL_DIR"
-    export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
-    hf download "$MODEL_ID" \
-      --revision "$MODEL_REVISION" \
-      --local-dir "$MODEL_DIR"
+    if [[ -n "${MODEL_RSYNC_HOST:-}" ]]; then
+      rsync -a --partial --whole-file --no-compress \
+        --contimeout=30 --timeout=300 --info=progress2 \
+        --exclude='.cache/' --exclude='MODEL_READY' \
+        "rsync://${MODEL_RSYNC_HOST}:${MODEL_RSYNC_PORT:-18731}/model/" \
+        "$MODEL_DIR/"
+    else
+      export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
+      hf download "$MODEL_ID" \
+        --revision "$MODEL_REVISION" \
+        --local-dir "$MODEL_DIR"
+    fi
     test -s "$MODEL_DIR/config.json"
     test -s "$MODEL_DIR/tokenizer_config.json"
     touch "$MODEL_DIR/MODEL_READY"
