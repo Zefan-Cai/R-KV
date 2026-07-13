@@ -40,10 +40,12 @@ if [[ -e "$SGLANG_SRC" ]]; then
   fi
 fi
 
-echo ">> [1/3] Cloning SGLang @ $SGLANG_COMMIT"
+echo ">> [1/3] Fetching SGLang @ $SGLANG_COMMIT (shallow)"
 echo "         $SGLANG_REPO"
-git clone "$SGLANG_REPO" "$SGLANG_SRC"
-git -C "$SGLANG_SRC" checkout --quiet "$SGLANG_COMMIT"
+git init --quiet "$SGLANG_SRC"
+git -C "$SGLANG_SRC" remote add origin "$SGLANG_REPO"
+git -C "$SGLANG_SRC" fetch --quiet --depth 1 origin "$SGLANG_COMMIT"
+git -C "$SGLANG_SRC" checkout --quiet --detach FETCH_HEAD
 echo "         checked out $(git -C "$SGLANG_SRC" rev-parse --short HEAD) (detached)"
 
 echo ">> [2/3] Installing R-KV package into the SGLang tree"

@@ -5,3 +5,7 @@ sglang-src/
 __pycache__/
 *.py[cod]
 .DS_Store
+
+# Local experiment outputs and node-side environments.
+experiments/**/artifacts/
+experiments/**/.venv/

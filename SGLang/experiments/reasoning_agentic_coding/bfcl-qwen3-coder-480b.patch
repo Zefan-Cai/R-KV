@@ -1,0 +1,35 @@
+diff --git a/berkeley-function-call-leaderboard/bfcl_eval/constants/supported_models.py b/berkeley-function-call-leaderboard/bfcl_eval/constants/supported_models.py
+index 33f8ac4..85eafc3 100644
+--- a/berkeley-function-call-leaderboard/bfcl_eval/constants/supported_models.py
++++ b/berkeley-function-call-leaderboard/bfcl_eval/constants/supported_models.py
+@@ -152,6 +152,7 @@ LOCAL_MODEL_LIST = [
+     "Qwen/Qwen3-30B-A3B-Instruct-2507-FC",
+     "Qwen/Qwen3-30B-A3B-Instruct-2507",
+     "Qwen/Qwen3-235B-A22B-Instruct-2507-FC",
++    "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8-FC",
+     "Qwen/Qwen3-235B-A22B-Instruct-2507",
+     "Team-ACE/ToolACE-2-8B",
+     "openbmb/MiniCPM3-4B",
+diff --git a/berkeley-function-call-leaderboard/bfcl_eval/constants/model_config.py b/berkeley-function-call-leaderboard/bfcl_eval/constants/model_config.py
+index a2ef25c..48ff523 100644
+--- a/berkeley-function-call-leaderboard/bfcl_eval/constants/model_config.py
++++ b/berkeley-function-call-leaderboard/bfcl_eval/constants/model_config.py
+@@ -1789,6 +1789,18 @@ OSS_MODEL_CONFIG_MAPPING = {
+         is_fc_model=True,
+         underscore_to_dot=False,
+     ),
++    "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8-FC": ModelConfig(
++        model_name="Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8",
++        display_name="Qwen3-Coder-480B-A35B-Instruct-FP8 (FC)",
++        url="https://huggingface.co/Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8",
++        org="Qwen",
++        license="apache-2.0",
++        model_handler=QwenFCHandler,
++        input_price=None,
++        output_price=None,
++        is_fc_model=True,
++        underscore_to_dot=False,
++    ),
+     "Qwen/Qwen3-235B-A22B-Instruct-2507": ModelConfig(
+         model_name="Qwen/Qwen3-235B-A22B-Instruct-2507",
+         display_name="Qwen3-235B-A22B-Instruct-2507 (Prompt)",
