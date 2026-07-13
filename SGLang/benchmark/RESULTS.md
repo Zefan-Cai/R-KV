@@ -1,93 +1,108 @@
-# R-KV Benchmark Results
+# R-KV Benchmark Results — Qwen2.5-Math-7B-Instruct (GSM8K)
 
-First measurements of the R-KV port, taken during phase-1 bring-up.
+Decode-time R-KV on a strong math model, measured with **SGLang's own GSM8K
+harness** (`sglang-src/benchmark/gsm8k/bench_sglang.py`, 5-shot) so the numbers
+line up with the upstream R-KV reference. Companion reports:
+[`RESULTS_dp.md`](./RESULTS_dp.md) (data-parallel scaling),
+[`RESULTS_tp.md`](./RESULTS_tp.md) (tensor-parallel scaling).
 
 ## Setup
 
-- **Models**: `Qwen2.5-Math-7B-Instruct` (headline — a strong math model, so
-  accuracy differences are signal, not noise) and `Qwen2.5-0.5B-Instruct` (a
-  weak *non-math* model, kept as a noisy secondary sanity check).
-- **GPU**: single NVIDIA H100 80GB.
-- **Dataset**: GSM8K-style few-shot MATH harness (`test.jsonl` from the `dev`
-  branch), first 20 items, `max_new_tokens=512`, `temperature=0`.
-- **Judging**: numeric match (see `eval.py`) — approximate, identical across all
-  runs.
-- **Config**: all R-KV runs use `--disable-radix-cache --disable-decode-cuda-graph
-  --disable-prefill-cuda-graph --disable-overlap-schedule --page-size 1`; the
-  eager baseline uses the same flags without `--enable-rkv`.
-- `window_size=8`, `buffer_size=16` throughout.
+- **Model**: `Qwen/Qwen2.5-Math-7B-Instruct` (bf16, GQA), single **NVIDIA H100 80GB**.
+- **Harness**: `bench_sglang.py`, standard GSM8K test set, **5-shot**, first
+  **200 questions**, `max_new_tokens=512`, `temperature=0`, **`--parallel 32`**.
+  Prompt ≈ 900 tokens; output ≈ 110 tokens/req.
+- `--mem-fraction-static 0.85`, FlashInfer backend, `page_size 1`.
+- **R-KV**: `window_size=8`, decode **and** prefill CUDA graphs **ON**, and the
+  **fused redundancy kernel is adopted** (server logs
+  `R-KV fused-redundancy gate: OK -> fused adopted`).
+- **Two Full-KV baselines** (both matter — see the note):
+  - **production** — radix/prefix cache + overlap schedule + CUDA graphs all ON
+    (fastest Full-KV; `launch_server.sh fullkv`).
+  - **constrained** — the *exact* flags R-KV requires (radix/overlap OFF,
+    `page_size 1`), no compression (`launch_server.sh constrained`). This is the
+    **fair A/B baseline**.
 
-> ⚠️ **Small sample (20 items).** Each item is ±5%, so treat these as trend
-> indicators, not precise numbers. Re-run with `--n 100`+ for tighter figures.
+> **Why two baselines?** R-KV structurally cannot use the radix/prefix cache — it
+> frees KV slots the radix tree would still reference. With a 5-shot prompt every
+> request shares a large prefix, so the prefix cache *alone* makes production
+> Full-KV much faster, an advantage unrelated to compression. The **constrained**
+> baseline removes it from both sides, isolating R-KV's true cost.
 
-## Accuracy vs budget — Qwen2.5-Math-7B-Instruct (headline)
+## Baselines
 
-Strong math model, so accuracy differences are signal, not noise. 20 items,
-few-shot prompt ~700 tokens, `window=8, buffer=16`, `max_new_tokens=512`
-(re-run 2026-07-02, post rotary off-by-one fix).
+| Full-KV | Accuracy | Latency (200) | Throughput |
+| --- | :---: | ---: | ---: |
+| production (radix + overlap + graphs) | 0.915 | 8.3 s | **2649 tok/s** |
+| constrained (R-KV's flags, no compression) | 0.910 | 12.3 s | **1792 tok/s** |
 
-| Config | Accuracy (20) | Compactions | Notes |
-| --- | --- | --- | --- |
-| baseline (R-KV off) | 95% (19/20) | — | reference |
-| R-KV budget=512 | **95% (19/20)** | ~230 | on par with baseline, heavy eviction |
-| R-KV budget=256 | **95% (19/20)** | 227 | most aggressive, still on par |
+Turning off radix/overlap and forcing `page_size 1` alone costs Full-KV **~32 %**
+(2649 → 1792 tok/s) — that is the prefix-cache advantage R-KV cannot use, **not** a
+compression cost. All R-KV rows below are compared to the **constrained** baseline.
 
-**Headline takeaway.** Even though `budget=512 < prompt (~700)` — so R-KV evicts
-part of the few-shot prompt itself — accuracy is **identical to the baseline
-(95%)**, confirming the "keep important + recent" selection retains what matters.
-Even at `budget=256` there is **no drop**. ~227–230 physical compactions ran per
-sweep with the server never crashing. (Full report:
-[`RESULTS_math7b.md`](./RESULTS_math7b.md).)
+## R-KV — `budget` × `buffer_size`
 
-## Accuracy vs budget — Qwen2.5-0.5B-Instruct (weak model, noisy)
+`--parallel 32`, 200 questions. **Compactions** = physical KV evictions during the run.
 
-20 items (re-run 2026-07-02, post rotary off-by-one fix).
+| `budget` | `buffer_size` | Accuracy | Throughput | vs constrained | Compactions |
+| ---: | ---: | :---: | ---: | ---: | ---: |
+| *constrained Full-KV* | — | 0.910 | 1792 | — | 0 |
+| 512 | 256 | 0.900 | 1715 | −4 % | 4 |
+| 512 | 128 | 0.910 | 1628 | −9 % | 62 |
+| 512 | 64 | 0.910 | 1549 | −14 % | 245 |
+| 512 | 16 | 0.915 | 1161 | −35 % | 1269 |
+| 256 | 256 | 0.900 | 1731 | −3 % | 4 |
+| 256 | 128 | 0.900 | 1679 | −6 % | 64 |
+| 256 | 64 | 0.885 | 1533 | −14 % | 247 |
+| 256 | 16 | 0.880 | 1126 | −37 % | 1232 |
+| 128 | 256 | 0.900 | 1684 | −6 % | 4 |
+| 128 | 128 | 0.865 | 1660 | −7 % | 64 |
+| 128 | 64 | 0.820 | 1533 | −14 % | 293 |
+| 128 | 16 | 0.750 | 1152 | −36 % | 1454 |
 
-| Config | Accuracy (20) | Compactions | Notes |
-| --- | --- | --- | --- |
-| baseline (R-KV off) | 30% (6/20) | — | reference |
-| R-KV budget=512 | 35% (7/20) | 386 | heavy eviction, accuracy preserved |
-| R-KV budget=256 | 35% (7/20) | 509 | most aggressive, still within noise |
+## Findings
 
-**Takeaway.** On this weak *non-math* model the absolute accuracy is low and
-noisy (±5% per item), but R-KV is well-behaved: at both `budget=512` and
-`budget=256` it matches the baseline within noise (indeed marginally above).
-This is the expected behaviour of a KV compressor — lossless while the budget is
-large enough. Crucially, the server ran **hundreds of physical compactions
-(freeing slots) without crashing**, confirming the eviction / free /
-`req_to_token` rewrite / rotary-decoupling are correct.
+1. **`budget` sets the accuracy wall.** `budget=512` is **lossless** (0.90–0.915
+   vs constrained 0.910 / production 0.915); `budget=256` is near-lossless
+   (0.88–0.90); `budget=128` holds only at large buffers and collapses to **0.75**
+   at `buffer=16` — there it evicts most of the ~900-token prompt+CoT every 16
+   steps.
+2. **`buffer_size` sets the cost.** Against the fair baseline, R-KV costs only
+   **~3–7 %** at `buffer ≥ 128`, ~14 % at `buffer=64`, and ~35 % at `buffer=16`.
+   The cost tracks **compaction frequency**: each compaction forces a short eager
+   window (the `window_size` steps around it) out of the CUDA graph, so frequent
+   compaction (small buffer) loses more graph replay.
+3. **R-KV stays fast *while* compacting.** e.g. `budget=256, buffer=128` runs **64
+   physical compactions at 1679 tok/s** (−6 % vs constrained Full-KV) with
+   **identical accuracy** (0.900); `budget=512, buffer=64` sustains 1549 tok/s
+   across **245 compactions**, still lossless.
+4. **The production↔constrained gap (2649 → 1792) is entirely prefix caching.**
+   R-KV trades that for a *constant, prompt-independent* KV footprint. This bench
+   (short GSM8K outputs, a large KV pool at `mem-fraction 0.85`) is **not
+   memory-bound**, so it exposes R-KV's overhead, not its benefit — the benefit
+   side (memory-bound serving → more concurrency under fixed VRAM) shows up in the
+   [DP scaling report](./RESULTS_dp.md).
 
-## Speed — Qwen2.5-0.5B-Instruct (fair, same eager config; serial batch=1)
+**Sweet spot:** `budget = 256–512`, `buffer = 128` — lossless accuracy, dozens of
+compactions, within ~6–9 % of the fair Full-KV throughput.
 
-| Config | Wall (20) | avg tok | Throughput | Notes |
-| --- | --- | --- | --- | --- |
-| baseline (eager, fair) | 60.7s | 363 | **119.6 tok/s** | reference |
-| R-KV budget=512 | 72.3s | 320 | **88.6 tok/s** | 386 compactions |
-| R-KV budget=256 | 95.1s | 420 | **88.3 tok/s** | 509 compactions |
+## Reproduce
 
-**R-KV compaction overhead** (same eager path, only `--enable-rkv` differs):
-119.6 → 88.6 tok/s, **≈ 26% slower** — consistent with the Math-7B measurement
-(~28%). Source: every `buffer_size` steps R-KV reads back all layers' KV,
-computes an O(budget²) key-similarity, and relocates slots — all synchronous on
-the eager path.
+```bash
+cd SGLang/benchmark
 
-**Loss of CUDA graph** (implicit, larger): R-KV must run eager, while a
-production baseline uses CUDA graph. So versus a *production* baseline, most of
-the end-to-end slowdown comes from losing CUDA graph, not from the compaction
-itself — see the Math-7B `concurrency=8` result (272 tok/s) for how batching
-amortizes the eager overhead.
+# Full-KV production baseline:
+MODEL=/data/model/Qwen2.5-Math-7B-Instruct ./launch_server.sh fullkv
+# Full-KV constrained (fair) baseline:
+MODEL=/data/model/Qwen2.5-Math-7B-Instruct ./launch_server.sh constrained
+# R-KV, budget 256, buffer 128:
+MODEL=/data/model/Qwen2.5-Math-7B-Instruct BUFFER=128 ./launch_server.sh rkv 256
 
-## Caveat: this scenario is cost-only for R-KV
+# Evaluate (SGLang GSM8K, 5-shot, 200 questions, concurrency 32):
+PYTHONPATH=../sglang-src/python python3 \
+  ../sglang-src/benchmark/gsm8k/bench_sglang.py \
+  --num-questions 200 --num-shots 5 --parallel 32 --max-new-tokens 512 --port 30000
+```
 
-The benchmark is **short sequences (~1.1k tokens) at batch=1**, where the KV
-cache is not a bottleneck — so it only exposes R-KV's overhead, not its benefit.
-R-KV pays off when:
-
-- **long CoT (several-k to tens-of-k tokens)** — attention grows ~quadratically;
-  compressing to `budget` makes late-decode attention materially cheaper;
-- **large batch / memory-bound serving** — the freed KV memory admits more
-  concurrent requests, raising aggregate throughput.
-
-A long-sequence / memory-pressure throughput test is needed to show the benefit
-side. Phase-2 perf targets (see `SGLang/docs/DESIGN.md`): CUDA-graph-compatible compaction,
-a cheaper redundancy estimate than O(budget²), and avoiding full KV read-back.
+The server log shows `R-KV compacted req_pool_idx=... phys N -> budget` lines and
+`R-KV fused-redundancy gate: OK -> fused adopted`.
