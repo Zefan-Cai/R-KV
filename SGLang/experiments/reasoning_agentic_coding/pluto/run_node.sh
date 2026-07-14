@@ -180,6 +180,10 @@ if command -v aws >/dev/null 2>&1 && aws sts get-caller-identity >/dev/null 2>&1
 fi
 
 for arm in "${ARMS[@]}"; do
+  if [[ -f "$RESULT_ROOT/$arm/PILOT_COMPLETE" ]]; then
+    echo "arm=$arm already complete; preserving artifacts and skipping rerun"
+    continue
+  fi
   if [[ "$arm" == p-* ]]; then
     export LONG_MAX_TOKENS="${PREFILL_SMOKE_LONG_MAX_TOKENS:-128}"
   else
