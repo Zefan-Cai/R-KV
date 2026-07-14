@@ -46,8 +46,23 @@ def validate(root: Path) -> dict[str, Any]:
         if len(expected) != len(expected_set):
             raise ValueError(f"duplicate manifest IDs in {category}")
 
-        result_path = find_one(root / "result", f"BFCL_v4_{category}_result.json")
-        result_entries = read_jsonl(result_path)
+        result_paths = [
+            find_one(root / "result", f"BFCL_v4_{category}_result.json")
+        ]
+        prereq_ids = [entry_id for entry_id in expected if "prereq" in entry_id]
+        if prereq_ids:
+            # BFCL persists memory setup conversations separately from the
+            # scored targets. The run manifest contains both, so strict
+            # coverage must merge the official target and prerequisite files.
+            result_paths.append(
+                find_one(
+                    root / "result",
+                    f"BFCL_v4_{category}_prereq_result.json",
+                )
+            )
+        result_entries = [
+            entry for result_path in result_paths for entry in read_jsonl(result_path)
+        ]
         result_ids = [str(entry.get("id")) for entry in result_entries]
         if len(result_ids) != len(set(result_ids)):
             raise ValueError(f"duplicate generated result IDs in {category}")

@@ -66,13 +66,17 @@ class BfclValidationTest(unittest.TestCase):
         (root / "score/model/agentic/memory/kv").mkdir(parents=True)
         manifest = {"memory_kv": ["memory_kv_prereq_0", "memory_kv_1"]}
         (root / "test_case_ids_to_generate.json").write_text(json.dumps(manifest))
+        prereq_result_path = (
+            root
+            / "result/model/agentic/memory/kv/BFCL_v4_memory_kv_prereq_result.json"
+        )
+        prereq_result_path.write_text(
+            json.dumps({"id": "memory_kv_prereq_0", "result": "setup"}) + "\n"
+        )
         result_path = (
             root / "result/model/agentic/memory/kv/BFCL_v4_memory_kv_result.json"
         )
-        entries = [
-            {"id": "memory_kv_prereq_0", "result": "setup"},
-            {"id": "memory_kv_1", "result": result},
-        ]
+        entries = [{"id": "memory_kv_1", "result": result}]
         result_path.write_text("".join(json.dumps(value) + "\n" for value in entries))
         score_path = root / "score/model/agentic/memory/kv/BFCL_v4_memory_kv_score.json"
         score_path.write_text(
@@ -94,6 +98,12 @@ class BfclValidationTest(unittest.TestCase):
     def test_rejects_swallowed_inference_error(self) -> None:
         root = self.make_root("Error during inference: timeout")
         with self.assertRaisesRegex(ValueError, "inference errors"):
+            validate_bfcl_pilot.validate(root)
+
+    def test_rejects_missing_prerequisite_result_file(self) -> None:
+        root = self.make_root()
+        next(root.rglob("BFCL_v4_memory_kv_prereq_result.json")).unlink()
+        with self.assertRaisesRegex(ValueError, "expected one.*prereq_result"):
             validate_bfcl_pilot.validate(root)
 
 

@@ -94,3 +94,7 @@ the existing Qwen3 FC handler safely replay a malformed tool call that omitted
 a later outer turn from aborting with `KeyError`, and does not change datasets
 or scoring. After the crossover passes, expand to `d-8k`, `p-2k`,
 LiveCodeBench v6, and the fixed SWE-bench Verified subset described above.
+
+The completion validator follows BFCL's native memory artifact layout: it
+merges each category's `*_prereq_result.json` setup conversations with its
+`*_result.json` scored targets before checking full manifest coverage.
