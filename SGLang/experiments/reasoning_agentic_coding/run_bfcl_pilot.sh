@@ -29,9 +29,15 @@ if [[ ! -x "$BFCL_VENV/bin/python" ]]; then
     python3 -m venv "$BFCL_VENV"
   fi
 fi
-if [[ ! -f "$BFCL_VENV/.bfcl-$GORILLA_REVISION-ready" ]]; then
-  "$BFCL_VENV/bin/python" -m pip install -e "$GORILLA_DIR/berkeley-function-call-leaderboard"
-  touch "$BFCL_VENV/.bfcl-$GORILLA_REVISION-ready"
+bfcl_ready_marker="$BFCL_VENV/.bfcl-$GORILLA_REVISION-runtime-v2-ready"
+if [[ ! -f "$bfcl_ready_marker" ]]; then
+  # BFCL imports every registered Qwen handler at CLI startup. qwen-agent's
+  # handler imports soundfile, but the BFCL editable dependency set does not
+  # install it, so generation otherwise exits before its first request.
+  "$BFCL_VENV/bin/python" -m pip install \
+    -e "$GORILLA_DIR/berkeley-function-call-leaderboard" \
+    "soundfile==0.13.1"
+  touch "$bfcl_ready_marker"
 fi
 
 export BFCL_PROJECT_ROOT="$OUT_DIR"
