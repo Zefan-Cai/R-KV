@@ -100,7 +100,13 @@ case "$ARM" in
       if [[ "${EVALPLUS_MINI:-0}" == "1" ]]; then
         evalplus_args+=(--mini)
       fi
-      evalplus.evaluate "${evalplus_args[@]}" \
+      # Pluto fixes RLIMIT_STACK soft=hard at 10 MiB. EvalPlus 0.3.1 otherwise
+      # tries to raise that hard limit to its 4 GiB memory cap and every worker
+      # exits before executing generated code. -1 is EvalPlus' sentinel for
+      # disabling only its resource-limit block; the reliability guard and
+      # per-test timeouts still run.
+      EVALPLUS_MAX_MEMORY_BYTES="${EVALPLUS_MAX_MEMORY_BYTES:--1}" \
+        evalplus.evaluate "${evalplus_args[@]}" \
         2>&1 | tee -a "$OUT_DIR/evalplus.log"
       python "$HERE/validate_evalplus.py" \
         "$evalplus_root" \

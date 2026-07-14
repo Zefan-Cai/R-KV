@@ -32,6 +32,13 @@ The prefill lane targets deterministic BFCL V4 `multi_turn_long_context` and
 memory tasks, followed by a fixed SWE-bench Verified subset with mini-SWE-agent.
 Web-search BFCL tasks are excluded because their external state drifts.
 
+Pluto fixes the process stack hard limit at 10 MiB. EvalPlus 0.3.1 attempts to
+raise that limit to its default 4 GiB memory cap, which makes every worker exit
+before executing generated code. The harness therefore uses EvalPlus' `-1`
+memory-limit sentinel on Pluto; its destructive-call guard and per-test
+timeouts remain enabled. Validation rejects the characteristic all-timeout
+artifact so evaluator failure cannot be reported as model pass@1=0.
+
 Always report both aggregate and actually-triggered subsets. A benchmark with
 fewer than 20% compressed requests is a no-regression control, not evidence for
 compression quality.

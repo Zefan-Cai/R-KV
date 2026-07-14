@@ -58,12 +58,40 @@ def validate(root: Path, expected_tasks: int = 164) -> dict[str, Any]:
             f"expected={expected_tasks}"
         )
 
+    entries = [
+        entry
+        for task_entries in evaluated.values()
+        if isinstance(task_entries, list)
+        for entry in task_entries
+        if isinstance(entry, dict)
+    ]
+    if len(entries) != expected_tasks:
+        raise ValueError(
+            "unexpected EvalPlus result cardinality: "
+            f"entries={len(entries)} expected={expected_tasks}"
+        )
+    if entries and all(
+        entry.get("base_status") == "timeout"
+        and entry.get("plus_status") == "timeout"
+        for entry in entries
+    ):
+        raise ValueError(
+            "all EvalPlus tasks timed out; evaluator infrastructure failure"
+        )
+
+    base_passes = sum(entry.get("base_status") == "pass" for entry in entries)
+    plus_passes = sum(entry.get("plus_status") == "pass" for entry in entries)
+
     return {
         "valid": True,
         "expected_tasks": expected_tasks,
         "sample_count": len(rows),
         "unique_task_count": len(unique_task_ids),
         "evaluated_task_count": len(evaluated_ids),
+        "base_passes": base_passes,
+        "plus_passes": plus_passes,
+        "base_pass_at_1": base_passes / expected_tasks,
+        "plus_pass_at_1": plus_passes / expected_tasks,
         "samples": str(sample_path),
         "results": str(result_path),
     }

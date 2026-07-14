@@ -81,7 +81,13 @@ class EvalPlusValidationTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
-    def write_artifacts(self, sample_ids: list[str], evaluated_ids: list[str]) -> None:
+    def write_artifacts(
+        self,
+        sample_ids: list[str],
+        evaluated_ids: list[str],
+        *,
+        status: str = "pass",
+    ) -> None:
         samples = self.root / "humaneval/model_openai_temp_0.0.jsonl"
         samples.parent.mkdir(parents=True)
         samples.write_text(
@@ -92,13 +98,27 @@ class EvalPlusValidationTest(unittest.TestCase):
         )
         results = samples.with_name("model_openai_temp_0.0_eval_results.json")
         results.write_text(
-            json.dumps({"eval": {task_id: [{}] for task_id in evaluated_ids}})
+            json.dumps(
+                {
+                    "eval": {
+                        task_id: [
+                            {
+                                "base_status": status,
+                                "plus_status": status,
+                            }
+                        ]
+                        for task_id in evaluated_ids
+                    }
+                }
+            )
         )
 
     def test_accepts_matching_complete_coverage(self) -> None:
         self.write_artifacts(["HumanEval/0", "HumanEval/1"], ["HumanEval/0", "HumanEval/1"])
         summary = validate_evalplus.validate(self.root, expected_tasks=2)
         self.assertTrue(summary["valid"])
+        self.assertEqual(summary["base_passes"], 2)
+        self.assertEqual(summary["plus_passes"], 2)
 
     def test_rejects_duplicate_samples(self) -> None:
         self.write_artifacts(["HumanEval/0", "HumanEval/0"], ["HumanEval/0"])
@@ -108,6 +128,15 @@ class EvalPlusValidationTest(unittest.TestCase):
     def test_rejects_score_coverage_mismatch(self) -> None:
         self.write_artifacts(["HumanEval/0", "HumanEval/1"], ["HumanEval/0"])
         with self.assertRaisesRegex(ValueError, "coverage mismatch"):
+            validate_evalplus.validate(self.root, expected_tasks=2)
+
+    def test_rejects_all_timeout_infrastructure_failure(self) -> None:
+        self.write_artifacts(
+            ["HumanEval/0", "HumanEval/1"],
+            ["HumanEval/0", "HumanEval/1"],
+            status="timeout",
+        )
+        with self.assertRaisesRegex(ValueError, "infrastructure failure"):
             validate_evalplus.validate(self.root, expected_tasks=2)
 
 
