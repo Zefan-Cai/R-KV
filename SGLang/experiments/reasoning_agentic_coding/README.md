@@ -88,7 +88,9 @@ Results are written to the shared filesystem and, when pod credentials allow,
 incrementally mirrored to
 `s3://phidias/zcai/codex/rkv-sglang-eval-20260713/results/`.
 
-The bundled BFCL patch only registers the actual Qwen3-Coder checkpoint with
-BFCL's existing Qwen3 FC handler; it does not change datasets or scoring. After
-the crossover passes, expand to `d-8k`, `p-2k`, LiveCodeBench v6, and the fixed
-SWE-bench Verified subset described above.
+The bundled BFCL patches register the actual Qwen3-Coder checkpoint and make
+the existing Qwen3 FC handler safely replay a malformed tool call that omitted
+`arguments`. BFCL still records that call as incorrect; the guard only prevents
+a later outer turn from aborting with `KeyError`, and does not change datasets
+or scoring. After the crossover passes, expand to `d-8k`, `p-2k`,
+LiveCodeBench v6, and the fixed SWE-bench Verified subset described above.

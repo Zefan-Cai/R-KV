@@ -32,6 +32,16 @@ class BfclHarnessTest(unittest.TestCase):
         self.assertIn("export BFCL_LOCK_DIR", script)
         self.assertIn('os.getenv("BFCL_LOCK_DIR"', lock_patch)
 
+    def test_replays_argumentless_qwen_tool_calls_without_crashing(self) -> None:
+        script = (HERE / "run_bfcl_pilot.sh").read_text(encoding="utf-8")
+        history_patch = (HERE / "bfcl-qwen-tool-history.patch").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("bfcl-qwen-tool-history.patch", script)
+        self.assertIn('arguments = tool_call.get("arguments", {})', history_patch)
+        self.assertIn("decoder already records that call as incorrect", history_patch)
+
 
 class ServerSummaryTest(unittest.TestCase):
     def test_accepts_matching_decode_compaction(self) -> None:

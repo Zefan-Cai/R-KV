@@ -1,0 +1,24 @@
+diff --git a/berkeley-function-call-leaderboard/bfcl_eval/model_handler/local_inference/qwen_fc.py b/berkeley-function-call-leaderboard/bfcl_eval/model_handler/local_inference/qwen_fc.py
+--- a/berkeley-function-call-leaderboard/bfcl_eval/model_handler/local_inference/qwen_fc.py
++++ b/berkeley-function-call-leaderboard/bfcl_eval/model_handler/local_inference/qwen_fc.py
+@@ -211,11 +211,16 @@ class QwenFCHandler(OSSHandler):
+                         formatted_prompt += '<tool_call>\n{"name": "'
+                         formatted_prompt += tool_call["name"]
+                         formatted_prompt += '", "arguments": '
+-                        
+-                        if isinstance(tool_call["arguments"], str):
+-                            formatted_prompt += tool_call["arguments"]
++
++                        # A malformed model call can omit `arguments`. BFCL's
++                        # decoder already records that call as incorrect; replay it
++                        # with an empty object so a later outer turn is still scored
++                        # instead of aborting the entire case with KeyError.
++                        arguments = tool_call.get("arguments", {})
++                        if isinstance(arguments, str):
++                            formatted_prompt += arguments
+                         else:
+-                            formatted_prompt += json.dumps(tool_call["arguments"])
++                            formatted_prompt += json.dumps(arguments)
+                         
+                         formatted_prompt += "}\n</tool_call>"
+ 

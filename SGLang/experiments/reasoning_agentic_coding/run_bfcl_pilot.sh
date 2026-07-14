@@ -27,6 +27,10 @@ if ! git -C "$GORILLA_DIR" apply --reverse --check "$HERE/bfcl-local-lock-dir.pa
   git -C "$GORILLA_DIR" apply --check "$HERE/bfcl-local-lock-dir.patch"
   git -C "$GORILLA_DIR" apply "$HERE/bfcl-local-lock-dir.patch"
 fi
+if ! git -C "$GORILLA_DIR" apply --reverse --check "$HERE/bfcl-qwen-tool-history.patch" >/dev/null 2>&1; then
+  git -C "$GORILLA_DIR" apply --check "$HERE/bfcl-qwen-tool-history.patch"
+  git -C "$GORILLA_DIR" apply "$HERE/bfcl-qwen-tool-history.patch"
+fi
 if [[ ! -x "$BFCL_VENV/bin/python" ]]; then
   if command -v uv >/dev/null 2>&1; then
     uv venv --python 3.12 --seed "$BFCL_VENV"
