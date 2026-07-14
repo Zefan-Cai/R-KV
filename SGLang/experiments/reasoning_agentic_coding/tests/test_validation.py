@@ -14,6 +14,7 @@ sys.path.insert(0, str(HERE))
 
 import summarize_server_log  # noqa: E402
 import validate_bfcl_pilot  # noqa: E402
+import validate_evalplus  # noqa: E402
 
 
 class ServerSummaryTest(unittest.TestCase):
@@ -68,6 +69,44 @@ class BfclValidationTest(unittest.TestCase):
         root = self.make_root("Error during inference: timeout")
         with self.assertRaisesRegex(ValueError, "inference errors"):
             validate_bfcl_pilot.validate(root)
+
+
+class EvalPlusValidationTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def write_artifacts(self, sample_ids: list[str], evaluated_ids: list[str]) -> None:
+        samples = self.root / "humaneval/model_openai_temp_0.0.jsonl"
+        samples.parent.mkdir(parents=True)
+        samples.write_text(
+            "".join(
+                json.dumps({"task_id": task_id, "solution": "pass"}) + "\n"
+                for task_id in sample_ids
+            )
+        )
+        results = samples.with_name("model_openai_temp_0.0_eval_results.json")
+        results.write_text(
+            json.dumps({"eval": {task_id: [{}] for task_id in evaluated_ids}})
+        )
+
+    def test_accepts_matching_complete_coverage(self) -> None:
+        self.write_artifacts(["HumanEval/0", "HumanEval/1"], ["HumanEval/0", "HumanEval/1"])
+        summary = validate_evalplus.validate(self.root, expected_tasks=2)
+        self.assertTrue(summary["valid"])
+
+    def test_rejects_duplicate_samples(self) -> None:
+        self.write_artifacts(["HumanEval/0", "HumanEval/0"], ["HumanEval/0"])
+        with self.assertRaisesRegex(ValueError, "duplicate samples"):
+            validate_evalplus.validate(self.root, expected_tasks=2)
+
+    def test_rejects_score_coverage_mismatch(self) -> None:
+        self.write_artifacts(["HumanEval/0", "HumanEval/1"], ["HumanEval/0"])
+        with self.assertRaisesRegex(ValueError, "coverage mismatch"):
+            validate_evalplus.validate(self.root, expected_tasks=2)
 
 
 if __name__ == "__main__":

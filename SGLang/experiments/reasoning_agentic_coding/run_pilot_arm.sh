@@ -9,6 +9,10 @@ REPO_ROOT="$(cd "$HERE/../../.." && pwd)"
 PORT="${PORT:-30000}"
 MODEL_NAME="${SERVED_MODEL_NAME:-Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8}"
 mkdir -p "$OUT_DIR"
+if [[ -f "$OUT_DIR/PILOT_COMPLETE" ]]; then
+  echo "arm=$ARM already complete; preserving artifacts and skipping rerun"
+  exit 0
+fi
 
 SERVER_LOG="$OUT_DIR/server.log"
 PID_FILE="$OUT_DIR/server.pid"
@@ -70,15 +74,23 @@ case "$ARM" in
 
     if [[ "${RUN_EVALPLUS:-1}" == "1" ]]; then
       mkdir -p "$OUT_DIR/evalplus"
-      OPENAI_API_KEY=EMPTY evalplus.evaluate \
-        --model "$MODEL_NAME" \
-        --dataset humaneval \
-        --backend openai \
-        --base-url "http://127.0.0.1:$PORT/v1" \
-        --root "$OUT_DIR/evalplus" \
-        --parallel "${EVALPLUS_PARALLEL:-8}" \
-        --greedy \
-        --mini 2>&1 | tee "$OUT_DIR/evalplus.log"
+      evalplus_args=(
+        --model "$MODEL_NAME"
+        --dataset humaneval
+        --backend openai
+        --base-url "http://127.0.0.1:$PORT/v1"
+        --root "$OUT_DIR/evalplus"
+        --parallel "${EVALPLUS_PARALLEL:-8}"
+        --greedy
+      )
+      if [[ "${EVALPLUS_MINI:-0}" == "1" ]]; then
+        evalplus_args+=(--mini)
+      fi
+      OPENAI_API_KEY=EMPTY evalplus.evaluate "${evalplus_args[@]}" \
+        2>&1 | tee -a "$OUT_DIR/evalplus.log"
+      python "$HERE/validate_evalplus.py" \
+        "$OUT_DIR/evalplus" \
+        --output "$OUT_DIR/evalplus.validation.json"
     fi
     ;;
   p-*)
