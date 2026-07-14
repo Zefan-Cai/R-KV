@@ -73,23 +73,37 @@ case "$ARM" in
       --output "$OUT_DIR/aime24.jsonl"
 
     if [[ "${RUN_EVALPLUS:-1}" == "1" ]]; then
-      mkdir -p "$OUT_DIR/evalplus"
+      evalplus_root="$OUT_DIR/evalplus"
+      evalplus_model_name="${MODEL_NAME//\//--}_openai_temp_0.0"
+      evalplus_samples="$evalplus_root/humaneval/$evalplus_model_name.jsonl"
+      evalplus_results="${evalplus_samples%.jsonl}_eval_results.json"
+      mkdir -p "$(dirname "$evalplus_samples")"
+      python "$HERE/evalplus_codegen.py" \
+        --base-url "http://127.0.0.1:$PORT/v1" \
+        --model "$MODEL_NAME" \
+        --output "$evalplus_samples" \
+        --concurrency "${EVALPLUS_CODEGEN_CONCURRENCY:-8}" \
+        --max-tokens "${EVALPLUS_MAX_TOKENS:-768}" \
+        2>&1 | tee -a "$OUT_DIR/evalplus.log"
+      if [[ -f "$evalplus_results" ]] && ! python "$HERE/validate_evalplus.py" \
+        "$evalplus_root" \
+        --output "$OUT_DIR/evalplus.preexisting-validation.json"; then
+        invalid_result="$evalplus_results.invalid-$(date -u +%Y%m%dT%H%M%SZ)"
+        echo "quarantining incomplete EvalPlus result at $invalid_result"
+        mv "$evalplus_results" "$invalid_result"
+      fi
       evalplus_args=(
-        --model "$MODEL_NAME"
         --dataset humaneval
-        --backend openai
-        --base-url "http://127.0.0.1:$PORT/v1"
-        --root "$OUT_DIR/evalplus"
+        --samples "$evalplus_samples"
         --parallel "${EVALPLUS_PARALLEL:-8}"
-        --greedy
       )
       if [[ "${EVALPLUS_MINI:-0}" == "1" ]]; then
         evalplus_args+=(--mini)
       fi
-      OPENAI_API_KEY=EMPTY evalplus.evaluate "${evalplus_args[@]}" \
+      evalplus.evaluate "${evalplus_args[@]}" \
         2>&1 | tee -a "$OUT_DIR/evalplus.log"
       python "$HERE/validate_evalplus.py" \
-        "$OUT_DIR/evalplus" \
+        "$evalplus_root" \
         --output "$OUT_DIR/evalplus.validation.json"
     fi
     ;;

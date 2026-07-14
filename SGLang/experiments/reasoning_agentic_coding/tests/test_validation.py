@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE))
@@ -15,6 +16,7 @@ sys.path.insert(0, str(HERE))
 import summarize_server_log  # noqa: E402
 import validate_bfcl_pilot  # noqa: E402
 import validate_evalplus  # noqa: E402
+import evalplus_codegen  # noqa: E402
 
 
 class ServerSummaryTest(unittest.TestCase):
@@ -107,6 +109,113 @@ class EvalPlusValidationTest(unittest.TestCase):
         self.write_artifacts(["HumanEval/0", "HumanEval/1"], ["HumanEval/0"])
         with self.assertRaisesRegex(ValueError, "coverage mismatch"):
             validate_evalplus.validate(self.root, expected_tasks=2)
+
+
+class EvalPlusCodegenTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.path = Path(self.temp_dir.name) / "samples.jsonl"
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def test_repairs_only_malformed_trailing_record(self) -> None:
+        self.path.write_text(
+            json.dumps({"task_id": "HumanEval/0", "solution": "pass"})
+            + "\n{\"task_id\":",
+            encoding="utf-8",
+        )
+        existing = evalplus_codegen.load_existing(self.path)
+        self.assertEqual(set(existing), {"HumanEval/0"})
+        self.assertEqual(len(self.path.read_text().splitlines()), 1)
+
+    def test_normalizes_valid_record_without_newline(self) -> None:
+        self.path.write_text(
+            json.dumps({"task_id": "HumanEval/0", "solution": "pass"}),
+            encoding="utf-8",
+        )
+        evalplus_codegen.load_existing(self.path)
+        self.assertTrue(self.path.read_text(encoding="utf-8").endswith("\n"))
+
+    def test_rejects_duplicate_task_ids(self) -> None:
+        row = json.dumps({"task_id": "HumanEval/0", "solution": "pass"})
+        self.path.write_text(f"{row}\n{row}\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "duplicate task_id"):
+            evalplus_codegen.load_existing(self.path)
+
+    def test_generate_resumes_only_missing_tasks(self) -> None:
+        self.path.write_text(
+            json.dumps({"task_id": "HumanEval/0", "solution": "existing"}) + "\n",
+            encoding="utf-8",
+        )
+        dataset = {
+            "HumanEval/0": {"prompt": "def zero():", "entry_point": "zero"},
+            "HumanEval/1": {"prompt": "def one():", "entry_point": "one"},
+        }
+        response = {"choices": [{"message": {"content": "```python\nreturn 1\n```"}}]}
+        with mock.patch.object(
+            evalplus_codegen, "request_completion", return_value=response
+        ) as request:
+            summary = evalplus_codegen.generate(
+                base_url="http://server/v1",
+                model="model",
+                output=self.path,
+                concurrency=2,
+                max_tokens=768,
+                dataset=dataset,
+                sanitizer=lambda value, **_: f"sanitized:{value}",
+            )
+        self.assertEqual(
+            summary,
+            {"existing": 1, "generated": 1, "legacy_missing_raw": 1, "total": 2},
+        )
+        self.assertEqual(request.call_count, 1)
+        rows = [json.loads(line) for line in self.path.read_text().splitlines()]
+        self.assertEqual({row["task_id"] for row in rows}, set(dataset))
+
+    def test_openai_payload_matches_evalplus_provider(self) -> None:
+        messages = [
+            {"role": "system", "content": evalplus_codegen.SYSTEM_MESSAGE},
+            {"role": "user", "content": "prompt"},
+        ]
+        with mock.patch.object(evalplus_codegen, "request_json", return_value={}) as request:
+            evalplus_codegen.request_completion(
+                "http://server/v1", "model", messages, max_tokens=768
+            )
+        request.assert_called_once_with(
+            "http://server/v1/chat/completions",
+            {
+                "model": "model",
+                "messages": messages,
+                "max_tokens": 768,
+                "temperature": 0.0,
+                "n": 1,
+                "top_p": 0.95,
+            },
+        )
+
+    def test_drops_orphan_raw_record_before_resume(self) -> None:
+        raw_path = self.path.with_name("samples.raw.jsonl")
+        raw_path.write_text(
+            json.dumps({"task_id": "HumanEval/1", "solution": "orphan"}) + "\n",
+            encoding="utf-8",
+        )
+        dataset = {"HumanEval/1": {"prompt": "def one():", "entry_point": "one"}}
+        response = {"choices": [{"message": {"content": "solution"}}]}
+        with mock.patch.object(
+            evalplus_codegen, "request_completion", return_value=response
+        ):
+            evalplus_codegen.generate(
+                base_url="http://server/v1",
+                model="model",
+                output=self.path,
+                concurrency=1,
+                max_tokens=768,
+                dataset=dataset,
+                sanitizer=lambda value, **_: value,
+            )
+        raw_rows = [json.loads(line) for line in raw_path.read_text().splitlines()]
+        self.assertEqual(raw_rows, [{"task_id": "HumanEval/1", "solution": "solution"}])
 
 
 if __name__ == "__main__":
