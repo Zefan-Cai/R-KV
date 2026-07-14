@@ -139,6 +139,19 @@ class EvalPlusValidationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "infrastructure failure"):
             validate_evalplus.validate(self.root, expected_tasks=2)
 
+    def test_plus_score_requires_base_and_extra_tests(self) -> None:
+        self.write_artifacts(
+            ["HumanEval/0", "HumanEval/1"],
+            ["HumanEval/0", "HumanEval/1"],
+        )
+        results = next(self.root.glob("**/*_eval_results.json"))
+        payload = json.loads(results.read_text())
+        payload["eval"]["HumanEval/1"][0]["base_status"] = "fail"
+        results.write_text(json.dumps(payload))
+        summary = validate_evalplus.validate(self.root, expected_tasks=2)
+        self.assertEqual(summary["base_passes"], 1)
+        self.assertEqual(summary["plus_passes"], 1)
+
 
 class EvalPlusCodegenTest(unittest.TestCase):
     def setUp(self) -> None:

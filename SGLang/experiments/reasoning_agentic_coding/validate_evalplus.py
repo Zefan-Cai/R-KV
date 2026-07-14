@@ -80,7 +80,14 @@ def validate(root: Path, expected_tasks: int = 164) -> dict[str, Any]:
         )
 
     base_passes = sum(entry.get("base_status") == "pass" for entry in entries)
-    plus_passes = sum(entry.get("plus_status") == "pass" for entry in entries)
+    # EvalPlus reports HumanEval+ as passing both the original base tests and
+    # the extra tests. `plus_status` alone only represents the extra-test side
+    # and can be `pass` even when `base_status` is `fail`.
+    plus_passes = sum(
+        entry.get("base_status") == "pass"
+        and entry.get("plus_status") == "pass"
+        for entry in entries
+    )
 
     return {
         "valid": True,
