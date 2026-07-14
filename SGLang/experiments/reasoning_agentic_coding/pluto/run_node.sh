@@ -22,15 +22,18 @@ MODEL_REVISION="003f183a92fbe5b9a8325aaa8b2ae797c91dd90f"
 # the shared flock lets either lane resume the single writer safely.
 MODEL_ROOT="${MODEL_ROOT:-$SHARED_ROOT/models}"
 MODEL_DIR="$MODEL_ROOT/Qwen3-Coder-480B-A35B-Instruct-FP8-$MODEL_REVISION"
+MODEL_SECONDARY_ROOT="${MODEL_SECONDARY_ROOT:-/sensei-fs-3/users/zcai/$CAMPAIGN/models}"
+MODEL_SECONDARY_DIR="$MODEL_SECONDARY_ROOT/Qwen3-Coder-480B-A35B-Instruct-FP8-$MODEL_REVISION"
 VENV="/mnt/localssd/rkv-sglang-venv"
 SGLANG_INSTALL_MODE="${SGLANG_INSTALL_MODE:-wheel}"
 export HF_HOME="${HF_HOME:-/mnt/localssd/.cache/huggingface}"
-# Reclaimable allocations lose node-local package caches. Persist only public
-# wheels/build artifacts on Sensei FS so later allocations spend their window
-# on model/evaluation work; credentials remain in the private local HF cache.
-export PIP_CACHE_DIR="${PIP_CACHE_DIR:-$SHARED_ROOT/bootstrap-cache/pip}"
-export UV_CACHE_DIR="${UV_CACHE_DIR:-$SHARED_ROOT/bootstrap-cache/uv}"
-mkdir -p "$RESULT_ROOT" "$MODEL_ROOT" "$HF_HOME" "$PIP_CACHE_DIR" "$UV_CACHE_DIR"
+# Keep package caches node-local. The two persistent project quotas are reserved
+# for the roughly 450 GiB checkpoint and its small result artifacts.
+export PIP_CACHE_DIR="${PIP_CACHE_DIR:-/mnt/localssd/.cache/pip}"
+export UV_CACHE_DIR="${UV_CACHE_DIR:-/mnt/localssd/.cache/uv}"
+mkdir -p \
+  "$RESULT_ROOT" "$MODEL_ROOT" "$MODEL_SECONDARY_ROOT" "$HF_HOME" \
+  "$PIP_CACHE_DIR" "$UV_CACHE_DIR"
 default_hf_token="$HOME/.cache/huggingface/token"
 if [[ "$HF_HOME/token" != "$default_hf_token" && -s "$default_hf_token" && ! -s "$HF_HOME/token" ]]; then
   install -m 600 "$default_hf_token" "$HF_HOME/token"
@@ -39,13 +42,6 @@ exec > >(tee -a "$RESULT_ROOT/node.log") 2>&1
 
 echo "role=$ROLE arms=${ARMS[*]} host=$(hostname) started_utc=$(date -u +%FT%TZ)"
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
-
-available_kib="$(df -Pk "$MODEL_ROOT" | awk 'NR==2 {print $4}')"
-required_kib="${MODEL_REQUIRED_KIB:-629145600}"
-if (( available_kib < required_kib )); then
-  echo "insufficient local NVMe for checkpoint: available_kib=$available_kib required_kib=$required_kib" >&2
-  exit 1
-fi
 
 if ! command -v uv >/dev/null 2>&1; then
   python3 -m pip install --user --upgrade uv
@@ -125,11 +121,8 @@ python tests/test_rkv_redundancy_fused.py
   if [[ ! -f "$MODEL_DIR/MODEL_READY" ]]; then
     mkdir -p "$MODEL_DIR"
     if [[ -n "${MODEL_RSYNC_HOST:-}" ]]; then
-      rsync -a --partial --whole-file --no-compress \
-        --contimeout=30 --timeout=300 --info=progress2 \
-        --exclude='.cache/' --exclude='MODEL_READY' \
-        "rsync://${MODEL_RSYNC_HOST}:${MODEL_RSYNC_PORT:-18731}/model/" \
-        "$MODEL_DIR/"
+      echo "MODEL_RSYNC_HOST is incompatible with the quota-striped checkpoint" >&2
+      exit 2
     else
       hf_token_path="${HF_TOKEN_PATH:-$HF_HOME/token}"
       for _ in $(seq 1 "${HF_TOKEN_WAIT_POLLS:-120}"); do
@@ -144,12 +137,89 @@ python tests/test_rkv_redundancy_fused.py
         exit 1
       fi
       export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
-      hf download "$MODEL_ID" \
-        --revision "$MODEL_REVISION" \
-        --local-dir "$MODEL_DIR"
+      if [[ -n "$MODEL_SECONDARY_ROOT" ]]; then
+        mkdir -p "$MODEL_SECONDARY_DIR"
+        # Each Sensei project quota holds about half this model. Keep shards
+        # 1-24 on the primary mount and 25-49 on the independent secondary
+        # mount, leaving enough headroom for metadata and final markers.
+        find "$MODEL_DIR/.cache/huggingface/download" \
+          -type f -name '*.incomplete' -delete 2>/dev/null || true
+
+        for index in $(seq 25 49); do
+          shard="$(printf 'model-%05d-of-00049.safetensors' "$index")"
+          primary_shard="$MODEL_DIR/$shard"
+          secondary_shard="$MODEL_SECONDARY_DIR/$shard"
+          if [[ -f "$primary_shard" && ! -L "$primary_shard" ]]; then
+            primary_size="$(stat -c %s "$primary_shard")"
+            # Always rerun rsync: an interrupted prior migration may leave a
+            # non-empty but incomplete destination that must be resumed.
+            rsync -a --partial "$primary_shard" "$MODEL_SECONDARY_DIR/"
+            secondary_size="$(stat -c %s "$secondary_shard")"
+            if [[ "$primary_size" != "$secondary_size" ]]; then
+              echo "shard migration size mismatch: $shard" >&2
+              exit 1
+            fi
+            rm -f "$primary_shard"
+            ln -s "$secondary_shard" "$primary_shard"
+          fi
+        done
+
+        hf download "$MODEL_ID" \
+          --revision "$MODEL_REVISION" \
+          --exclude 'model-*.safetensors' \
+          --local-dir "$MODEL_SECONDARY_DIR"
+
+        missing_primary_shards=()
+        missing_secondary_shards=()
+        for index in $(seq 1 49); do
+          shard="$(printf 'model-%05d-of-00049.safetensors' "$index")"
+          if [[ ! -s "$MODEL_DIR/$shard" && ! -s "$MODEL_SECONDARY_DIR/$shard" ]]; then
+            if (( index <= 24 )); then
+              missing_primary_shards+=("$shard")
+            else
+              missing_secondary_shards+=("$shard")
+            fi
+          fi
+        done
+        if (( ${#missing_primary_shards[@]} > 0 )); then
+          printf 'downloading %d missing shards on primary Sensei mount\n' \
+            "${#missing_primary_shards[@]}"
+          hf download "$MODEL_ID" "${missing_primary_shards[@]}" \
+            --revision "$MODEL_REVISION" \
+            --local-dir "$MODEL_DIR"
+        fi
+        if (( ${#missing_secondary_shards[@]} > 0 )); then
+          printf 'downloading %d missing shards on secondary Sensei mount\n' \
+            "${#missing_secondary_shards[@]}"
+          hf download "$MODEL_ID" "${missing_secondary_shards[@]}" \
+            --revision "$MODEL_REVISION" \
+            --local-dir "$MODEL_SECONDARY_DIR"
+        fi
+
+        while IFS= read -r -d '' source_path; do
+          relative_path="${source_path#"$MODEL_SECONDARY_DIR/"}"
+          destination_path="$MODEL_DIR/$relative_path"
+          if [[ ! -e "$destination_path" ]]; then
+            mkdir -p "$(dirname "$destination_path")"
+            [[ -L "$destination_path" ]] && rm -f "$destination_path"
+            ln -s "$source_path" "$destination_path"
+          fi
+        done < <(
+          find "$MODEL_SECONDARY_DIR" \
+            -path "$MODEL_SECONDARY_DIR/.cache" -prune -o \
+            -type f -print0
+        )
+      else
+        hf download "$MODEL_ID" \
+          --revision "$MODEL_REVISION" \
+          --local-dir "$MODEL_DIR"
+      fi
     fi
     test -s "$MODEL_DIR/config.json"
     test -s "$MODEL_DIR/tokenizer_config.json"
+    for index in $(seq 1 49); do
+      test -s "$MODEL_DIR/$(printf 'model-%05d-of-00049.safetensors' "$index")"
+    done
     touch "$MODEL_DIR/MODEL_READY"
   fi
 ) 9>"$MODEL_ROOT/qwen3-coder-480b.lock"

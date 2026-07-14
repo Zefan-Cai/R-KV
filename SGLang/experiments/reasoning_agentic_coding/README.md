@@ -39,11 +39,18 @@ compression quality.
 ## Pluto pilot
 
 The Pluto entrypoints provision one H200 P1 node and one H200 P2 node. Because
-the 450 GiB checkpoint transfer is longer than observed reclaim windows, its
-partial shards and final `MODEL_READY` marker persist under
-`/sensei-fs/users/zcai/rkv-sglang-eval-20260713/models`; a shared `flock` keeps
-the P1/P2 download resumable and single-writer. Results live beside it under
-the campaign root. The nodes run the CPU and H200 fused-kernel parity suites.
+the 450 GiB checkpoint transfer is longer than observed reclaim windows and
+larger than one roughly 250 GiB Sensei project quota, finalized shards are
+striped across
+`/sensei-fs/users/zcai/rkv-sglang-eval-20260713/models` and
+`/sensei-fs-3/users/zcai/rkv-sglang-eval-20260713/models`. The primary model
+directory retains shards 1-24 and symlinks secondary shards 25-49 into one
+loader-visible checkpoint. Package caches stay on node-local NVMe so the two
+persistent quotas retain safety headroom. A
+shared `flock` keeps the P1/P2 transfer resumable and single-writer, and the
+final `MODEL_READY` marker is written only after all 49 shards validate.
+Results live under the primary campaign root. The nodes run the CPU and H200
+fused-kernel parity suites.
 To reduce cold-start time, the default bootstrap uses the v0.5.14 wheel for
 dependencies/native artifacts and overlays the exact patched `49e384ce` Python
 tree for this HTTP-only campaign; a full Rust/protoc source build remains
@@ -60,9 +67,9 @@ health probes plus a deterministic BFCL V4 long-context/memory pilot with all
 required memory setup dependencies. The server context cap is 65,536 tokens
 for these pilot slices.
 
-For a reclaimed P2 allocation, `MODEL_RSYNC_HOST=<P1 pod IP>` and optional
-`MODEL_RSYNC_PORT` stage the already-verified public checkpoint from P1 over the
-pod network instead of repeating the 450 GiB Hugging Face transfer.
+The earlier whole-checkpoint `MODEL_RSYNC_HOST` shortcut is intentionally
+disabled: it would place all 449 GiB on the primary quota and reproduce the
+failure. Either lane instead resumes the same deterministic 24/25-shard split.
 
 Results are written to the shared filesystem and, when pod credentials allow,
 incrementally mirrored to
