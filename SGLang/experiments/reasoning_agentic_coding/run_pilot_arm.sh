@@ -67,7 +67,7 @@ case "$ARM" in
       --model "$MODEL_NAME" \
       aime \
       --data "$REPO_ROOT/HuggingFace/data/aime24.jsonl" \
-      --limit "${AIME_LIMIT:-5}" \
+      --limit "${AIME_LIMIT:-30}" \
       --concurrency "${AIME_CONCURRENCY:-2}" \
       --max-tokens "${AIME_MAX_TOKENS:-8192}" \
       --output "$OUT_DIR/aime24.jsonl"

@@ -54,10 +54,11 @@ R-KV effects:
 - P1 order: `d-full`, `d-4k`, `p-full`, `p-4k`
 - P2 order: `d-4k`, `d-full`, `p-4k`, `p-full`
 
-Each decode arm runs short/tool/forced-long probes, AIME24 pilot questions, and
-HumanEval+ through EvalPlus. Each prefill arm runs the same health probes plus a
-deterministic BFCL V4 long-context/memory pilot with all required memory setup
-dependencies. The server context cap is 65,536 tokens for these pilot slices.
+Each decode arm runs short/tool/forced-long probes, all 30 bundled AIME24
+questions, and HumanEval+ through EvalPlus. Each prefill arm runs the same
+health probes plus a deterministic BFCL V4 long-context/memory pilot with all
+required memory setup dependencies. The server context cap is 65,536 tokens
+for these pilot slices.
 
 For a reclaimed P2 allocation, `MODEL_RSYNC_HOST=<P1 pod IP>` and optional
 `MODEL_RSYNC_PORT` stage the already-verified public checkpoint from P1 over the
