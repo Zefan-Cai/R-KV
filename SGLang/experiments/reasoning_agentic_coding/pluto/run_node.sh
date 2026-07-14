@@ -17,7 +17,10 @@ ATTEMPT_ID="${ATTEMPT_ID:-pilot-v1}"
 RESULT_ROOT="$SHARED_ROOT/results/$ROLE/$ATTEMPT_ID"
 MODEL_ID="Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8"
 MODEL_REVISION="003f183a92fbe5b9a8325aaa8b2ae797c91dd90f"
-MODEL_ROOT="${MODEL_ROOT:-/mnt/localssd/rkv-models}"
+# Reclaimable P1/P2 allocations cannot reliably finish a 450 GiB checkpoint
+# transfer on node-local NVMe. Sensei FS preserves partial shards across runs;
+# the shared flock lets either lane resume the single writer safely.
+MODEL_ROOT="${MODEL_ROOT:-$SHARED_ROOT/models}"
 MODEL_DIR="$MODEL_ROOT/Qwen3-Coder-480B-A35B-Instruct-FP8-$MODEL_REVISION"
 VENV="/mnt/localssd/rkv-sglang-venv"
 SGLANG_INSTALL_MODE="${SGLANG_INSTALL_MODE:-wheel}"
