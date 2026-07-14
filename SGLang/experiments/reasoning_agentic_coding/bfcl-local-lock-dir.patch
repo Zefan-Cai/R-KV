@@ -1,0 +1,15 @@
+diff --git a/berkeley-function-call-leaderboard/bfcl_eval/constants/eval_config.py b/berkeley-function-call-leaderboard/bfcl_eval/constants/eval_config.py
+index ad587bb..1de899e 100644
+--- a/berkeley-function-call-leaderboard/bfcl_eval/constants/eval_config.py
++++ b/berkeley-function-call-leaderboard/bfcl_eval/constants/eval_config.py
+@@ -24,7 +24,9 @@ SCORE_PATH = PROJECT_ROOT / "score"
+ DOTENV_PATH = PROJECT_ROOT / ".env"
+ TEST_IDS_TO_GENERATE_PATH = PROJECT_ROOT / "test_case_ids_to_generate.json"
+ # Directory that stores all lock files (kept out of the results tree)
+-LOCK_DIR = PROJECT_ROOT / ".file_locks"
++LOCK_DIR = Path(
++    os.getenv("BFCL_LOCK_DIR", str(PROJECT_ROOT / ".file_locks"))
++)
+ 
+ PROMPT_PATH = PACKAGE_ROOT / "data"
+ MULTI_TURN_FUNC_DOC_PATH = PROMPT_PATH / "multi_turn_func_doc"

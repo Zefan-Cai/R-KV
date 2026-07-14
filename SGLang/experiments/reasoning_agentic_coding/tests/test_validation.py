@@ -19,6 +19,20 @@ import validate_evalplus  # noqa: E402
 import evalplus_codegen  # noqa: E402
 
 
+class BfclHarnessTest(unittest.TestCase):
+    def test_uses_node_local_lock_dir_without_moving_artifacts(self) -> None:
+        script = (HERE / "run_bfcl_pilot.sh").read_text(encoding="utf-8")
+        lock_patch = (HERE / "bfcl-local-lock-dir.patch").read_text(encoding="utf-8")
+
+        self.assertIn(
+            'BFCL_LOCK_DIR="${BFCL_LOCK_DIR:-/mnt/localssd/rkv-bfcl-locks}"',
+            script,
+        )
+        self.assertIn('export BFCL_PROJECT_ROOT="$OUT_DIR"', script)
+        self.assertIn("export BFCL_LOCK_DIR", script)
+        self.assertIn('os.getenv("BFCL_LOCK_DIR"', lock_patch)
+
+
 class ServerSummaryTest(unittest.TestCase):
     def test_accepts_matching_decode_compaction(self) -> None:
         summary = summarize_server_log.summarize(

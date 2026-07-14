@@ -74,6 +74,12 @@ health probes plus a deterministic BFCL V4 long-context/memory pilot with all
 required memory setup dependencies. The server context cap is 65,536 tokens
 for these pilot slices.
 
+BFCL result and score artifacts remain under each arm's shared `OUT_DIR`, but
+its high-frequency `filelock` metadata lives in
+`/mnt/localssd/rkv-bfcl-locks` by default. Override `BFCL_LOCK_DIR` only when a
+different node-local path is required; local locks are safe here because each
+arm has exactly one writer.
+
 The earlier whole-checkpoint `MODEL_RSYNC_HOST` shortcut is intentionally
 disabled: it would place all 449 GiB on the primary quota and reproduce the
 failure. Either lane instead resumes the same deterministic 24/25-shard split.
