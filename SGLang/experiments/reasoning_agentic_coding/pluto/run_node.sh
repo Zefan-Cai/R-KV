@@ -126,6 +126,18 @@ python tests/test_rkv_redundancy_fused.py
         "rsync://${MODEL_RSYNC_HOST}:${MODEL_RSYNC_PORT:-18731}/model/" \
         "$MODEL_DIR/"
     else
+      hf_token_path="${HF_TOKEN_PATH:-$HF_HOME/token}"
+      for _ in $(seq 1 "${HF_TOKEN_WAIT_POLLS:-120}"); do
+        if [[ -n "${HF_TOKEN:-}" || -s "$hf_token_path" ]]; then
+          break
+        fi
+        echo "waiting for private HF token file at $hf_token_path"
+        sleep 5
+      done
+      if [[ -z "${HF_TOKEN:-}" && ! -s "$hf_token_path" ]]; then
+        echo "HF token unavailable; refusing an unauthenticated 450 GiB transfer" >&2
+        exit 1
+      fi
       export HF_HUB_DISABLE_XET="${HF_HUB_DISABLE_XET:-1}"
       hf download "$MODEL_ID" \
         --revision "$MODEL_REVISION" \
