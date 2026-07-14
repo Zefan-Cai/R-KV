@@ -25,7 +25,12 @@ MODEL_DIR="$MODEL_ROOT/Qwen3-Coder-480B-A35B-Instruct-FP8-$MODEL_REVISION"
 VENV="/mnt/localssd/rkv-sglang-venv"
 SGLANG_INSTALL_MODE="${SGLANG_INSTALL_MODE:-wheel}"
 export HF_HOME="${HF_HOME:-/mnt/localssd/.cache/huggingface}"
-mkdir -p "$RESULT_ROOT" "$MODEL_ROOT" "$HF_HOME"
+# Reclaimable allocations lose node-local package caches. Persist only public
+# wheels/build artifacts on Sensei FS so later allocations spend their window
+# on model/evaluation work; credentials remain in the private local HF cache.
+export PIP_CACHE_DIR="${PIP_CACHE_DIR:-$SHARED_ROOT/bootstrap-cache/pip}"
+export UV_CACHE_DIR="${UV_CACHE_DIR:-$SHARED_ROOT/bootstrap-cache/uv}"
+mkdir -p "$RESULT_ROOT" "$MODEL_ROOT" "$HF_HOME" "$PIP_CACHE_DIR" "$UV_CACHE_DIR"
 default_hf_token="$HOME/.cache/huggingface/token"
 if [[ "$HF_HOME/token" != "$default_hf_token" && -s "$default_hf_token" && ! -s "$HF_HOME/token" ]]; then
   install -m 600 "$default_hf_token" "$HF_HOME/token"
