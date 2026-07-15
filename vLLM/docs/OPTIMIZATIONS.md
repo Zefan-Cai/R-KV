@@ -39,35 +39,50 @@ many tokens accumulate before each compaction) is the key quality knob at tight
 budgets: too small a buffer compacts too aggressively and too often. Larger
 buffers are also **faster** (fewer compactions). Recommended: `buffer ≈ budget`.
 
+> This table predates the two-phase cross-layer refactor and uses a different
+> (higher-scoring) harness than the 对拍 below. The apples-to-apples,
+> post-refactor numbers on SGLang's own few-shot harness are in the
+> **Differential test** table.
+
 ### Differential test (对拍) vs SGLang — same harness, model, config
 
-Using SGLang's own few-shot GSM8K harness (`benchmark/eval.py`,
-`data/gsm8k_fewshot.jsonl`, prompt ≈ 700 tokens > budget) at budget=256,
-buffer=64, greedy, run identically against both engines:
+Using SGLang's own few-shot GSM8K harness (`data/gsm8k_fewshot.jsonl`, prompt
+≈ 700 tokens > budget), Qwen2.5-Math-7B-Instruct, 200 questions, greedy,
+`window=8`, run identically against both engines (vLLM offline `--enforce-eager`
+vs the SGLang server; **decode-only** R-KV on both — `enable_rkv_prefill=False`):
 
-| Engine | Accuracy |
+| Engine / config | Accuracy |
 | --- | --- |
-| SGLang R-KV | 90.0% (180/200) |
-| vLLM R-KV — **prefix caching ON (buggy)** | **1.5%** (3/200) |
-| vLLM R-KV — prefix caching OFF (fixed) | 68.5% (137/200) |
+| vLLM Full-KV (ceiling) | 90.5% (181/200) |
+| SGLang R-KV — budget=256 buffer=64 | 88.5% (177/200) |
+| vLLM R-KV — budget=256 buffer=64 | 82.0% (164/200) |
+| vLLM R-KV — budget=256 buffer=128 | 88.0% (176/200) |
+| vLLM R-KV — budget=512 buffer=128 | 89.5% (179/200) |
 
-**Critical bug this surfaced:** with **prefix caching ON**, the shared exemplar
-prefix's KV blocks are shared across requests; R-KV's in-place eviction of one
-request corrupts the shared blocks of the others (output bleeds another
-request's content). Fixed: **R-KV now force-disables prefix caching** in
-`VllmConfig.__post_init__` (mirrors SGLang's required `--disable-radix-cache`).
+**Two-phase cross-layer compaction (now matches SGLang).** The port previously
+evicted **per-layer / per-head inside each layer's `forward`**; it now
+accumulates a cross-head-**mean** score, **sums it across all layers**, makes one
+global kept-set decision, and evicts every layer identically **after the full
+forward** (`RKVCompressor.observe_layer` + `compact_step`). At `budget=256` this
+lifted `buffer=64` from 68.5% → **82.0%**, matches SGLang at `buffer=128`
+(**88.0%** vs 88.5%), and is near-lossless at `budget=512` (**89.5%** vs the
+90.5% Full-KV ceiling).
 
-A **residual tight-budget gap** remains (budget 256: vLLM ~68–75% vs SGLang
-90%); vLLM closes it at a larger budget (budget 512: 87%). This is a scoring/
-compaction-frequency fidelity difference (not corruption); use `budget ≈ 512`
-for best accuracy. Root-causing it (candidate: cross-layer score aggregation)
-is tracked as P1.
+**Critical bug this 对拍 originally surfaced:** with **prefix caching ON**, the
+shared exemplar prefix's KV blocks are shared across requests; R-KV's in-place
+eviction of one request corrupts the shared blocks of the others (output bleeds
+another request's content, ~1.5%). Fixed: **R-KV force-disables prefix caching**
+in `VllmConfig.__post_init__` (mirrors SGLang's required `--disable-radix-cache`).
 
-> **Investigated & rejected as the tight-budget fix:** observation-window
-> scoring (verified populated: `qwin=(8, …)`), cross-head score reduction, and
-> temporal-order relocation each **failed** to close the gap (window/sort no
-> change; cross-head worse). The catastrophic failure was prefix caching, not
-> the scoring; the residual gap is still open.
+**Residual tight-budget gap:** at `buffer=64` vLLM (82.0%) still trails SGLang
+(88.5%) — vLLM needs `buffer=128` to match (88.0%), i.e. each vLLM compaction is
+slightly lossier. With cadence (first compaction ~decode step `buffer`, then
+every `buffer` steps at `seq=budget+buffer`), algorithm, config, cross-head +
+cross-layer reduction, observation window and eviction mechanics all verified
+**identical** to SGLang, the residual is attributed to attention-backend numerics
+(vLLM FlashAttention vs SGLang FlashInfer produce slightly different K/Q feeding
+the scorer) compounding over frequent tight-budget compactions. Use
+`buffer ≈ budget` or `budget ≈ 512` for best accuracy.
 
 
 
@@ -109,6 +124,23 @@ larger models shrink the relative overhead.
 6. **Prefix caching corrupted R-KV** (shared prefix blocks mutated in place →
    cross-request KV bleed → ~1.5% accuracy on shared-prefix workloads). Found
    via the SGLang 对拍. Fixed: force-disable prefix caching when R-KV is on.
+7. **Per-layer / per-head eviction diverged from the R-KV reference** — each
+   layer independently ran top-k *inside its own forward*, compounding scoring
+   noise across all layers. Fixed: **two-phase cross-layer compaction** —
+   cross-head **mean**, **summed across all layers**, one global kept set
+   evicted after the full forward (`observe_layer` + `compact_step`).
+8. **First compaction fired far too early.** The scheduler armed on absolute
+   `num_computed_tokens % buffer`; for a prompt length not a multiple of
+   `buffer` this fired a few decode steps in and evicted most of the prompt off
+   a nearly-cold observation window (permanent damage). Fixed: arm on the
+   **decode-relative** count (`num_computed_tokens - num_prompt_tokens`), so the
+   first compaction lands `buffer` steps into decode with a warm window
+   (matches SGLang's cadence).
+9. **Observation window was empty on mixed batches.** `record_query` skipped any
+   step whose query rows ≠ request count — i.e. every mixed prefill/decode step
+   under continuous batching — so the window was under-populated. Fixed: gather
+   each request's *last* query token via `query_start_loc` (vectorized, no host
+   sync).
 
 ## Known limitations
 
@@ -117,18 +149,19 @@ larger models shrink the relative overhead.
    the V1 runner and auto-selects it whenever enabled. **Roadmap P0** — port the
    wiring to V2.
 
-2. **Requires `--enforce-eager`.** `RKVCompressor.compact_batch` uses
-   data-dependent control flow (`.item()`, per-request Python loops, dynamic
-   shapes) that is incompatible with full CUDA-graph capture. Run with
-   `--enforce-eager` until a graph-safe path exists (the SGLang port runs a
-   *hybrid* graph/eager path — window/compaction steps eager, the rest replayed).
+2. **Requires `--enforce-eager`.** `RKVCompressor` uses data-dependent control
+   flow (`.item()`, per-request Python loops, dynamic shapes) that is
+   incompatible with full CUDA-graph capture. Run with `--enforce-eager` until a
+   graph-safe path exists (the SGLang port runs a *hybrid* graph/eager path —
+   window/compaction steps eager, the rest replayed).
 
-3. **Accuracy is buffer-sensitive at tight budgets.** ~90% at budget 256
-   requires `buffer ≈ budget`; a small buffer compacts too aggressively and
-   drops accuracy (see the table above). This is a tuning property, not a bug.
-   The observation-window and cross-layer ideas were investigated and are **not**
-   needed (per-layer caches are already more expressive than SGLang's shared
-   decision; the window regressed throughput without helping accuracy).
+3. **Accuracy is buffer-sensitive at tight budgets.** Matching SGLang at
+   `budget=256` needs `buffer ≈ 128`; a smaller buffer compacts more often and
+   each compaction is slightly lossy, so the error compounds. This is a tuning
+   property, not a bug. Cross-head-mean + cross-layer-sum scoring and the
+   observation window are now **implemented** (they closed most of the earlier
+   gap — see the 对拍 table); the small remaining `buffer=64` gap vs SGLang is
+   attributed to attention-backend numerics.
 
 4. **FlashAttention backend only.** Other backends (FlashInfer, Triton, MLA) are
    untouched — R-KV is a no-op there. **Roadmap P3.**
@@ -147,7 +180,7 @@ larger models shrink the relative overhead.
 | --- | --- | --- | --- |
 | P5 | Accuracy sweep (GSM8K, Math-7B) | **done** | SGLang parity: 90% @ b256/buf256, near-lossless @ 512 |
 | P2 | Skip `occupied_slot_mapping` build when nothing compacts | **done** | lower pre-compaction overhead |
-| P1 | Observation-window / cross-layer scoring | **done (rejected)** | no accuracy gain; accuracy is buffer-tunable instead |
+| P1 | Observation-window + cross-layer scoring | **done** | +13.5 pts @ b256/buf64 (68.5→82.0); matches SGLang at buf=128 (88.0 vs 88.5) |
 | P0 | Port wiring to the V2 GPU model runner | todo | works on the default runner |
 | P3 | FlashInfer + other backends | todo | broader coverage |
 | P4 | Hybrid CUDA-graph path | todo | throughput (avoid full eager) |

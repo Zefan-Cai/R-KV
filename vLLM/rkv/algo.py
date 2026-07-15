@@ -145,18 +145,17 @@ class R1KV:
         self.retain_ratio = retain_ratio
         self.retain_direction = retain_direction
 
-    def update_kv(
-        self,
-        key_states,
-        query_states,
-        value_states,
-    ):
-        head_dim = query_states.shape[-1]
-        kv_cache_len = key_states.shape[-2]
+    def _scores(self, key_states, query_states):
+        """Per-past-token joint R-KV score.
 
-        if kv_cache_len < self.budget:
-            return key_states, value_states
+        Returns ``final_score`` of shape
+        ``(bsz, kv_heads, kv_cache_len - window_size)``.
 
+        Split out of :meth:`update_kv` so the serving integration can compute a
+        per-layer score, reduce it across KV heads, and accumulate it across
+        layers into a single global eviction decision (mirroring the SGLang
+        R-KV port's cross-head-mean + cross-layer-sum reduction).
+        """
         attn_weights = compute_attention_scores(query_states, key_states)
         attn_weights_sum = (
             nn.functional.softmax(
@@ -180,9 +179,21 @@ class R1KV:
             retain_direction=self.retain_direction,
         )[:, :, : -self.window_size]
 
-        final_score = attn_cache * self.mix_lambda - similarity_cos * (
-            1 - self.mix_lambda
-        )
+        return attn_cache * self.mix_lambda - similarity_cos * (1 - self.mix_lambda)
+
+    def update_kv(
+        self,
+        key_states,
+        query_states,
+        value_states,
+    ):
+        head_dim = query_states.shape[-1]
+        kv_cache_len = key_states.shape[-2]
+
+        if kv_cache_len < self.budget:
+            return key_states, value_states
+
+        final_score = self._scores(key_states, query_states)
         indices = final_score.topk(self.budget - self.window_size, dim=-1).indices
         indices = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
 

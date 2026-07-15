@@ -70,10 +70,10 @@ index 13a19b8..0c57509 100755
      "VLLM_MLA_DISABLE": lambda: bool(int(os.getenv("VLLM_MLA_DISABLE", "0"))),
      # If set, vLLM will pick up the provided Flash Attention MLA
 diff --git a/vllm/v1/attention/backend.py b/vllm/v1/attention/backend.py
-index bfecb3c..dd1b3c8 100644
+index bfecb3c..0af2e41 100644
 --- a/vllm/v1/attention/backend.py
 +++ b/vllm/v1/attention/backend.py
-@@ -463,6 +463,18 @@ class CommonAttentionMetadata:
+@@ -463,6 +463,30 @@ class CommonAttentionMetadata:
      fixed sliding window. None disables R-SWA. The attention backend copies this
      into its own persistent buffer and reads ``rswa_window`` from model config."""
  
@@ -88,15 +88,27 @@ index bfecb3c..dd1b3c8 100644
 +    """(total_num_kv_cache_tokens,) physical slot id of every occupied KV
 +    entry, laid out per request; used by the compressor to read/overwrite each
 +    request's full KV in place."""
++    rkv_score_acc: list | None = None
++    """(num_reqs,) per-request cross-layer score accumulator: each layer adds
++    its cross-head-mean per-token score here so a single global eviction
++    decision (top budget-window past tokens) is made after the full forward."""
++    rkv_layer_caches: list | None = None
++    """List of ``(key_cache, value_cache)`` registered by each attention layer
++    during the forward, so the post-forward compaction can evict the one kept
++    set from every layer."""
++    rkv_req_ids: list | None = None
++    """(num_reqs,) request ids in batch order, set every decode step so the
++    compressor can key each request's rolling observation-window queries by a
++    stable id (surviving vLLM's batch reordering)."""
 +
      # WARNING: Deprecated fields. Will be removed in a future release (v0.15.0)
      _seq_lens_cpu: torch.Tensor | None = None
      _num_computed_tokens_cpu: torch.Tensor | None = None
 diff --git a/vllm/v1/attention/backends/flash_attn.py b/vllm/v1/attention/backends/flash_attn.py
-index db5b0dd..afe6265 100755
+index db5b0dd..ccf6663 100755
 --- a/vllm/v1/attention/backends/flash_attn.py
 +++ b/vllm/v1/attention/backends/flash_attn.py
-@@ -268,6 +268,13 @@ class FlashAttentionMetadata:
+@@ -268,6 +268,16 @@ class FlashAttentionMetadata:
      rswa_window: int | None = None
      rswa_window_tensor: torch.Tensor | None = None
  
@@ -106,11 +118,14 @@ index db5b0dd..afe6265 100755
 +    should_compress_list: tuple[bool, ...] | None = None
 +    num_dropped_tokens_list: list[int] | None = None
 +    occupied_slot_mapping: torch.Tensor | None = None
++    rkv_score_acc: list | None = None
++    rkv_layer_caches: list | None = None
++    rkv_req_ids: list | None = None
 +
  
  def _get_sliding_window_configs(
      vllm_config: VllmConfig,
-@@ -624,6 +631,10 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
+@@ -624,6 +634,13 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
              max_num_splits=max_num_splits,
              causal=causal,
              sliding_window=effective_sliding_window,
@@ -118,10 +133,13 @@ index db5b0dd..afe6265 100755
 +            should_compress_list=common_attn_metadata.should_compress_list,
 +            num_dropped_tokens_list=common_attn_metadata.num_dropped_tokens_list,
 +            occupied_slot_mapping=common_attn_metadata.occupied_slot_mapping,
++            rkv_score_acc=common_attn_metadata.rkv_score_acc,
++            rkv_layer_caches=common_attn_metadata.rkv_layer_caches,
++            rkv_req_ids=common_attn_metadata.rkv_req_ids,
          )
  
          # Compute mm_prefix range tensor if the batch contains
-@@ -746,6 +757,12 @@ class FlashAttentionImpl(AttentionImpl):
+@@ -746,6 +763,12 @@ class FlashAttentionImpl(AttentionImpl):
          if vllm_config is not None and self.dcp_world_size > 1:
              self._dcp_dtype = vllm_config.model_config.dtype
  
@@ -134,16 +152,23 @@ index db5b0dd..afe6265 100755
      def forward(
          self,
          layer: torch.nn.Module,
-@@ -975,6 +992,17 @@ class FlashAttentionImpl(AttentionImpl):
+@@ -975,6 +998,24 @@ class FlashAttentionImpl(AttentionImpl):
                      mask_mod=rswa_mask_mod_fn or mm_mask_mod,
                      aux_tensors=rswa_aux or mm_aux,
                  )
-+                # R-KV: after attention has read this step's full KV, evict
-+                # redundant/unimportant past tokens for any armed request and
-+                # physically overwrite this layer's paged KV in place. Inert
-+                # unless R-KV is enabled and a request is armed this step.
++                # R-KV: record this layer's decode query into each request's
++                # rolling observation window (every decode step), then -- on
++                # compaction steps -- accumulate this layer's cross-head-mean
++                # eviction score into the shared per-request buffer and register
++                # this layer's KV. The single global cross-layer eviction runs
++                # after the full forward (see GPUModelRunner). Inert unless R-KV
++                # is enabled.
++                if attn_metadata.rkv_req_ids is not None:
++                    self.rkv_compressor.record_query(
++                        query[:num_actual_tokens], attn_metadata
++                    )
 +                if attn_metadata.should_compress_list is not None:
-+                    self.rkv_compressor.compact_batch(
++                    self.rkv_compressor.observe_layer(
 +                        query[:num_actual_tokens],
 +                        key_cache,
 +                        value_cache,
@@ -176,7 +201,7 @@ index 291e73b..0cb1151 100644
  
  
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index 8e01035..503fd9a 100644
+index 8e01035..5531b10 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
 @@ -7,6 +7,7 @@ from collections.abc import Iterable
@@ -187,27 +212,34 @@ index 8e01035..503fd9a 100644
  from vllm.compilation.cuda_graph import CUDAGraphStat
  from vllm.config import VllmConfig
  from vllm.distributed.ec_transfer.ec_connector.base import (
-@@ -1175,6 +1176,19 @@ class Scheduler(SchedulerInterface):
+@@ -1175,6 +1176,26 @@ class Scheduler(SchedulerInterface):
          for req_id, num_scheduled_token in num_scheduled_tokens.items():
              request = self.requests[req_id]
              request.num_computed_tokens += num_scheduled_token
-+            # R-KV: arm this request for compression when it crosses a
-+            # ``VLLM_V1_R_KV_BUFFER``-token boundary (compress every N tokens).
++            # R-KV: arm this request for compression every
++            # ``VLLM_V1_R_KV_BUFFER`` GENERATED tokens, counted from the start
++            # of decode (not from absolute ``num_computed_tokens``). Anchoring
++            # to the decode count matches the SGLang port's cadence: the first
++            # compaction fires after ``buffer_size`` decode steps (a warm
++            # observation window) instead of at the first absolute multiple of
++            # ``buffer_size`` past the prompt -- which, for a prompt length not a
++            # multiple of ``buffer_size``, fires only a few tokens in and evicts
++            # most of the prompt off a nearly-cold window (permanent damage).
 +            # Only during decode: compacting a partial (chunked) prefill would
 +            # evict prompt KV before the prompt is fully materialised and
 +            # desync the dropped-token accounting (num_dropped > num_computed).
 +            compress_every = envs.VLLM_V1_R_KV_BUFFER
++            num_decoded = request.num_computed_tokens - request.num_prompt_tokens
 +            request.should_compress = (
 +                compress_every > 0
-+                and request.num_computed_tokens > request.num_prompt_tokens
-+                and request.num_computed_tokens // compress_every
-+                > (request.num_computed_tokens - num_scheduled_token)
-+                // compress_every
++                and num_decoded > 0
++                and num_decoded // compress_every
++                > (num_decoded - num_scheduled_token) // compress_every
 +            )
              if self.defer_block_free:
                  # Record the in-flight step, to fence deferred block freeing.
                  request.last_sched_seq = self.sched_step_seq
-@@ -1267,6 +1281,8 @@ class Scheduler(SchedulerInterface):
+@@ -1267,6 +1288,8 @@ class Scheduler(SchedulerInterface):
          all_token_ids: dict[str, list[int]] = {}
          num_computed_tokens: list[int] = []
          num_output_tokens: list[int] = []
@@ -216,7 +248,7 @@ index 8e01035..503fd9a 100644
          resumed_req_ids = set()
  
          num_running_reqs = len(running_reqs)
-@@ -1301,6 +1317,8 @@ class Scheduler(SchedulerInterface):
+@@ -1301,6 +1324,8 @@ class Scheduler(SchedulerInterface):
              num_output_tokens.append(
                  req.num_output_tokens + req.num_output_placeholders
              )
@@ -225,7 +257,7 @@ index 8e01035..503fd9a 100644
  
          return CachedRequestData(
              req_ids=req_ids,
-@@ -1310,6 +1328,8 @@ class Scheduler(SchedulerInterface):
+@@ -1310,6 +1335,8 @@ class Scheduler(SchedulerInterface):
              new_block_ids=new_block_ids,
              num_computed_tokens=num_computed_tokens,
              num_output_tokens=num_output_tokens,
@@ -234,7 +266,7 @@ index 8e01035..503fd9a 100644
          )
  
      def _try_schedule_encoder_inputs(
-@@ -1576,6 +1596,12 @@ class Scheduler(SchedulerInterface):
+@@ -1576,6 +1603,12 @@ class Scheduler(SchedulerInterface):
                  continue
  
              req_index = model_runner_output.req_id_to_index[req_id]
@@ -324,10 +356,10 @@ index 28d1a04..b0310b6 100644
  
              self.request_lora_mapping[empty_index] = self.request_lora_mapping[
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index e9b23f1..fac1d56 100644
+index e9b23f1..0f96da4 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
-@@ -769,6 +769,29 @@ class GPUModelRunner(
+@@ -769,6 +769,38 @@ class GPUModelRunner(
              self.max_num_reqs, dtype=torch.int32
          )
  
@@ -353,11 +385,20 @@ index e9b23f1..fac1d56 100644
 +            self._rkv_should_compress_list: tuple[bool, ...] | None = None
 +            self._rkv_num_dropped_tokens_list: list[int] | None = None
 +            self._rkv_occupied_slot_mapping: torch.Tensor | None = None
++            # Two-phase, cross-layer compaction: each layer's forward
++            # accumulates its cross-head-mean score into ``_rkv_score_acc`` and
++            # registers its KV in ``_rkv_layer_caches``; the single global
++            # eviction runs after the forward via ``rkv_compactor.compact_step``.
++            self._rkv_score_acc: list | None = None
++            self._rkv_layer_caches: list | None = None
++            from vllm.rkv.integration import RKVCompressor
++
++            self.rkv_compactor = RKVCompressor()
 +
          self.encoder_seq_lens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
          if self.dcp_world_size > 1:
              self.dcp_local_seq_lens = self._make_buffer(
-@@ -1312,6 +1335,8 @@ class GPUModelRunner(
+@@ -1312,6 +1344,8 @@ class GPUModelRunner(
              new_block_ids = req_data.new_block_ids[i]
              resumed_from_preemption = req_id in req_data.resumed_req_ids
              num_output_tokens = req_data.num_output_tokens[i]
@@ -366,7 +407,7 @@ index e9b23f1..fac1d56 100644
              req_index = self.input_batch.req_id_to_index.get(req_id)
  
              if req_state.prev_num_draft_len and self.use_async_scheduling:
-@@ -1358,7 +1383,7 @@ class GPUModelRunner(
+@@ -1358,7 +1392,7 @@ class GPUModelRunner(
  
              # Update the cached states.
              req_state.num_computed_tokens = num_computed_tokens
@@ -375,7 +416,7 @@ index e9b23f1..fac1d56 100644
              if not is_last_rank:
                  if not req_data.new_token_ids:
                      # Async scheduled PP: Sampled tokens propagated via GPU broadcast.
-@@ -1424,6 +1449,8 @@ class GPUModelRunner(
+@@ -1424,6 +1458,8 @@ class GPUModelRunner(
  
              # Update the persistent batch.
              self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
@@ -384,7 +425,7 @@ index e9b23f1..fac1d56 100644
              if new_block_ids is not None:
                  self.input_batch.block_table.append_row(new_block_ids, req_index)
  
-@@ -1911,6 +1938,91 @@ class GPUModelRunner(
+@@ -1911,6 +1947,101 @@ class GPUModelRunner(
  
          return encoder_seq_lens, encoder_seq_lens_cpu
  
@@ -450,7 +491,17 @@ index e9b23f1..fac1d56 100644
 +        will_compact = armed & (num_live >= self._rkv_threshold)
 +        if not will_compact.any():
 +            self._rkv_occupied_slot_mapping = None
++            self._rkv_score_acc = None
++            self._rkv_layer_caches = None
 +            return
++
++        # Two-phase cross-layer compaction buffers, shared by reference with the
++        # attention backend (via cm_base): each layer's ``observe_layer`` sums
++        # its cross-head-mean score into ``_rkv_score_acc`` and appends its KV to
++        # ``_rkv_layer_caches``; ``rkv_compactor.compact_step`` drains them after
++        # the forward. Fresh per step so no stale layer caches survive.
++        self._rkv_score_acc = [None] * num_reqs
++        self._rkv_layer_caches = []
 +
 +        # occupied_slot_mapping: physical slot id of every occupied KV entry,
 +        # laid out per request over its live range [0, num_kv + num_scheduled).
@@ -476,7 +527,7 @@ index e9b23f1..fac1d56 100644
      def _prepare_inputs(
          self,
          scheduler_output: "SchedulerOutput",
-@@ -2143,16 +2255,29 @@ class GPUModelRunner(
+@@ -2143,16 +2274,29 @@ class GPUModelRunner(
              self.num_computed_tokens[req_indices_gpu].to(torch.int64)
              + self.query_pos.gpu[:total_num_scheduled_tokens]
          )
@@ -515,7 +566,7 @@ index e9b23f1..fac1d56 100644
  
          # Copy the tensors to the GPU.
          self._prepare_input_ids(
-@@ -2395,6 +2520,14 @@ class GPUModelRunner(
+@@ -2395,6 +2539,22 @@ class GPUModelRunner(
              rswa_prefix_lens=rswa_prefix_lens,
          )
  
@@ -526,11 +577,42 @@ index e9b23f1..fac1d56 100644
 +            cm_base.should_compress_list = self._rkv_should_compress_list
 +            cm_base.num_dropped_tokens_list = self._rkv_num_dropped_tokens_list
 +            cm_base.occupied_slot_mapping = self._rkv_occupied_slot_mapping
++            # Cross-layer accumulator + per-layer cache registry (shared by
++            # reference so every layer's observe_layer mutates the same objects
++            # the post-forward compact_step drains).
++            cm_base.rkv_score_acc = self._rkv_score_acc
++            cm_base.rkv_layer_caches = self._rkv_layer_caches
++            # Request ids (batch order) every step so the compressor keys each
++            # request's rolling observation window by a stable id.
++            cm_base.rkv_req_ids = self.input_batch.req_ids[:num_reqs]
 +
          if self.dcp_world_size > 1:
              self.dcp_local_seq_lens.cpu[:num_reqs] = get_dcp_local_seq_lens(
                  self.optimistic_seq_lens_cpu[:num_reqs],
-@@ -4682,6 +4815,11 @@ class GPUModelRunner(
+@@ -4358,6 +4518,22 @@ class GPUModelRunner(
+                 **model_kwargs,
+             )
+ 
++        if self.rkv_enabled and self._rkv_layer_caches:
++            # R-KV phase 2: one global cross-layer eviction after the full
++            # forward. Every layer has summed its cross-head-mean score into
++            # ``_rkv_score_acc`` and registered its KV in ``_rkv_layer_caches``
++            # (observe_layer); pick one kept set and evict it from all layers.
++            num_rkv_reqs = len(self._rkv_should_compress_list)
++            self.rkv_compactor.compact_step(
++                num_rkv_reqs,
++                self.seq_lens[:num_rkv_reqs],
++                self._rkv_occupied_slot_mapping,
++                self._rkv_should_compress_list,
++                self._rkv_score_acc,
++                self._rkv_layer_caches,
++                self._rkv_num_dropped_tokens_list,
++            )
++
+         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
+             if self.use_aux_hidden_state_outputs:
+                 # True when EAGLE 3 is used.
+@@ -4682,6 +4858,11 @@ class GPUModelRunner(
                  routed_experts=None,
              )
  
