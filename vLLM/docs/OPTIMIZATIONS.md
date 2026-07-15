@@ -16,13 +16,26 @@ NVIDIA H100** (vLLM 0.25.1, torch 2.11+cu130, `Qwen2.5-0.5B` / `Qwen2.5-Math-7B`
   generation) R-KV output is **byte-identical** to Full-KV across prompts,
   proving the logical/physical position + slot-mapping wiring is transparent
   when nothing is evicted.
-- **Quality scales with budget** — `budget=256` matches Full-KV's reasoning;
-  `budget=64` stays coherent with minor artifacts (expected at an aggressive
-  budget on a 0.5B model).
+- **Quality scales with budget** — see the GSM8K sweep below.
 - **Batch > 1** — validated up to 64 concurrent requests; each compresses
   independently.
 - **Out-of-the-box** — setting `BUDGET`/`BUFFER` auto-selects the V1 runner; no
   flags required beyond `--enforce-eager`.
+
+### Accuracy — GSM8K, Qwen2.5-Math-7B-Instruct (200 questions, greedy)
+
+| Config | Accuracy |
+| --- | --- |
+| Full-KV | 94.5% (189/200) |
+| R-KV budget=512 buffer=64 | **92.5%** (185/200) — near-lossless |
+| R-KV budget=256 buffer=64 | 72.5% (145/200) |
+| R-KV budget=128 buffer=64 | 36.5% (73/200) |
+
+**R-KV is near-lossless at `budget=512`.** Accuracy falls off faster at tight
+budgets than the SGLang port (which holds ~0.90 at budget 256). The gap is the
+**observation-window scoring**, not the layer dimension (see the analysis under
+"Roadmap"). `budget≈512` is the recommended operating point today.
+
 
 ### Measured throughput (H100, Qwen2.5-0.5B, equal work, `ignore_eos`)
 
@@ -70,34 +83,37 @@ larger models shrink the relative overhead.
    `--enforce-eager` until a graph-safe path exists (the SGLang port runs a
    *hybrid* graph/eager path — window/compaction steps eager, the rest replayed).
 
-3. **Per-layer independent compression.** Each attention layer evicts its own
-   tokens (keeping the same *count* but possibly different *tokens* per layer).
-   This matches the original PoC but is a fidelity compromise; the SGLang port's
-   single cross-layer decision (cross-layer score sum, cross-head mean) is the
-   principled fix. **Roadmap P1.**
+3. **Single-query importance (the tight-budget accuracy lever).** At compaction
+   time the compressor scores each past token by the attention it receives from
+   only the **current** decode query. The reference / SGLang port scores over a
+   trailing **observation window** of the last `window_size` decode queries,
+   which is a much more robust importance signal and is the main reason SGLang
+   holds ~0.90 at budget 256 while this port drops to ~0.73. Implementing the
+   window on vLLM needs runner-level per-request query state (stable across the
+   batch reordering that `condense()` performs), so it is a substantial change.
+   **Roadmap P1.** (Note: making the eviction decision *cross-layer* instead of
+   per-layer is **not** expected to help here — vLLM's per-layer caches let each
+   layer keep its own best tokens, which is strictly more expressive than the
+   single shared decision SGLang is forced into by its shared slot table.)
 
-4. **`occupied_slot_mapping` is rebuilt (numpy, CPU) every compaction step** and
-   can be large for big batches × long contexts. Fine for correctness; a GPU
-   kernel or an incremental scheme would cut overhead. **Roadmap P2.**
-
-5. **FlashAttention backend only.** Other backends (FlashInfer, Triton, MLA) are
+4. **FlashAttention backend only.** Other backends (FlashInfer, Triton, MLA) are
    untouched — R-KV is a no-op there. **Roadmap P3.**
 
-6. **`optimistic_seq_lens_cpu` stays logical.** It is used only as an upper
+5. **`optimistic_seq_lens_cpu` stays logical.** It is used only as an upper
    bound (`max_seq_len`), so an over-estimate is safe, but a few code paths that
    read the CPU seq-len copy should be audited on GPU.
 
-7. **Interactions not yet exercised:** speculative decoding, chunked prefill,
+6. **Interactions not yet exercised:** speculative decoding, chunked prefill,
    prefix caching / block reuse, tensor/pipeline parallelism, async scheduling,
    M-RoPE models. Start validation with these **off**.
 
 ## Roadmap
 
-| # | Item | Payoff |
-| --- | --- | --- |
-| P0 | Port wiring to the V2 GPU model runner | works on the default runner |
-| P1 | Single cross-layer eviction decision | correctness/fidelity parity with SGLang |
-| P2 | GPU / incremental `occupied_slot_mapping` | lower per-compaction overhead |
-| P3 | FlashInfer + other backends | broader coverage |
-| P4 | Hybrid CUDA-graph path | throughput (avoid full eager) |
-| P5 | Accuracy sweep (GSM8K / MATH, 7B) | quantify the budget/quality curve |
+| # | Item | Status | Payoff |
+| --- | --- | --- | --- |
+| P5 | Accuracy sweep (GSM8K, Math-7B) | **done** | near-lossless @ budget 512 |
+| P2 | Skip `occupied_slot_mapping` build when nothing compacts | **done** | lower pre-compaction overhead |
+| P1 | Observation-window importance scoring | todo | tight-budget accuracy parity with SGLang |
+| P0 | Port wiring to the V2 GPU model runner | todo | works on the default runner |
+| P3 | FlashInfer + other backends | todo | broader coverage |
+| P4 | Hybrid CUDA-graph path | todo | throughput (avoid full eager) |
