@@ -296,10 +296,10 @@ index 28d1a04..b0310b6 100644
  
              self.request_lora_mapping[empty_index] = self.request_lora_mapping[
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index e9b23f1..f2bf503 100644
+index e9b23f1..fac1d56 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
-@@ -769,6 +769,26 @@ class GPUModelRunner(
+@@ -769,6 +769,29 @@ class GPUModelRunner(
              self.max_num_reqs, dtype=torch.int32
          )
  
@@ -313,6 +313,9 @@ index e9b23f1..f2bf503 100644
 +            envs.VLLM_V1_R_KV_BUDGET > 0 and envs.VLLM_V1_R_KV_BUFFER > 0
 +        )
 +        if self.rkv_enabled:
++            self._rkv_threshold = (
++                envs.VLLM_V1_R_KV_BUDGET + envs.VLLM_V1_R_KV_BUFFER
++            )
 +            self.rkv_physical_positions = self._make_buffer(
 +                self.max_num_tokens, dtype=torch.int64
 +            )
@@ -326,7 +329,7 @@ index e9b23f1..f2bf503 100644
          self.encoder_seq_lens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
          if self.dcp_world_size > 1:
              self.dcp_local_seq_lens = self._make_buffer(
-@@ -1312,6 +1332,8 @@ class GPUModelRunner(
+@@ -1312,6 +1335,8 @@ class GPUModelRunner(
              new_block_ids = req_data.new_block_ids[i]
              resumed_from_preemption = req_id in req_data.resumed_req_ids
              num_output_tokens = req_data.num_output_tokens[i]
@@ -335,7 +338,7 @@ index e9b23f1..f2bf503 100644
              req_index = self.input_batch.req_id_to_index.get(req_id)
  
              if req_state.prev_num_draft_len and self.use_async_scheduling:
-@@ -1358,7 +1380,7 @@ class GPUModelRunner(
+@@ -1358,7 +1383,7 @@ class GPUModelRunner(
  
              # Update the cached states.
              req_state.num_computed_tokens = num_computed_tokens
@@ -344,7 +347,7 @@ index e9b23f1..f2bf503 100644
              if not is_last_rank:
                  if not req_data.new_token_ids:
                      # Async scheduled PP: Sampled tokens propagated via GPU broadcast.
-@@ -1424,6 +1446,8 @@ class GPUModelRunner(
+@@ -1424,6 +1449,8 @@ class GPUModelRunner(
  
              # Update the persistent batch.
              self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
@@ -353,7 +356,7 @@ index e9b23f1..f2bf503 100644
              if new_block_ids is not None:
                  self.input_batch.block_table.append_row(new_block_ids, req_index)
  
-@@ -1911,6 +1935,83 @@ class GPUModelRunner(
+@@ -1911,6 +1938,91 @@ class GPUModelRunner(
  
          return encoder_seq_lens, encoder_seq_lens_cpu
  
@@ -406,15 +409,23 @@ index e9b23f1..f2bf503 100644
 +        self._rkv_should_compress_list = should_compress
 +        self._rkv_num_dropped_tokens_list = [0] * num_reqs
 +
-+        if not any(should_compress):
++        num_computed_np = self.input_batch.num_computed_tokens_cpu[:num_reqs]
++        num_kv_cache_tokens = num_computed_np - dropped_np
++        num_live = num_kv_cache_tokens + num_scheduled_tokens
++
++        # Only build occupied_slot_mapping when at least one *armed* request is
++        # actually over the compaction threshold this step; otherwise the
++        # compressor would skip every request and the O(total_kv) build is
++        # wasted work. (should_compress fires periodically for every request,
++        # long before it reaches budget + buffer.)
++        armed = np.array(should_compress, dtype=bool)
++        will_compact = armed & (num_live >= self._rkv_threshold)
++        if not will_compact.any():
 +            self._rkv_occupied_slot_mapping = None
 +            return
 +
 +        # occupied_slot_mapping: physical slot id of every occupied KV entry,
 +        # laid out per request over its live range [0, num_kv + num_scheduled).
-+        num_computed_np = self.input_batch.num_computed_tokens_cpu[:num_reqs]
-+        num_kv_cache_tokens = num_computed_np - dropped_np
-+        num_live = num_kv_cache_tokens + num_scheduled_tokens
 +        total_kv = int(num_live.sum())
 +        occ_req = np.repeat(self.arange_np[:num_reqs], num_live)
 +        occ_cu = np.cumsum(num_live)
@@ -437,7 +448,7 @@ index e9b23f1..f2bf503 100644
      def _prepare_inputs(
          self,
          scheduler_output: "SchedulerOutput",
-@@ -2143,16 +2244,29 @@ class GPUModelRunner(
+@@ -2143,16 +2255,29 @@ class GPUModelRunner(
              self.num_computed_tokens[req_indices_gpu].to(torch.int64)
              + self.query_pos.gpu[:total_num_scheduled_tokens]
          )
@@ -476,7 +487,7 @@ index e9b23f1..f2bf503 100644
  
          # Copy the tensors to the GPU.
          self._prepare_input_ids(
-@@ -2395,6 +2509,14 @@ class GPUModelRunner(
+@@ -2395,6 +2520,14 @@ class GPUModelRunner(
              rswa_prefix_lens=rswa_prefix_lens,
          )
  
@@ -491,7 +502,7 @@ index e9b23f1..f2bf503 100644
          if self.dcp_world_size > 1:
              self.dcp_local_seq_lens.cpu[:num_reqs] = get_dcp_local_seq_lens(
                  self.optimistic_seq_lens_cpu[:num_reqs],
-@@ -4682,6 +4804,11 @@ class GPUModelRunner(
+@@ -4682,6 +4815,11 @@ class GPUModelRunner(
                  routed_experts=None,
              )
  
