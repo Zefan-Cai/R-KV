@@ -39,12 +39,35 @@ many tokens accumulate before each compaction) is the key quality knob at tight
 budgets: too small a buffer compacts too aggressively and too often. Larger
 buffers are also **faster** (fewer compactions). Recommended: `buffer ≈ budget`.
 
-> **Investigated & rejected: observation-window scoring.** The single-query
-> importance signal was hypothesized to be the tight-budget bottleneck, so a
-> per-request window of the last `window_size` decode queries was implemented.
-> It did **not** improve accuracy (budget 256: 70% vs 72.5%) and cost ~2.5×
-> throughput (per-step query recording), so it was reverted. The tight-budget
-> gap was the `buffer` setting, not the scoring window.
+### Differential test (对拍) vs SGLang — same harness, model, config
+
+Using SGLang's own few-shot GSM8K harness (`benchmark/eval.py`,
+`data/gsm8k_fewshot.jsonl`, prompt ≈ 700 tokens > budget) at budget=256,
+buffer=64, greedy, run identically against both engines:
+
+| Engine | Accuracy |
+| --- | --- |
+| SGLang R-KV | 90.0% (180/200) |
+| vLLM R-KV — **prefix caching ON (buggy)** | **1.5%** (3/200) |
+| vLLM R-KV — prefix caching OFF (fixed) | 68.5% (137/200) |
+
+**Critical bug this surfaced:** with **prefix caching ON**, the shared exemplar
+prefix's KV blocks are shared across requests; R-KV's in-place eviction of one
+request corrupts the shared blocks of the others (output bleeds another
+request's content). Fixed: **R-KV now force-disables prefix caching** in
+`VllmConfig.__post_init__` (mirrors SGLang's required `--disable-radix-cache`).
+
+A **residual tight-budget gap** remains (budget 256: vLLM ~68–75% vs SGLang
+90%); vLLM closes it at a larger budget (budget 512: 87%). This is a scoring/
+compaction-frequency fidelity difference (not corruption); use `budget ≈ 512`
+for best accuracy. Root-causing it (candidate: cross-layer score aggregation)
+is tracked as P1.
+
+> **Investigated & rejected as the tight-budget fix:** observation-window
+> scoring (verified populated: `qwin=(8, …)`), cross-head score reduction, and
+> temporal-order relocation each **failed** to close the gap (window/sort no
+> change; cross-head worse). The catastrophic failure was prefix caching, not
+> the scoring; the residual gap is still open.
 
 
 
@@ -80,6 +103,12 @@ larger models shrink the relative overhead.
 4. `occupied_slot_mapping` indexed the fixed-size `arange_np`, overflowing when
    total batch KV exceeded one step's token budget (batch>1, long context).
    Fixed: build the per-request position ramp with `np.arange(total_kv)`.
+5. Compaction fired during **chunked prefill** of long prompts (partial-prefill
+   eviction → `num_dropped > num_computed` → crash). Fixed: gate compaction to
+   the decode phase (`num_computed_tokens > num_prompt_tokens`).
+6. **Prefix caching corrupted R-KV** (shared prefix blocks mutated in place →
+   cross-request KV bleed → ~1.5% accuracy on shared-prefix workloads). Found
+   via the SGLang 对拍. Fixed: force-disable prefix caching when R-KV is on.
 
 ## Known limitations
 

@@ -1,5 +1,5 @@
 diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
-index e8796a3..120e226 100644
+index e8796a3..d6da5fb 100644
 --- a/vllm/config/vllm.py
 +++ b/vllm/config/vllm.py
 @@ -517,6 +517,11 @@ class VllmConfig:
@@ -14,6 +14,30 @@ index e8796a3..120e226 100644
          use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
          if use_v2_model_runner is not None:
              return use_v2_model_runner
+@@ -872,6 +877,23 @@ class VllmConfig:
+         # To give each torch profile run a unique instance name.
+         self.instance_id = f"{time.time_ns()}"
+ 
++        # R-KV (redundancy-aware KV compression) physically evicts and relocates
++        # KV in place. Prefix caching shares KV blocks across requests, so an
++        # in-place eviction in one request would corrupt the shared prefix of
++        # others. Disable prefix caching when R-KV is enabled (mirrors SGLang's
++        # required --disable-radix-cache).
++        if (
++            envs.VLLM_V1_R_KV_BUDGET > 0
++            and envs.VLLM_V1_R_KV_BUFFER > 0
++            and self.cache_config is not None
++            and self.cache_config.enable_prefix_caching
++        ):
++            logger.info_once(
++                "R-KV enabled: disabling prefix caching (in-place KV eviction "
++                "is incompatible with shared prefix blocks)."
++            )
++            self.cache_config.enable_prefix_caching = False
++
+         if self.performance_mode != "balanced":
+             logger.info_once("Performance mode set to '%s'.", self.performance_mode)
+ 
 diff --git a/vllm/envs.py b/vllm/envs.py
 index 13a19b8..0c57509 100755
 --- a/vllm/envs.py
