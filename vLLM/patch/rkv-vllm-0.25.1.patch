@@ -152,7 +152,7 @@ index 291e73b..0cb1151 100644
  
  
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index 8e01035..5d7a793 100644
+index 8e01035..503fd9a 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
 @@ -7,6 +7,7 @@ from collections.abc import Iterable
@@ -163,15 +163,19 @@ index 8e01035..5d7a793 100644
  from vllm.compilation.cuda_graph import CUDAGraphStat
  from vllm.config import VllmConfig
  from vllm.distributed.ec_transfer.ec_connector.base import (
-@@ -1175,6 +1176,15 @@ class Scheduler(SchedulerInterface):
+@@ -1175,6 +1176,19 @@ class Scheduler(SchedulerInterface):
          for req_id, num_scheduled_token in num_scheduled_tokens.items():
              request = self.requests[req_id]
              request.num_computed_tokens += num_scheduled_token
 +            # R-KV: arm this request for compression when it crosses a
 +            # ``VLLM_V1_R_KV_BUFFER``-token boundary (compress every N tokens).
++            # Only during decode: compacting a partial (chunked) prefill would
++            # evict prompt KV before the prompt is fully materialised and
++            # desync the dropped-token accounting (num_dropped > num_computed).
 +            compress_every = envs.VLLM_V1_R_KV_BUFFER
 +            request.should_compress = (
 +                compress_every > 0
++                and request.num_computed_tokens > request.num_prompt_tokens
 +                and request.num_computed_tokens // compress_every
 +                > (request.num_computed_tokens - num_scheduled_token)
 +                // compress_every
@@ -179,7 +183,7 @@ index 8e01035..5d7a793 100644
              if self.defer_block_free:
                  # Record the in-flight step, to fence deferred block freeing.
                  request.last_sched_seq = self.sched_step_seq
-@@ -1267,6 +1277,8 @@ class Scheduler(SchedulerInterface):
+@@ -1267,6 +1281,8 @@ class Scheduler(SchedulerInterface):
          all_token_ids: dict[str, list[int]] = {}
          num_computed_tokens: list[int] = []
          num_output_tokens: list[int] = []
@@ -188,7 +192,7 @@ index 8e01035..5d7a793 100644
          resumed_req_ids = set()
  
          num_running_reqs = len(running_reqs)
-@@ -1301,6 +1313,8 @@ class Scheduler(SchedulerInterface):
+@@ -1301,6 +1317,8 @@ class Scheduler(SchedulerInterface):
              num_output_tokens.append(
                  req.num_output_tokens + req.num_output_placeholders
              )
@@ -197,7 +201,7 @@ index 8e01035..5d7a793 100644
  
          return CachedRequestData(
              req_ids=req_ids,
-@@ -1310,6 +1324,8 @@ class Scheduler(SchedulerInterface):
+@@ -1310,6 +1328,8 @@ class Scheduler(SchedulerInterface):
              new_block_ids=new_block_ids,
              num_computed_tokens=num_computed_tokens,
              num_output_tokens=num_output_tokens,
@@ -206,7 +210,7 @@ index 8e01035..5d7a793 100644
          )
  
      def _try_schedule_encoder_inputs(
-@@ -1576,6 +1592,12 @@ class Scheduler(SchedulerInterface):
+@@ -1576,6 +1596,12 @@ class Scheduler(SchedulerInterface):
                  continue
  
              req_index = model_runner_output.req_id_to_index[req_id]
