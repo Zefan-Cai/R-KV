@@ -1,0 +1,20 @@
+# R-KV on vLLM v0.25.1 — dependency notes.
+#
+# R-KV itself adds NO new runtime dependencies: the algorithm (rkv/algo.py) and
+# integration layer (rkv/integration.py) use only torch, which vLLM already
+# requires. The port is pinned to the upstream vLLM v0.25.1 release; build it
+# from the patched source tree produced by scripts/apply_rkv.sh.
+#
+# vLLM's own dependency stack (torch, flashinfer, kernels, transformers, ...) is
+# authoritative — do not pin those here, let the vLLM build resolve them for
+# your CUDA/platform. Install the patched tree with, e.g.:
+#
+#   scripts/apply_rkv.sh
+#   pip install -e vllm-src        # source build; needs CUDA + a GPU
+#
+# The pin below is documentation of the exact upstream reference; the actual
+# install comes from the patched source tree, not from PyPI.
+
+# Upstream reference (pinned): vLLM v0.25.1
+#   git tag  v0.25.1
+#   commit   752a3a504485790a2e8491cacbb35c137339ad34

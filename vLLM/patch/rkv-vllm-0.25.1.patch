@@ -1,0 +1,502 @@
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index e8796a3..120e226 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -517,6 +517,11 @@ class VllmConfig:
+ 
+     @property
+     def use_v2_model_runner(self) -> bool:
++        # R-KV (redundancy-aware KV-cache compression) is wired into the V1 GPU
++        # model runner. Force the V1 runner when R-KV is enabled so compression
++        # is not silently skipped on the (default) V2 runner.
++        if envs.VLLM_V1_R_KV_BUDGET > 0 and envs.VLLM_V1_R_KV_BUFFER > 0:
++            return False
+         use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
+         if use_v2_model_runner is not None:
+             return use_v2_model_runner
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 13a19b8..0c57509 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -150,6 +150,13 @@ if TYPE_CHECKING:
+     VLLM_RUST_FRONTEND_PATH: str | None = "auto"
+     VLLM_SERVER_DEV_MODE: bool = False
+     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
++    # R-KV (redundancy-aware KV cache compression). ``BUDGET`` is the fixed
++    # per-request KV entry count kept after compression; ``BUFFER`` is the
++    # compression interval (compress every N generated tokens). 0 disables.
++    VLLM_V1_R_KV_BUDGET: int = 0
++    VLLM_V1_R_KV_BUFFER: int = 0
++    VLLM_V1_R_KV_WINDOW: int = 8
++    VLLM_V1_R_KV_KERNEL: int = 7
+     VLLM_MLA_DISABLE: bool = False
+     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
+     VLLM_RAY_BUNDLE_INDICES: str = ""
+@@ -1323,6 +1330,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_V1_OUTPUT_PROC_CHUNK_SIZE": lambda: int(
+         os.getenv("VLLM_V1_OUTPUT_PROC_CHUNK_SIZE", "128")
+     ),
++    # R-KV (redundancy-aware KV cache compression) knobs. BUDGET/BUFFER > 0
++    # enable decode-time compression; WINDOW/KERNEL are algorithm knobs.
++    "VLLM_V1_R_KV_BUDGET": lambda: int(os.getenv("VLLM_V1_R_KV_BUDGET", "0")),
++    "VLLM_V1_R_KV_BUFFER": lambda: int(os.getenv("VLLM_V1_R_KV_BUFFER", "0")),
++    "VLLM_V1_R_KV_WINDOW": lambda: int(os.getenv("VLLM_V1_R_KV_WINDOW", "8")),
++    "VLLM_V1_R_KV_KERNEL": lambda: int(os.getenv("VLLM_V1_R_KV_KERNEL", "7")),
+     # If set, vLLM will disable the MLA attention optimizations.
+     "VLLM_MLA_DISABLE": lambda: bool(int(os.getenv("VLLM_MLA_DISABLE", "0"))),
+     # If set, vLLM will pick up the provided Flash Attention MLA
+diff --git a/vllm/v1/attention/backend.py b/vllm/v1/attention/backend.py
+index bfecb3c..dd1b3c8 100644
+--- a/vllm/v1/attention/backend.py
++++ b/vllm/v1/attention/backend.py
+@@ -463,6 +463,18 @@ class CommonAttentionMetadata:
+     fixed sliding window. None disables R-SWA. The attention backend copies this
+     into its own persistent buffer and reads ``rswa_window`` from model config."""
+ 
++    # R-KV (redundancy-aware KV cache compression). All None unless R-KV is
++    # enabled and a request is armed for compression this step.
++    should_compress_list: tuple[bool, ...] | None = None
++    """(num_reqs,) per-request decode-time compression gate."""
++    num_dropped_tokens_list: list[int] | None = None
++    """(num_reqs,) sink written in place by the compressor with the number of
++    KV entries physically evicted this step."""
++    occupied_slot_mapping: torch.Tensor | None = None
++    """(total_num_kv_cache_tokens,) physical slot id of every occupied KV
++    entry, laid out per request; used by the compressor to read/overwrite each
++    request's full KV in place."""
++
+     # WARNING: Deprecated fields. Will be removed in a future release (v0.15.0)
+     _seq_lens_cpu: torch.Tensor | None = None
+     _num_computed_tokens_cpu: torch.Tensor | None = None
+diff --git a/vllm/v1/attention/backends/flash_attn.py b/vllm/v1/attention/backends/flash_attn.py
+index db5b0dd..afe6265 100755
+--- a/vllm/v1/attention/backends/flash_attn.py
++++ b/vllm/v1/attention/backends/flash_attn.py
+@@ -268,6 +268,13 @@ class FlashAttentionMetadata:
+     rswa_window: int | None = None
+     rswa_window_tensor: torch.Tensor | None = None
+ 
++    # R-KV (redundancy-aware KV cache compression). None unless enabled and a
++    # request is armed for compression this step.
++    num_reqs: int = 0
++    should_compress_list: tuple[bool, ...] | None = None
++    num_dropped_tokens_list: list[int] | None = None
++    occupied_slot_mapping: torch.Tensor | None = None
++
+ 
+ def _get_sliding_window_configs(
+     vllm_config: VllmConfig,
+@@ -624,6 +631,10 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
+             max_num_splits=max_num_splits,
+             causal=causal,
+             sliding_window=effective_sliding_window,
++            num_reqs=num_reqs,
++            should_compress_list=common_attn_metadata.should_compress_list,
++            num_dropped_tokens_list=common_attn_metadata.num_dropped_tokens_list,
++            occupied_slot_mapping=common_attn_metadata.occupied_slot_mapping,
+         )
+ 
+         # Compute mm_prefix range tensor if the batch contains
+@@ -746,6 +757,12 @@ class FlashAttentionImpl(AttentionImpl):
+         if vllm_config is not None and self.dcp_world_size > 1:
+             self._dcp_dtype = vllm_config.model_config.dtype
+ 
++        # R-KV: decode-time redundancy-aware KV-cache compressor. Inert unless
++        # ``VLLM_V1_R_KV_BUDGET``/``BUFFER`` are set (see rkv.integration).
++        from vllm.rkv.integration import RKVCompressor
++
++        self.rkv_compressor = RKVCompressor()
++
+     def forward(
+         self,
+         layer: torch.nn.Module,
+@@ -975,6 +992,17 @@ class FlashAttentionImpl(AttentionImpl):
+                     mask_mod=rswa_mask_mod_fn or mm_mask_mod,
+                     aux_tensors=rswa_aux or mm_aux,
+                 )
++                # R-KV: after attention has read this step's full KV, evict
++                # redundant/unimportant past tokens for any armed request and
++                # physically overwrite this layer's paged KV in place. Inert
++                # unless R-KV is enabled and a request is armed this step.
++                if attn_metadata.should_compress_list is not None:
++                    self.rkv_compressor.compact_batch(
++                        query[:num_actual_tokens],
++                        key_cache,
++                        value_cache,
++                        attn_metadata,
++                    )
+                 return output
+ 
+         # Cascade attention (rare case).
+diff --git a/vllm/v1/core/sched/output.py b/vllm/v1/core/sched/output.py
+index 291e73b..0cb1151 100644
+--- a/vllm/v1/core/sched/output.py
++++ b/vllm/v1/core/sched/output.py
+@@ -124,6 +124,9 @@ class CachedRequestData:
+     new_block_ids: list[tuple[list[int], ...] | None]
+     num_computed_tokens: list[int]
+     num_output_tokens: list[int]
++    # R-KV: physically-evicted KV count and per-step compression gate.
++    num_dropped_tokens: list[int]
++    should_compress: list[bool]
+ 
+     # Version of dataclass repr with token IDs obfuscated.
+     def anon_repr(self) -> str:
+@@ -174,6 +177,8 @@ class CachedRequestData:
+             new_block_ids=[],
+             num_computed_tokens=[],
+             num_output_tokens=[],
++            num_dropped_tokens=[],
++            should_compress=[],
+         )
+ 
+ 
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 8e01035..5d7a793 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -7,6 +7,7 @@ from collections.abc import Iterable
+ from dataclasses import replace
+ from typing import Any
+ 
++import vllm.envs as envs
+ from vllm.compilation.cuda_graph import CUDAGraphStat
+ from vllm.config import VllmConfig
+ from vllm.distributed.ec_transfer.ec_connector.base import (
+@@ -1175,6 +1176,15 @@ class Scheduler(SchedulerInterface):
+         for req_id, num_scheduled_token in num_scheduled_tokens.items():
+             request = self.requests[req_id]
+             request.num_computed_tokens += num_scheduled_token
++            # R-KV: arm this request for compression when it crosses a
++            # ``VLLM_V1_R_KV_BUFFER``-token boundary (compress every N tokens).
++            compress_every = envs.VLLM_V1_R_KV_BUFFER
++            request.should_compress = (
++                compress_every > 0
++                and request.num_computed_tokens // compress_every
++                > (request.num_computed_tokens - num_scheduled_token)
++                // compress_every
++            )
+             if self.defer_block_free:
+                 # Record the in-flight step, to fence deferred block freeing.
+                 request.last_sched_seq = self.sched_step_seq
+@@ -1267,6 +1277,8 @@ class Scheduler(SchedulerInterface):
+         all_token_ids: dict[str, list[int]] = {}
+         num_computed_tokens: list[int] = []
+         num_output_tokens: list[int] = []
++        num_dropped_tokens: list[int] = []
++        should_compress: list[bool] = []
+         resumed_req_ids = set()
+ 
+         num_running_reqs = len(running_reqs)
+@@ -1301,6 +1313,8 @@ class Scheduler(SchedulerInterface):
+             num_output_tokens.append(
+                 req.num_output_tokens + req.num_output_placeholders
+             )
++            num_dropped_tokens.append(req.num_dropped_tokens)
++            should_compress.append(req.should_compress)
+ 
+         return CachedRequestData(
+             req_ids=req_ids,
+@@ -1310,6 +1324,8 @@ class Scheduler(SchedulerInterface):
+             new_block_ids=new_block_ids,
+             num_computed_tokens=num_computed_tokens,
+             num_output_tokens=num_output_tokens,
++            num_dropped_tokens=num_dropped_tokens,
++            should_compress=should_compress,
+         )
+ 
+     def _try_schedule_encoder_inputs(
+@@ -1576,6 +1592,12 @@ class Scheduler(SchedulerInterface):
+                 continue
+ 
+             req_index = model_runner_output.req_id_to_index[req_id]
++            # R-KV: accumulate KV entries physically evicted this step so the
++            # next step's logical->physical position mapping stays consistent.
++            if model_runner_output.num_dropped_tokens_list:
++                request.num_dropped_tokens += (
++                    model_runner_output.num_dropped_tokens_list[req_index]
++                )
+             generated_token_ids = (
+                 sampled_token_ids[req_index] if sampled_token_ids else []
+             )
+diff --git a/vllm/v1/outputs.py b/vllm/v1/outputs.py
+index 9f13ad9..9934b30 100644
+--- a/vllm/v1/outputs.py
++++ b/vllm/v1/outputs.py
+@@ -266,6 +266,9 @@ class ModelRunnerOutput:
+     # req_id -> num_nans_in_logits
+     num_nans_in_logits: dict[str, int] | None = None
+ 
++    # R-KV: [num_reqs] KV entries physically evicted this step (0 if none).
++    num_dropped_tokens_list: list[int] = field(default_factory=list)
++
+     # information related to cudagraph execution
+     cudagraph_stats: CUDAGraphStat | None = None
+ 
+diff --git a/vllm/v1/request.py b/vllm/v1/request.py
+index 0e8d4ee..2a85c8f 100644
+--- a/vllm/v1/request.py
++++ b/vllm/v1/request.py
+@@ -151,6 +151,10 @@ class Request:
+ 
+         self.spec_token_ids: list[int] = []
+         self.num_computed_tokens = 0
++        # R-KV: number of KV entries physically evicted so far, and whether the
++        # scheduler armed this request for compression on the current step.
++        self.num_dropped_tokens = 0
++        self.should_compress = False
+         self.cache_salt: str | None = cache_salt
+ 
+         # Multi-modal related
+diff --git a/vllm/v1/worker/gpu_input_batch.py b/vllm/v1/worker/gpu_input_batch.py
+index 28d1a04..b0310b6 100644
+--- a/vllm/v1/worker/gpu_input_batch.py
++++ b/vllm/v1/worker/gpu_input_batch.py
+@@ -43,6 +43,9 @@ class CachedRequestState:
+     num_computed_tokens: int
+     output_token_ids: list[int]
+ 
++    # R-KV: number of KV entries physically evicted for this request so far.
++    num_dropped_tokens: int = 0
++
+     mrope_positions: torch.Tensor | None = None
+     mrope_position_delta: int | None = None
+ 
+@@ -168,6 +171,10 @@ class InputBatch:
+         )
+         self.num_computed_tokens_cpu = self.num_computed_tokens_cpu_tensor.numpy()
+ 
++        # R-KV: per-request physically-evicted KV count and per-step gate.
++        self.num_dropped_tokens_cpu = np.zeros(max_num_reqs, dtype=np.int32)
++        self.should_compress_list = [False] * max_num_reqs
++
+         # Block table.
+         self.block_table = MultiGroupBlockTable(
+             max_num_reqs=max_num_reqs,
+@@ -376,6 +383,8 @@ class InputBatch:
+         self.num_tokens_no_spec[req_index] = request.num_tokens
+ 
+         self.num_computed_tokens_cpu[req_index] = request.num_computed_tokens
++        self.num_dropped_tokens_cpu[req_index] = request.num_dropped_tokens
++        self.should_compress_list[req_index] = False
+         self.block_table.add_row(request.block_ids, req_index)
+ 
+         if sampling_params := request.sampling_params:
+@@ -755,6 +764,12 @@ class InputBatch:
+             self.num_computed_tokens_cpu[empty_index] = self.num_computed_tokens_cpu[
+                 last_req_index
+             ]
++            self.num_dropped_tokens_cpu[empty_index] = self.num_dropped_tokens_cpu[
++                last_req_index
++            ]
++            self.should_compress_list[empty_index] = self.should_compress_list[
++                last_req_index
++            ]
+             self.block_table.move_row(last_req_index, empty_index)
+ 
+             self.request_lora_mapping[empty_index] = self.request_lora_mapping[
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index e9b23f1..64a52c9 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -769,6 +769,26 @@ class GPUModelRunner(
+             self.max_num_reqs, dtype=torch.int32
+         )
+ 
++        # R-KV: decode-time redundancy-aware KV-cache compression. When
++        # ``VLLM_V1_R_KV_BUDGET``/``BUFFER`` are unset (0) this is fully inert
++        # and none of the R-KV code paths below execute. When enabled the KV
++        # cache physically shrinks after eviction, so slot writes use *physical*
++        # positions while RoPE keeps *logical* positions; these buffers hold the
++        # physical positions and per-request evicted counts.
++        self.rkv_enabled = (
++            envs.VLLM_V1_R_KV_BUDGET > 0 and envs.VLLM_V1_R_KV_BUFFER > 0
++        )
++        if self.rkv_enabled:
++            self.rkv_physical_positions = self._make_buffer(
++                self.max_num_tokens, dtype=torch.int64
++            )
++            self.rkv_dropped = self._make_buffer(
++                self.max_num_reqs, dtype=torch.int32
++            )
++            self._rkv_should_compress_list: tuple[bool, ...] | None = None
++            self._rkv_num_dropped_tokens_list: list[int] | None = None
++            self._rkv_occupied_slot_mapping: torch.Tensor | None = None
++
+         self.encoder_seq_lens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
+         if self.dcp_world_size > 1:
+             self.dcp_local_seq_lens = self._make_buffer(
+@@ -1312,6 +1332,8 @@ class GPUModelRunner(
+             new_block_ids = req_data.new_block_ids[i]
+             resumed_from_preemption = req_id in req_data.resumed_req_ids
+             num_output_tokens = req_data.num_output_tokens[i]
++            num_dropped_tokens = req_data.num_dropped_tokens[i]
++            should_compress = req_data.should_compress[i]
+             req_index = self.input_batch.req_id_to_index.get(req_id)
+ 
+             if req_state.prev_num_draft_len and self.use_async_scheduling:
+@@ -1358,7 +1380,7 @@ class GPUModelRunner(
+ 
+             # Update the cached states.
+             req_state.num_computed_tokens = num_computed_tokens
+-
++            req_state.num_dropped_tokens = num_dropped_tokens
+             if not is_last_rank:
+                 if not req_data.new_token_ids:
+                     # Async scheduled PP: Sampled tokens propagated via GPU broadcast.
+@@ -1424,6 +1446,8 @@ class GPUModelRunner(
+ 
+             # Update the persistent batch.
+             self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
++            self.input_batch.num_dropped_tokens_cpu[req_index] = num_dropped_tokens
++            self.input_batch.should_compress_list[req_index] = should_compress
+             if new_block_ids is not None:
+                 self.input_batch.block_table.append_row(new_block_ids, req_index)
+ 
+@@ -1911,6 +1935,80 @@ class GPUModelRunner(
+ 
+         return encoder_seq_lens, encoder_seq_lens_cpu
+ 
++    def _rkv_prepare_physical(
++        self,
++        num_reqs: int,
++        total_num_scheduled_tokens: int,
++        req_indices: np.ndarray,
++        positions_np: np.ndarray,
++        num_scheduled_tokens: np.ndarray,
++        num_scheduled_tokens_gpu: torch.Tensor,
++    ) -> None:
++        """R-KV: compute physical positions/seq_lens after KV eviction.
++
++        RoPE keeps the *logical* positions already written into
++        ``self.positions``. Because the paged KV cache physically shrinks by
++        ``num_dropped_tokens`` per request after each compaction, the slot
++        mapping (where new KV is written) and the attention ``seq_lens`` use
++        *physical* positions instead. When any request is armed for compression
++        this step, this also builds ``occupied_slot_mapping`` -- the physical
++        slot id of every currently-occupied KV entry, laid out per request --
++        which the FlashAttention backend hands to the R-KV compressor so it can
++        read and overwrite each request's full KV in place.
++        """
++        dropped_np = self.input_batch.num_dropped_tokens_cpu[:num_reqs]
++        # Physical position of each scheduled token = logical - dropped.
++        self.rkv_physical_positions.np[:total_num_scheduled_tokens] = (
++            positions_np - dropped_np[req_indices]
++        )
++        self.rkv_physical_positions.copy_to_gpu(total_num_scheduled_tokens)
++
++        self.rkv_dropped.np[:num_reqs] = dropped_np
++        self.rkv_dropped.copy_to_gpu(num_reqs)
++        self.seq_lens[:num_reqs] = (
++            self.num_computed_tokens[:num_reqs]
++            - self.rkv_dropped.gpu[:num_reqs]
++            + num_scheduled_tokens_gpu
++        )
++        self.seq_lens[num_reqs:].fill_(0)
++
++        self.input_batch.block_table.compute_slot_mapping(
++            num_reqs,
++            self.query_start_loc.gpu[: num_reqs + 1],
++            self.rkv_physical_positions.gpu[:total_num_scheduled_tokens],
++        )
++
++        # Snapshot the per-request compression gate + evicted-count sink used by
++        # the attention backend / scheduler this step.
++        should_compress = tuple(self.input_batch.should_compress_list[:num_reqs])
++        self._rkv_should_compress_list = should_compress
++        self._rkv_num_dropped_tokens_list = [0] * num_reqs
++
++        if not any(should_compress):
++            self._rkv_occupied_slot_mapping = None
++            return
++
++        # occupied_slot_mapping: physical slot id of every occupied KV entry,
++        # laid out per request over its live range [0, num_kv + num_scheduled).
++        num_computed_np = self.input_batch.num_computed_tokens_cpu[:num_reqs]
++        num_kv_cache_tokens = num_computed_np - dropped_np
++        num_live = num_kv_cache_tokens + num_scheduled_tokens
++        total_kv = int(num_live.sum())
++        occ_req = np.repeat(self.arange_np[:num_reqs], num_live)
++        occ_cu = np.cumsum(num_live)
++        occ_offsets = np.repeat(occ_cu - num_live, num_live)
++        occ_positions = self.arange_np[:total_kv] - occ_offsets
++        blk = self.input_batch.block_table[0]
++        block_size = blk.block_size
++        block_table_np = blk.block_table.np
++        max_blocks = block_table_np.shape[1]
++        occ_block_idx = occ_req * max_blocks + occ_positions // block_size
++        block_numbers = block_table_np.reshape(-1)[occ_block_idx].astype(np.int64)
++        occ_slots = block_numbers * block_size + occ_positions % block_size
++        self._rkv_occupied_slot_mapping = torch.from_numpy(occ_slots).to(
++            self.device, non_blocking=True
++        )
++
+     def _prepare_inputs(
+         self,
+         scheduler_output: "SchedulerOutput",
+@@ -2143,16 +2241,29 @@ class GPUModelRunner(
+             self.num_computed_tokens[req_indices_gpu].to(torch.int64)
+             + self.query_pos.gpu[:total_num_scheduled_tokens]
+         )
+-        self.seq_lens[:num_reqs] = (
+-            self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
+-        )
+-        self.seq_lens[num_reqs:].fill_(0)
++        if self.rkv_enabled:
++            # R-KV: RoPE keeps the logical positions above; the physical KV
++            # cache has shrunk by ``num_dropped_tokens`` per request, so seq_lens
++            # and slot writes use physical positions (see helper).
++            self._rkv_prepare_physical(
++                num_reqs,
++                total_num_scheduled_tokens,
++                req_indices,
++                positions_np,
++                num_scheduled_tokens,
++                num_scheduled_tokens_gpu,
++            )
++        else:
++            self.seq_lens[:num_reqs] = (
++                self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
++            )
++            self.seq_lens[num_reqs:].fill_(0)
+ 
+-        self.input_batch.block_table.compute_slot_mapping(
+-            num_reqs,
+-            self.query_start_loc.gpu[: num_reqs + 1],
+-            self.positions[:total_num_scheduled_tokens],
+-        )
++            self.input_batch.block_table.compute_slot_mapping(
++                num_reqs,
++                self.query_start_loc.gpu[: num_reqs + 1],
++                self.positions[:total_num_scheduled_tokens],
++            )
+ 
+         # Copy the tensors to the GPU.
+         self._prepare_input_ids(
+@@ -2395,6 +2506,14 @@ class GPUModelRunner(
+             rswa_prefix_lens=rswa_prefix_lens,
+         )
+ 
++        if self.rkv_enabled:
++            # R-KV: hand the decode-time compression metadata to the attention
++            # backend (populated in _rkv_prepare_physical). None on steps where
++            # no request is armed for compression.
++            cm_base.should_compress_list = self._rkv_should_compress_list
++            cm_base.num_dropped_tokens_list = self._rkv_num_dropped_tokens_list
++            cm_base.occupied_slot_mapping = self._rkv_occupied_slot_mapping
++
+         if self.dcp_world_size > 1:
+             self.dcp_local_seq_lens.cpu[:num_reqs] = get_dcp_local_seq_lens(
+                 self.optimistic_seq_lens_cpu[:num_reqs],
+@@ -4682,6 +4801,11 @@ class GPUModelRunner(
+                 routed_experts=None,
+             )
+ 
++        if self.rkv_enabled and self._rkv_num_dropped_tokens_list is not None:
++            # R-KV: report tokens physically evicted this step so the scheduler
++            # can grow each request's logical->physical position offset.
++            output.num_dropped_tokens_list = self._rkv_num_dropped_tokens_list
++
+         if not self.use_async_scheduling:
+             if self.routed_experts_initialized:
+                 # Sync path: D2H was issued in ``_bookkeeping_sync`` and
