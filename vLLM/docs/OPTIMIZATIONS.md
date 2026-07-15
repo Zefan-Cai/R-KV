@@ -19,9 +19,30 @@ NVIDIA H100** (vLLM 0.25.1, torch 2.11+cu130, `Qwen2.5-0.5B` / `Qwen2.5-Math-7B`
 - **Quality scales with budget** — `budget=256` matches Full-KV's reasoning;
   `budget=64` stays coherent with minor artifacts (expected at an aggressive
   budget on a 0.5B model).
-- **Batch > 1** — multiple concurrent requests compress independently.
+- **Batch > 1** — validated up to 64 concurrent requests; each compresses
+  independently.
 - **Out-of-the-box** — setting `BUDGET`/`BUFFER` auto-selects the V1 runner; no
   flags required beyond `--enforce-eager`.
+
+### Measured throughput (H100, Qwen2.5-0.5B, equal work, `ignore_eos`)
+
+This is a **non-memory-bound** microbenchmark (0.5B on an 80GB H100 → huge KV
+pool), so it measures R-KV's **overhead**, not its benefit. R-KV's advantage
+(constant per-request KV footprint → more concurrency / longer context) only
+shows up when memory-bound.
+
+| Config | N×tok | tok/s |
+| --- | --- | --- |
+| Full-KV (V2 runner + CUDA graph, production default) | 64×512 | ~27,800 |
+| Full-KV (eager, fair baseline) | 64×512 | ~6,740 |
+| R-KV budget=512 buffer=64 (eager) | 32×1024 | ~2,460 (−32% vs fair eager) |
+| R-KV budget=256 buffer=64 (eager) | 32×1024 | ~2,170 (−40% vs fair eager) |
+
+Two separate costs stack here: (a) **forcing eager** (no CUDA graph) is the
+largest factor (~4× on this tiny model), and (b) **compaction overhead**
+(O(seq²) scoring) adds ~32–40% on top. Both match the SGLang port's findings for
+short, non-memory-bound decode. Raising `buffer` (compact less often) and
+larger models shrink the relative overhead.
 
 ### Bugs found & fixed during GPU validation
 
@@ -32,6 +53,9 @@ NVIDIA H100** (vLLM 0.25.1, torch 2.11+cu130, `Qwen2.5-0.5B` / `Qwen2.5-Math-7B`
    indexing (gather on read, scatter in place on write).
 3. R-KV silently no-op'd on v0.25.1's default V2 model runner. Fixed: R-KV
    auto-selects the V1 runner when enabled (`VllmConfig.use_v2_model_runner`).
+4. `occupied_slot_mapping` indexed the fixed-size `arange_np`, overflowing when
+   total batch KV exceeded one step's token budget (batch>1, long context).
+   Fixed: build the per-request position ramp with `np.arange(total_kv)`.
 
 ## Known limitations
 

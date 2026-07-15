@@ -296,7 +296,7 @@ index 28d1a04..b0310b6 100644
  
              self.request_lora_mapping[empty_index] = self.request_lora_mapping[
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index e9b23f1..64a52c9 100644
+index e9b23f1..f2bf503 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
 @@ -769,6 +769,26 @@ class GPUModelRunner(
@@ -353,7 +353,7 @@ index e9b23f1..64a52c9 100644
              if new_block_ids is not None:
                  self.input_batch.block_table.append_row(new_block_ids, req_index)
  
-@@ -1911,6 +1935,80 @@ class GPUModelRunner(
+@@ -1911,6 +1935,83 @@ class GPUModelRunner(
  
          return encoder_seq_lens, encoder_seq_lens_cpu
  
@@ -419,7 +419,10 @@ index e9b23f1..64a52c9 100644
 +        occ_req = np.repeat(self.arange_np[:num_reqs], num_live)
 +        occ_cu = np.cumsum(num_live)
 +        occ_offsets = np.repeat(occ_cu - num_live, num_live)
-+        occ_positions = self.arange_np[:total_kv] - occ_offsets
++        # NOTE(R-KV): the total occupied KV across the batch can exceed
++        # ``self.arange_np`` (sized for a single step's tokens), so build the
++        # per-request position ramp directly rather than slicing arange_np.
++        occ_positions = np.arange(total_kv, dtype=np.int64) - occ_offsets
 +        blk = self.input_batch.block_table[0]
 +        block_size = blk.block_size
 +        block_table_np = blk.block_table.np
@@ -434,7 +437,7 @@ index e9b23f1..64a52c9 100644
      def _prepare_inputs(
          self,
          scheduler_output: "SchedulerOutput",
-@@ -2143,16 +2241,29 @@ class GPUModelRunner(
+@@ -2143,16 +2244,29 @@ class GPUModelRunner(
              self.num_computed_tokens[req_indices_gpu].to(torch.int64)
              + self.query_pos.gpu[:total_num_scheduled_tokens]
          )
@@ -473,7 +476,7 @@ index e9b23f1..64a52c9 100644
  
          # Copy the tensors to the GPU.
          self._prepare_input_ids(
-@@ -2395,6 +2506,14 @@ class GPUModelRunner(
+@@ -2395,6 +2509,14 @@ class GPUModelRunner(
              rswa_prefix_lens=rswa_prefix_lens,
          )
  
@@ -488,7 +491,7 @@ index e9b23f1..64a52c9 100644
          if self.dcp_world_size > 1:
              self.dcp_local_seq_lens.cpu[:num_reqs] = get_dcp_local_seq_lens(
                  self.optimistic_seq_lens_cpu[:num_reqs],
-@@ -4682,6 +4801,11 @@ class GPUModelRunner(
+@@ -4682,6 +4804,11 @@ class GPUModelRunner(
                  routed_experts=None,
              )
  
