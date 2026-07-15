@@ -27,14 +27,25 @@ NVIDIA H100** (vLLM 0.25.1, torch 2.11+cu130, `Qwen2.5-0.5B` / `Qwen2.5-Math-7B`
 | Config | Accuracy |
 | --- | --- |
 | Full-KV | 94.5% (189/200) |
-| R-KV budget=512 buffer=64 | **92.5%** (185/200) — near-lossless |
+| R-KV budget=512 buffer=64 | 92.5% (185/200) |
+| R-KV budget=384 buffer=128 | 90.5% (181/200) |
+| R-KV budget=256 buffer=256 | **90.0%** (180/200) |
+| R-KV budget=256 buffer=128 | 82.5% (165/200) |
 | R-KV budget=256 buffer=64 | 72.5% (145/200) |
-| R-KV budget=128 buffer=64 | 36.5% (73/200) |
 
-**R-KV is near-lossless at `budget=512`.** Accuracy falls off faster at tight
-budgets than the SGLang port (which holds ~0.90 at budget 256). The gap is the
-**observation-window scoring**, not the layer dimension (see the analysis under
-"Roadmap"). `budget≈512` is the recommended operating point today.
+**R-KV on vLLM reaches SGLang-parity accuracy** — near-lossless at `budget=512`,
+and ~90% at `budget=256` **when the buffer is large enough**. The `buffer` (how
+many tokens accumulate before each compaction) is the key quality knob at tight
+budgets: too small a buffer compacts too aggressively and too often. Larger
+buffers are also **faster** (fewer compactions). Recommended: `buffer ≈ budget`.
+
+> **Investigated & rejected: observation-window scoring.** The single-query
+> importance signal was hypothesized to be the tight-budget bottleneck, so a
+> per-request window of the last `window_size` decode queries was implemented.
+> It did **not** improve accuracy (budget 256: 70% vs 72.5%) and cost ~2.5×
+> throughput (per-step query recording), so it was reverted. The tight-budget
+> gap was the `buffer` setting, not the scoring window.
+
 
 
 ### Measured throughput (H100, Qwen2.5-0.5B, equal work, `ignore_eos`)
@@ -83,18 +94,12 @@ larger models shrink the relative overhead.
    `--enforce-eager` until a graph-safe path exists (the SGLang port runs a
    *hybrid* graph/eager path — window/compaction steps eager, the rest replayed).
 
-3. **Single-query importance (the tight-budget accuracy lever).** At compaction
-   time the compressor scores each past token by the attention it receives from
-   only the **current** decode query. The reference / SGLang port scores over a
-   trailing **observation window** of the last `window_size` decode queries,
-   which is a much more robust importance signal and is the main reason SGLang
-   holds ~0.90 at budget 256 while this port drops to ~0.73. Implementing the
-   window on vLLM needs runner-level per-request query state (stable across the
-   batch reordering that `condense()` performs), so it is a substantial change.
-   **Roadmap P1.** (Note: making the eviction decision *cross-layer* instead of
-   per-layer is **not** expected to help here — vLLM's per-layer caches let each
-   layer keep its own best tokens, which is strictly more expressive than the
-   single shared decision SGLang is forced into by its shared slot table.)
+3. **Accuracy is buffer-sensitive at tight budgets.** ~90% at budget 256
+   requires `buffer ≈ budget`; a small buffer compacts too aggressively and
+   drops accuracy (see the table above). This is a tuning property, not a bug.
+   The observation-window and cross-layer ideas were investigated and are **not**
+   needed (per-layer caches are already more expressive than SGLang's shared
+   decision; the window regressed throughput without helping accuracy).
 
 4. **FlashAttention backend only.** Other backends (FlashInfer, Triton, MLA) are
    untouched — R-KV is a no-op there. **Roadmap P3.**
@@ -111,9 +116,9 @@ larger models shrink the relative overhead.
 
 | # | Item | Status | Payoff |
 | --- | --- | --- | --- |
-| P5 | Accuracy sweep (GSM8K, Math-7B) | **done** | near-lossless @ budget 512 |
+| P5 | Accuracy sweep (GSM8K, Math-7B) | **done** | SGLang parity: 90% @ b256/buf256, near-lossless @ 512 |
 | P2 | Skip `occupied_slot_mapping` build when nothing compacts | **done** | lower pre-compaction overhead |
-| P1 | Observation-window importance scoring | todo | tight-budget accuracy parity with SGLang |
+| P1 | Observation-window / cross-layer scoring | **done (rejected)** | no accuracy gain; accuracy is buffer-tunable instead |
 | P0 | Port wiring to the V2 GPU model runner | todo | works on the default runner |
 | P3 | FlashInfer + other backends | todo | broader coverage |
 | P4 | Hybrid CUDA-graph path | todo | throughput (avoid full eager) |
