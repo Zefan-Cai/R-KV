@@ -190,6 +190,42 @@ wiring patch is untouched.
     on** (`VllmConfig.__post_init__`). Lifted `budget=256 buffer=64` from
     82.0% → **87.5%** (SGLang: 88.5%) and restored `buffer=128` to lossless
     90.5%.
+11. **Preemption left the dropped-token counter stale.** `_preempt_request`
+    resets `num_computed_tokens = 0` (a preempted request recomputes from
+    scratch) but left `num_dropped_tokens` untouched, so on resume the physical
+    position (`logical − dropped`) would go **negative** and corrupt the paged
+    KV. Fixed: reset `num_dropped_tokens = 0` alongside `num_computed_tokens`.
+    Defensive — preemption does not fire on the GSM8K sweep (no accuracy change),
+    but the reset is required for correctness under high-concurrency / memory
+    pressure. Found while investigating the `buffer=16` gap (see below).
+
+## Tight-buffer (`buffer=16`) accuracy gap — investigated, numerics-bound
+
+At `budget=256 buffer=16` vLLM scores **83.0%** (batch) / 84.5% (single-stream)
+vs SGLang's **88.0%**. A full step-by-step differential (as for bug #10) found
+**no discrete logic bug** — the gap is engine-kernel numerics amplified by the
+4× higher compaction frequency:
+
+- **Cadence is identical** to SGLang (vLLM `[712, 272, 272, 272, 272]` vs SGLang
+  `[711, 272, 272, 272]` for the same prompt — a 1-token off-by-one only).
+- **Single-prompt is correct** and matches SGLang (the prompts that run away in a
+  batch are correct in isolation).
+- **The gap is mostly intrinsic, not batch**: even at `max_num_seqs=1` vLLM is
+  84.5% (< SGLang 88%). vLLM is buffer-*sensitive* (87.5% → 84.5% from buf64 →
+  buf16); SGLang is buffer-*flat* (88.5% → 88.0%).
+- **Ruled out**: async scheduling (off), negative/out-of-range physical positions
+  (none), preemption (never fires here), slot collisions (none), cadence, and the
+  algorithm (bit-identical).
+- **Deterministic**: two identical batch runs are byte-for-byte identical (same
+  runaways), so it is **not a race** — the batch effect is deterministic
+  batched-matmul K/Q variation (FlashAttention batch ≠ single) amplified by
+  R-KV's discrete top-k over the 12 compactions per request at buf16.
+
+Conclusion: the same FlashAttention-vs-FlashInfer K/Q numeric difference behind
+buf64's ~1-point residual, scaled ~4× by the 4× compaction frequency. vLLM's
+post-RoPE keys match the HuggingFace reference bit-closely; SGLang deviates but
+its ranking is more stable across frequent re-selection. Not fixable without
+matching kernels. **Use `buffer ≥ 64`** (`buffer=128` is lossless).
 
 ## Known limitations
 
