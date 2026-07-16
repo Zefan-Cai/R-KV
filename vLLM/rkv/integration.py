@@ -513,9 +513,15 @@ class RKVCompressor:
         seq_starts_cpu = seq_starts.tolist()
         seq_ends_cpu = seq_ends.tolist()
 
-        # Phase A0: collect the armed-and-over-threshold requests and their
-        # occupied slots.
-        armed: list[tuple[int, int, int, torch.Tensor]] = []
+        # Phase A: for each group of armed requests that share a cache length,
+        # pick the kept set and collect its source/destination slot ids -- scored,
+        # top-k selected, sorted and gathered ONE group at a time (requests
+        # batched into the leading dim), so this launch-bound work is amortized
+        # across the ~budget/buffer requests that compact together. The physical
+        # relocation is deferred to Phase B. Reference mode already has each
+        # request's per-layer-summed score in ``score_acc``.
+        batched = self.config.score_mode == "batched"
+        groups: dict[int, list[tuple[int, int, torch.Tensor]]] = {}
         for i in range(num_reqs):
             if not should_compress[i]:
                 continue
@@ -523,61 +529,59 @@ class RKVCompressor:
             if seq_len < threshold:
                 continue
             kv_start = seq_starts_cpu[i]
-            kv_end = seq_ends_cpu[i]
-            armed.append((i, seq_len, kv_start, occupied_slot_mapping[kv_start:kv_end]))
-        if not armed:
+            groups.setdefault(seq_len, []).append(
+                (i, kv_start, occupied_slot_mapping[kv_start : seq_ends_cpu[i]])
+            )
+        if not groups:
             return
 
-        # Phase A1: cross-layer scoring. In batched mode, group requests by cache
-        # length so every request in a group shares ONE cosine-similarity +
-        # attention scoring call (and one K gather per layer) -- the redundancy
-        # scoring is launch-bound, so amortizing it across the ~budget/buffer
-        # requests that compact together is the dominant win at small buffers.
-        # Reference mode already has each request's score in ``score_acc``.
-        scores: dict[int, torch.Tensor] = {}
-        if self.config.score_mode == "batched":
-            groups: dict[int, list[tuple[int, torch.Tensor]]] = {}
-            for (i, seq_len, kv_start, slots) in armed:
-                groups.setdefault(seq_len, []).append((i, slots))
-            for members in groups.values():
-                idxs = [m[0] for m in members]
-                grp = self._score_group(
-                    layer_caches, idxs, [m[1] for m in members], block_size
-                )
-                if grp is not None:
-                    for r, i in enumerate(idxs):
-                        scores[i] = grp[r]
-
-        # Phase A2: pick each request's kept set and collect its source /
-        # destination slot ids. The physical relocation is deferred to Phase B so
-        # it can run as ONE gather+scatter per layer across ALL requests, instead
-        # of per (request, layer) -- that per-request x per-layer loop was the
-        # dominant eviction cost at small buffers (many tiny kernel launches).
         src_slots: list[torch.Tensor] = []
         dst_slots: list[torch.Tensor] = []
-        for (i, seq_len, kv_start, slots) in armed:
-            score = score_acc[i] if score_acc[i] is not None else scores.get(i)
-            if score is None:
+        for seq_len, members in groups.items():
+            idxs = [m[0] for m in members]
+            slots_list = [m[2] for m in members]
+            if batched:
+                grp_scores = self._score_group(
+                    layer_caches, idxs, slots_list, block_size
+                )
+            else:
+                grp_scores = torch.stack([score_acc[i] for i in idxs])
+            if grp_scores is None:
                 continue
+            g = len(idxs)
+            dev = grp_scores.device
 
-            # One global kept set: top past tokens + trailing observation window,
-            # sorted ascending to keep the survivors in temporal order.
-            past_idx = score.topk(num_past).indices
+            # One global kept set per request: top past tokens + trailing
+            # observation window, sorted ascending to keep temporal order --
+            # top-k / sort / gather batched across the whole group.
+            past_idx = grp_scores.topk(num_past, dim=-1).indices  # (g, num_past)
             window_idx = torch.arange(
-                seq_len - window, seq_len, device=past_idx.device
-            )
-            kept = torch.sort(torch.cat([past_idx, window_idx])).values
+                seq_len - window, seq_len, device=dev
+            ).expand(g, window)
+            kept = torch.sort(
+                torch.cat([past_idx, window_idx], dim=-1), dim=-1
+            ).values  # (g, budget)
 
-            src_slots.append(slots[kept])
-            dst_slots.append(occupied_slot_mapping[kv_start : kv_start + budget])
-            num_dropped_tokens_list[i] = seq_len - budget
+            # Source = each request's kept occupied slots; destination = its
+            # leading ``budget`` occupied slots.
+            src_grp = torch.gather(torch.stack(slots_list), 1, kept)  # (g, budget)
+            kv_starts = torch.tensor(
+                [m[1] for m in members], device=dev
+            ).unsqueeze(1)
+            dst_grp = occupied_slot_mapping[
+                kv_starts + torch.arange(budget, device=dev)
+            ]  # (g, budget)
+            src_slots.append(src_grp.reshape(-1))
+            dst_slots.append(dst_grp.reshape(-1))
 
-            self._n_compactions += 1
+            for i in idxs:
+                num_dropped_tokens_list[i] = seq_len - budget
+                self._n_compactions += 1
             if os.getenv("VLLM_V1_R_KV_TRACE") == "1":
                 print(
-                    f"[RKV-COMPACT] #{self._n_compactions} "
+                    f"[RKV-COMPACT] #{self._n_compactions} group={g} "
                     f"layers={len(layer_caches)} seq_len={seq_len} "
-                    f"kept={int(kept.numel())} dropped={seq_len - budget}",
+                    f"kept={budget} dropped={seq_len - budget}",
                     flush=True,
                 )
 
