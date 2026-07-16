@@ -34,11 +34,11 @@ same *patch-not-fork* layout as the [SGLang port](../SGLang/README.md).
 ## Why a patch, not a fork?
 
 R-KV touches vLLM in a **small, purely additive** way: one self-contained
-package (`rkv/`) plus ~522 lines of wiring across **13** existing files. Instead
+package (`rkv/`) plus ~632 lines of wiring across **13** existing files. Instead
 of vendoring the entire vLLM tree, this directory ships:
 
 - `rkv/` — the R-KV code (browsable, the source of truth);
-- `patch/rkv-vllm-0.25.1.patch` — the 10-file wiring diff;
+- `patch/rkv-vllm-0.25.1.patch` — the 13-file wiring diff;
 - `scripts/apply_rkv.sh` — clones the **exact pinned** vLLM commit, drops in
   `rkv/`, and applies the patch.
 
@@ -50,7 +50,7 @@ vLLM/
 ├── README.md                      # you are here
 ├── requirements-rkv.txt           # dependency notes (R-KV adds none)
 ├── rkv/                           # R-KV package (algo, integration)
-├── patch/rkv-vllm-0.25.1.patch    # wiring diff (10 upstream files)
+├── patch/rkv-vllm-0.25.1.patch    # wiring diff (13 upstream files)
 ├── scripts/apply_rkv.sh           # clone pinned vLLM + drop in rkv/ + apply patch
 ├── benchmark/                     # benchmarking notes
 ├── docs/                          # DESIGN, IMPLEMENTATION, OPTIMIZATIONS, REPRODUCE

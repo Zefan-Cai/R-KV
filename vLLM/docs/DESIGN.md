@@ -26,18 +26,23 @@ tested against the reference.
 
 ## 2. The core tension (per-head vs. per-token)
 
-The algorithm is **per-head / per-layer**: different heads may keep different
-tokens. But vLLM's paged KV cache is addressed by a shared `slot_mapping` /
-block table — one logical position maps to one physical slot **per layer**.
+The algorithm scores tokens **per head / per layer**: on its own each head or
+layer would keep a different set of tokens. But vLLM's paged KV cache is
+addressed by a shared `slot_mapping` / block table — one logical position maps
+to one physical slot, and every layer must evict the *same* logical positions or
+the physical layout diverges across layers.
 
-This vLLM port resolves the tension the same way the original proof-of-concept
-did: compression runs **per attention layer** inside `forward`, keeping exactly
-`budget` entries and writing the survivors into that layer's leading physical
-slots. Because every layer keeps the same *count* (`budget`), the block table
-stays consistent across layers even though the *identity* of the kept tokens can
-differ per layer. (Making a single cross-layer decision, as the SGLang port
-does, is a fidelity improvement tracked in
-[`OPTIMIZATIONS.md`](./OPTIMIZATIONS.md).)
+This port makes **one global kept set** and applies it to every layer, mirroring
+the SGLang R-KV port. Compaction is two-phase: inside each attention `forward`,
+`observe_layer` reduces that layer's score across KV heads (**mean**) and adds
+it into a per-request cross-layer accumulator (**sum** across layers) and
+registers the layer's KV; after the full forward, `compact_step` turns the
+summed score into a single kept set (top `budget − window_size` past tokens plus
+the trailing `window_size` observation window) and relocates exactly that set
+into the leading `budget` physical slots of **every** layer. One decision, one
+dropped count — so the block table and physical positions stay consistent across
+all layers. Under tensor parallelism the per-rank partial scores are all-reduced
+before the top-k so every rank keeps the identical set.
 
 ## 3. Logical vs. physical positions
 

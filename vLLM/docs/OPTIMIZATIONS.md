@@ -429,19 +429,45 @@ the principled default). **Use `buffer ≥ 64`** (`buffer=128` is lossless).
    the top-k cutoff, amplified by buf16's ~12 compactions/request (bug #12 fixed
    the larger part via `mix_lambda`). Recommended: `buffer ≥ 64`.
 
-4. **FlashAttention backend only.** Other backends (FlashInfer, Triton, MLA) are
-   untouched — R-KV is a no-op there. **Roadmap P3.**
+4. **FlashAttention backend only — enforced.** R-KV's scoring/eviction hooks run
+   inside the FlashAttention forward; other backends (FlashInfer, Triton, MLA)
+   never call them. R-KV now **refuses to start** (raises `ValueError` in
+   `GPUModelRunner._rkv_validate_kv_cache`) on a non-FlashAttention cache group
+   instead of silently running Full-KV. **Roadmap P3** — support more backends.
 
 5. **`optimistic_seq_lens_cpu` stays logical.** It is used only as an upper
    bound (`max_seq_len`), so an over-estimate is safe, but a few code paths that
    read the CPU seq-len copy should be audited on GPU.
 
-6. **Interactions not yet exercised:** speculative decoding, **pipeline**
-   parallelism (R-KV's cross-layer score would be split across PP ranks and
-   would need a further reduction), M-RoPE models. Start validation with these
-   **off**. Tensor & data parallelism **are** supported (see the validation
-   record); prefix caching is auto-disabled (bug #6); async scheduling is
-   opt-in via `VLLM_V1_R_KV_ASYNC`.
+6. **Fail-closed support scope.** R-KV is validated only for a single
+   FullAttention paged KV cache on FlashAttention, so it **raises `ValueError`
+   at startup** on combinations it cannot safely support — rather than
+   corrupting KV or silently running Full-KV:
+
+   - speculative / multi-token decode (KV is evicted right after the forward,
+     before draft tokens are verified, and cannot be rolled back);
+   - pipeline parallelism (`PP>1`) and decode context parallelism (`DCP>1`,
+     whose logical local seq-lengths are not reconciled with R-KV's physical
+     ones);
+   - quantized / FP8 KV cache (scoring runs in the KV storage dtype);
+   - more than one KV cache group, or a non-`FullAttentionSpec` group
+     (hybrid / Mamba / sliding-window models);
+   - any non-FlashAttention cache layer.
+
+   `RKVConfig` also validates its own knobs (`budget > window`, `buffer ≥
+   window`, positive odd `kernel_size`, parameter ranges) and raises on bad
+   values. **Supported:** tensor & data parallelism, PIECEWISE cudagraph,
+   opt-in async scheduling (`VLLM_V1_R_KV_ASYNC`); prefix caching is
+   auto-disabled. Speculative decoding, PP/DCP and hybrid models stay
+   **roadmap** items (compaction after acceptance; a cross-PP score reduction;
+   per-group slot mappings).
+
+7. **Batched-scoring memory is not a hard cap.** `compact_step` batches
+   same-length requests into one cross-layer GEMM, chunked over *layers* by
+   `VLLM_V1_R_KV_SCORE_CHUNK_MB` (default 512 MB) but **not** over requests, so
+   a very large simultaneous compaction (`num_requests × kv_heads × seq_len²`)
+   can still exceed it on small-VRAM GPUs. Validated at batch 256 on H100.
+   **Roadmap** — chunk the request dimension too.
 
 ## Roadmap
 

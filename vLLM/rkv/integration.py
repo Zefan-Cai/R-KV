@@ -106,6 +106,47 @@ class RKVConfig:
     score_mode: str = "batched"
     score_chunk_bytes: int = 512 * 1024 * 1024
 
+    def __post_init__(self) -> None:
+        # Only validate an *enabled* config: with budget or buffer_size == 0
+        # R-KV is a pure no-op, so the (otherwise out-of-range) zero values must
+        # be tolerated rather than rejected.
+        if not (self.budget > 0 and self.buffer_size > 0):
+            return
+        if self.window_size <= 0:
+            raise ValueError(
+                f"R-KV window_size ({self.window_size}) must be positive."
+            )
+        if self.budget <= self.window_size:
+            raise ValueError(
+                f"R-KV budget ({self.budget}) must be greater than window_size "
+                f"({self.window_size})."
+            )
+        if self.buffer_size < self.window_size:
+            raise ValueError(
+                f"R-KV buffer_size ({self.buffer_size}) must be >= window_size "
+                f"({self.window_size}); a smaller buffer compacts before the "
+                "observation window is full, scoring against stale/zero queries."
+            )
+        if self.kernel_size <= 0 or self.kernel_size % 2 == 0:
+            raise ValueError(
+                f"R-KV kernel_size ({self.kernel_size}) must be a positive odd "
+                "integer (an even kernel makes the max-pool output one longer "
+                "than the score, so scoring raises a shape-mismatch error)."
+            )
+        if not 0.0 <= self.mix_lambda <= 1.0:
+            raise ValueError(
+                f"R-KV mix_lambda ({self.mix_lambda}) must be in [0, 1]."
+            )
+        if not 0.0 < self.retain_ratio <= 1.0:
+            raise ValueError(
+                f"R-KV retain_ratio ({self.retain_ratio}) must be in (0, 1]."
+            )
+        if self.score_mode not in ("batched", "reference"):
+            raise ValueError(
+                f"R-KV score_mode ({self.score_mode!r}) must be 'batched' or "
+                "'reference'."
+            )
+
     @classmethod
     def from_env(cls) -> "RKVConfig":
         return cls(

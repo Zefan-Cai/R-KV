@@ -1,5 +1,5 @@
 diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
-index e8796a3..2860ba0 100644
+index e8796a3..157f438 100644
 --- a/vllm/config/vllm.py
 +++ b/vllm/config/vllm.py
 @@ -517,6 +517,11 @@ class VllmConfig:
@@ -14,10 +14,64 @@ index e8796a3..2860ba0 100644
          use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
          if use_v2_model_runner is not None:
              return use_v2_model_runner
-@@ -872,6 +877,73 @@ class VllmConfig:
+@@ -872,6 +877,127 @@ class VllmConfig:
          # To give each torch profile run a unique instance name.
          self.instance_id = f"{time.time_ns()}"
  
++        # R-KV (redundancy-aware KV compression) is validated only on a narrow,
++        # well-tested configuration: a single FullAttention paged KV cache on the
++        # FlashAttention backend, no in-flight KV rollback, and physical (not
++        # logical) sequence lengths. Several vLLM features would silently corrupt
++        # KV state or run Full-KV without noticing under R-KV, so **fail closed**
++        # here rather than only documenting the limitation. (The single-cache-
++        # group / FullAttention / FlashAttention / non-sliding-window checks need
++        # the KV cache spec, so they live in
++        # ``GPUModelRunner._rkv_validate_kv_cache``.)
++        if envs.VLLM_V1_R_KV_BUDGET > 0 and envs.VLLM_V1_R_KV_BUFFER > 0:
++            if self.speculative_config is not None:
++                raise ValueError(
++                    "R-KV is incompatible with speculative decoding: compaction "
++                    "permanently evicts KV right after the forward, before draft "
++                    "tokens are verified, so KV for rejected tokens cannot be "
++                    "rolled back. Disable speculative decoding or R-KV."
++                )
++            if (
++                self.parallel_config is not None
++                and self.parallel_config.pipeline_parallel_size > 1
++            ):
++                raise ValueError(
++                    "R-KV does not support pipeline parallelism "
++                    f"(pipeline_parallel_size="
++                    f"{self.parallel_config.pipeline_parallel_size}): its "
++                    "cross-layer score would be split across PP stages. Use "
++                    "pipeline_parallel_size=1 (tensor & data parallelism are "
++                    "supported)."
++                )
++            if (
++                self.parallel_config is not None
++                and self.parallel_config.decode_context_parallel_size > 1
++            ):
++                raise ValueError(
++                    "R-KV does not support decode context parallelism "
++                    f"(decode_context_parallel_size="
++                    f"{self.parallel_config.decode_context_parallel_size}): R-KV "
++                    "uses physical KV seq_lens while DCP derives local seq "
++                    "lengths from logical positions; the two are not yet "
++                    "reconciled."
++                )
++            if self.cache_config is not None and self.cache_config.cache_dtype not in (
++                "auto",
++                "float16",
++                "bfloat16",
++            ):
++                raise ValueError(
++                    "R-KV requires an unquantized (fp16/bf16) KV cache: its "
++                    "similarity/attention scoring runs in the KV storage dtype, "
++                    "which is unreliable or unsupported for "
++                    f"cache_dtype={self.cache_config.cache_dtype!r}. Use "
++                    "--kv-cache-dtype auto."
++                )
++
 +        # R-KV (redundancy-aware KV compression) physically evicts and relocates
 +        # KV in place. Prefix caching shares KV blocks across requests, so an
 +        # in-place eviction in one request would corrupt the shared prefix of
@@ -552,7 +606,7 @@ index 28d1a04..b0310b6 100644
  
              self.request_lora_mapping[empty_index] = self.request_lora_mapping[
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index e9b23f1..9c6d074 100644
+index e9b23f1..8cdddc0 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
 @@ -769,6 +769,45 @@ class GPUModelRunner(
@@ -632,7 +686,7 @@ index e9b23f1..9c6d074 100644
              if new_block_ids is not None:
                  self.input_batch.block_table.append_row(new_block_ids, req_index)
  
-@@ -1911,6 +1958,101 @@ class GPUModelRunner(
+@@ -1911,6 +1958,111 @@ class GPUModelRunner(
  
          return encoder_seq_lens, encoder_seq_lens_cpu
  
@@ -720,6 +774,16 @@ index e9b23f1..9c6d074 100644
 +        # ``self.arange_np`` (sized for a single step's tokens), so build the
 +        # per-request position ramp directly rather than slicing arange_np.
 +        occ_positions = np.arange(total_kv, dtype=np.int64) - occ_offsets
++        # R-KV addresses only the first KV cache group's block table (validated
++        # as the single FullAttention group in ``_rkv_validate_kv_cache``). A
++        # second block table here would mean a hybrid model slipped past that
++        # startup check -- fail rather than build a slot mapping that ignores the
++        # other groups.
++        if len(self.input_batch.block_table.block_tables) != 1:
++            raise ValueError(
++                "R-KV requires exactly one KV cache group; found "
++                f"{len(self.input_batch.block_table.block_tables)} block tables."
++            )
 +        blk = self.input_batch.block_table[0]
 +        block_size = blk.block_size
 +        block_table_np = blk.block_table.np
@@ -734,7 +798,7 @@ index e9b23f1..9c6d074 100644
      def _prepare_inputs(
          self,
          scheduler_output: "SchedulerOutput",
-@@ -2143,16 +2285,29 @@ class GPUModelRunner(
+@@ -2143,16 +2295,29 @@ class GPUModelRunner(
              self.num_computed_tokens[req_indices_gpu].to(torch.int64)
              + self.query_pos.gpu[:total_num_scheduled_tokens]
          )
@@ -773,7 +837,7 @@ index e9b23f1..9c6d074 100644
  
          # Copy the tensors to the GPU.
          self._prepare_input_ids(
-@@ -2395,6 +2550,29 @@ class GPUModelRunner(
+@@ -2395,6 +2560,29 @@ class GPUModelRunner(
              rswa_prefix_lens=rswa_prefix_lens,
          )
  
@@ -803,7 +867,7 @@ index e9b23f1..9c6d074 100644
          if self.dcp_world_size > 1:
              self.dcp_local_seq_lens.cpu[:num_reqs] = get_dcp_local_seq_lens(
                  self.optimistic_seq_lens_cpu[:num_reqs],
-@@ -4358,6 +4536,33 @@ class GPUModelRunner(
+@@ -4358,6 +4546,33 @@ class GPUModelRunner(
                  **model_kwargs,
              )
  
@@ -837,7 +901,7 @@ index e9b23f1..9c6d074 100644
          with record_function_or_nullcontext("gpu_model_runner: postprocess"):
              if self.use_aux_hidden_state_outputs:
                  # True when EAGLE 3 is used.
-@@ -4682,6 +4887,11 @@ class GPUModelRunner(
+@@ -4682,6 +4897,11 @@ class GPUModelRunner(
                  routed_experts=None,
              )
  
@@ -849,3 +913,63 @@ index e9b23f1..9c6d074 100644
          if not self.use_async_scheduling:
              if self.routed_experts_initialized:
                  # Sync path: D2H was issued in ``_bookkeeping_sync`` and
+@@ -7419,6 +7639,8 @@ class GPUModelRunner(
+         self.may_add_encoder_only_layers_to_kv_cache_config()
+         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
+         self.initialize_attn_backend(kv_cache_config, is_profiling=is_profiling)
++        if self.rkv_enabled:
++            self._rkv_validate_kv_cache(kv_cache_config)
+         initialize_mamba_ssu_backend(
+             self.vllm_config.mamba_config, self.kv_cache_config
+         )
+@@ -7461,6 +7683,50 @@ class GPUModelRunner(
+                 kv_transfer_group.register_kv_caches(kv_caches)
+             kv_transfer_group.set_host_xfer_buffer_ops(copy_kv_blocks)
+ 
++    def _rkv_validate_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
++        """Fail closed if the KV cache layout is one R-KV cannot safely compact.
++
++        R-KV evicts and relocates KV **in place** against a single paged cache:
++        it builds the occupied slot mapping from the first KV cache group's
++        block table and applies one kept-set decision (and one dropped-token
++        count) to every registered FlashAttention layer. On a hybrid / multi-
++        group model (sliding-window + full attention, Mamba/attention, differing
++        block layouts) that assumption breaks -- the group-0 slot mapping does
++        not describe the other groups, and the scheduler would free blocks for
++        all of them with the same count. A non-FlashAttention backend never runs
++        R-KV's in-forward hooks, so R-KV would silently degrade to Full-KV.
++        Refuse to start in those cases instead of corrupting or no-op'ing.
++        """
++        groups = kv_cache_config.kv_cache_groups
++        if len(groups) != 1:
++            raise ValueError(
++                f"R-KV requires exactly one KV cache group, found {len(groups)} "
++                "(hybrid / sliding-window + full-attention / Mamba models are "
++                "not supported). Disable R-KV for this model."
++            )
++        spec = groups[0].kv_cache_spec
++        if not isinstance(spec, FullAttentionSpec):
++            raise ValueError(
++                "R-KV requires a FullAttentionSpec KV cache group, found "
++                f"{type(spec).__name__} (sliding-window / Mamba / other cache "
++                "specs are not supported)."
++            )
++        if getattr(spec, "sliding_window", None):
++            raise ValueError(
++                "R-KV does not support sliding-window attention: vLLM may free "
++                "out-of-window blocks that R-KV still lists in its occupied slot "
++                "mapping, so it could read from or write survivors into a freed "
++                "block."
++            )
++        for attn_group in self.attn_groups[0]:
++            name = attn_group.backend.get_name()
++            if name != "FLASH_ATTN":
++                raise ValueError(
++                    f"R-KV requires the FlashAttention backend, found {name!r}. "
++                    "R-KV's scoring/eviction hooks run inside FlashAttention's "
++                    "forward only; other backends would silently run Full-KV."
++                )
++
+     def _get_attention_kv_cache_gid(self) -> int:
+         """Find the KV cache group index for attention layers.
+ 
