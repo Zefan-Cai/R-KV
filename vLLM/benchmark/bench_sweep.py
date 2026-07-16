@@ -68,6 +68,9 @@ if CONC > 0:
     kw["max_num_seqs"] = CONC
 if os.environ.get("RKV_NOASYNC") == "1":
     kw["async_scheduling"] = False
+if os.environ.get("RKV_NOPREFIX") == "1":
+    kw["enable_prefix_caching"] = False
+    tag = tag + "-noprefix"
 # RKV_EAGER=1 (default) forces eager; RKV_EAGER=0 lets R-KV run under PIECEWISE
 # cudagraph (the config auto-forces PIECEWISE when R-KV is on and not eager).
 _eager = os.environ.get("RKV_EAGER", "1") == "1"
