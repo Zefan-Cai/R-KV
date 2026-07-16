@@ -347,6 +347,23 @@ on Full-KV. See Known limitations #2.
     83.0→**85.5**, buf64 87.5→**89.0** (now ≥ SGLang's 88.5), buf128
     90.5→**91.5** (> SGLang's 89.0). (My earlier "0.07 is better" reading was
     confounded by the pre-fix async corruption, bug #10.)
+13. **Evicted KV blocks were never freed (no memory saving; the whole point of
+    R-KV).** Compaction only *flagged* evicted tokens via `num_dropped_tokens`
+    (used to compute physical positions); the scheduler's block manager never
+    referenced it, so it kept allocating a block per *logical* token. The KV
+    footprint grew unbounded with the sequence — R-KV shrank only the *attention*
+    length, not memory, and long generations could OOM. Fixed
+    (`KVCacheManager.allocate_slots` + coordinator/single-type managers): once a
+    request has compacted (`num_dropped_tokens > 0`) its physical KV is bounded
+    at `budget + buffer` tokens (survivors relocate to the low slots; new tokens
+    reuse the high slots each cycle), so cap the block reservation at
+    `ceil((budget+buffer)/block_size)+1` and free the high blocks holding only
+    evicted KV (reusing the sliding-window `_remove_blocks_in_range` null-fill).
+    The worker never indexes past the cap, so no block-table change is needed.
+    Gated by `VLLM_V1_R_KV_FREE_BLOCKS` (default on). Validated: accuracy
+    **bit-identical** (b256/buf64 = 89.0%); a 1500-token gen holds **21 blocks
+    vs 95**; under tight KV, 200×1024-token requests run at **8215 vs 4656 tok/s
+    (+76%)** because the bounded footprint lets far more run concurrently.
 
 ## Tight-buffer (`buffer=16`) gap — root-caused to `mix_lambda`, residual numerics
 
@@ -427,4 +444,4 @@ the principled default). **Use `buffer ≥ 64`** (`buffer=128` is lossless).
 | **P8** | **Make R-KV async-scheduling compatible** (runner-authoritative `num_dropped`, applied right after `compact_step` instead of the async-delayed scheduler round-trip) | **todo — 2nd lever** | **async scheduling = ~23% (measured); R-KV force-disables it for bug #10** |
 | P4a″ | Gate recording to the observation window | todo (now low value: `record_query` is only ~3% after P4a′) | mainly helps buf16 |
 | P4b | Full hybrid graph (also graph attention, eager only on compaction) | **dropped** | FULL vs PIECEWISE is only ~3% even with async off; not worth the in-attention-hook complexity |
-| P7 | Memory-bound benchmark (long context / high concurrency) | todo | demonstrate R-KV's *benefit* (constant KV footprint), not just its overhead |
+| P7 | Memory-bound benchmark (long context / high concurrency) | **unblocked** | bug #13 freed evicted blocks → bounded KV footprint; measured **+76% tok/s** (4656→8215) at 200×1024-tok under tight KV. A fuller sweep remains. |
