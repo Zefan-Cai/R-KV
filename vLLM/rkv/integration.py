@@ -78,7 +78,13 @@ class RKVConfig:
     buffer_size: int = 64
     window_size: int = 8
     kernel_size: int = 7
-    mix_lambda: float = 0.07
+    # ``mix_lambda`` weights importance vs. redundancy in the joint score
+    # (``mix_lambda*importance - (1-mix_lambda)*redundancy``). 0.1 matches the
+    # SGLang R-KV port's runtime config and the reference HF eval scripts; the
+    # R-KV *algorithm* class default is 0.07, but the eval-validated value is
+    # 0.1. Using 0.07 measurably lowers accuracy and the loss compounds at tight
+    # buffers (more compactions): b256 buf64 87.5->89.0, buf16 83.0->85.5.
+    mix_lambda: float = 0.1
     retain_ratio: float = 0.1
     retain_direction: str = "last"
     # Scoring path: "batched" (default; one cross-layer GEMM at compaction time,
@@ -97,7 +103,7 @@ class RKVConfig:
             buffer_size=_env_int("VLLM_V1_R_KV_BUFFER", 64),
             window_size=_env_int("VLLM_V1_R_KV_WINDOW", 8),
             kernel_size=_env_int("VLLM_V1_R_KV_KERNEL", 7),
-            mix_lambda=_env_float("VLLM_V1_R_KV_MIX_LAMBDA", 0.07),
+            mix_lambda=_env_float("VLLM_V1_R_KV_MIX_LAMBDA", 0.1),
             retain_ratio=_env_float("VLLM_V1_R_KV_RETAIN_RATIO", 0.1),
             score_mode=os.getenv("VLLM_V1_R_KV_SCORE_MODE", "batched"),
             score_chunk_bytes=_env_int("VLLM_V1_R_KV_SCORE_CHUNK_MB", 512)

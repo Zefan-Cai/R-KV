@@ -198,34 +198,40 @@ wiring patch is untouched.
     Defensive — preemption does not fire on the GSM8K sweep (no accuracy change),
     but the reset is required for correctness under high-concurrency / memory
     pressure. Found while investigating the `buffer=16` gap (see below).
+12. **`mix_lambda` default mismatched the reference (the tight-buffer gap).** The
+    joint score is `mix_lambda·importance − (1−mix_lambda)·redundancy`. vLLM
+    defaulted to **0.07** (the R-KV *algorithm class* default), but SGLang's
+    runtime `RKVConfig` and the reference HF eval scripts use **0.1**. The
+    importance/redundancy imbalance shifts the kept set, and the error
+    **compounds with compaction frequency** — so it hit `buffer=16` (≈12
+    compactions/request) far harder than `buffer=64` (≈3). This was the main
+    driver of the vLLM-vs-SGLang *buffer sensitivity*. Fixed: default
+    `mix_lambda = 0.1` (matches SGLang). Effect at `budget=256`: buf16
+    83.0→**85.5**, buf64 87.5→**89.0** (now ≥ SGLang's 88.5), buf128
+    90.5→**91.5** (> SGLang's 89.0). (My earlier "0.07 is better" reading was
+    confounded by the pre-fix async corruption, bug #10.)
 
-## Tight-buffer (`buffer=16`) accuracy gap — investigated, numerics-bound
+## Tight-buffer (`buffer=16`) gap — root-caused to `mix_lambda`, residual numerics
 
-At `budget=256 buffer=16` vLLM scores **83.0%** (batch) / 84.5% (single-stream)
-vs SGLang's **88.0%**. A full step-by-step differential (as for bug #10) found
-**no discrete logic bug** — the gap is engine-kernel numerics amplified by the
-4× higher compaction frequency:
+At `budget=256 buffer=16` vLLM originally scored **83.0%** vs SGLang's **88.0%**,
+and unlike SGLang was *buffer-sensitive* (buf64 87.5% → buf16 83.0%, vs SGLang's
+flat 88.5% → 88.0%). A full step-by-step differential (as for bug #10) traced
+most of that asymmetry to the **`mix_lambda` config mismatch** (bug #12):
 
-- **Cadence is identical** to SGLang (vLLM `[712, 272, 272, 272, 272]` vs SGLang
-  `[711, 272, 272, 272]` for the same prompt — a 1-token off-by-one only).
-- **Single-prompt is correct** and matches SGLang (the prompts that run away in a
-  batch are correct in isolation).
-- **The gap is mostly intrinsic, not batch**: even at `max_num_seqs=1` vLLM is
-  84.5% (< SGLang 88%). vLLM is buffer-*sensitive* (87.5% → 84.5% from buf64 →
-  buf16); SGLang is buffer-*flat* (88.5% → 88.0%).
-- **Ruled out**: async scheduling (off), negative/out-of-range physical positions
-  (none), preemption (never fires here), slot collisions (none), cadence, and the
-  algorithm (bit-identical).
-- **Deterministic**: two identical batch runs are byte-for-byte identical (same
-  runaways), so it is **not a race** — the batch effect is deterministic
-  batched-matmul K/Q variation (FlashAttention batch ≠ single) amplified by
-  R-KV's discrete top-k over the 12 compactions per request at buf16.
+- Cadence, single-prompt correctness, physical positions, preemption, slot
+  collisions and the algorithm were all verified **identical/correct**; two
+  identical batch runs are byte-for-byte deterministic (not a race).
+- The remaining lever was the R-KV **algorithm parameters**. Comparing them
+  against SGLang's runtime config exposed `mix_lambda` (0.07 vs 0.1). A clean
+  sweep confirmed it: at `mix_lambda=0.1`, buf64 matches SGLang and buf16 gains
+  +2.5.
 
-Conclusion: the same FlashAttention-vs-FlashInfer K/Q numeric difference behind
-buf64's ~1-point residual, scaled ~4× by the 4× compaction frequency. vLLM's
-post-RoPE keys match the HuggingFace reference bit-closely; SGLang deviates but
-its ranking is more stable across frequent re-selection. Not fixable without
-matching kernels. **Use `buffer ≥ 64`** (`buffer=128` is lossless).
+After the fix, `budget=256` `buffer≥64` **meets or beats SGLang**; only `buf16`
+still trails by ~2.5 pts (85.5% vs 88.0%). That residual is a genuine
+borderline-top-k sensitivity to the FlashAttention-vs-FlashInfer K/Q numerics,
+amplified ~4× by buf16's compaction frequency (a `mix_lambda` of 0.12 reaches
+89% at buf16 but that overfits and lowers buf64 — so 0.1, the SGLang/HF value, is
+the principled default). **Use `buffer ≥ 64`** (`buffer=128` is lossless).
 
 ## Known limitations
 

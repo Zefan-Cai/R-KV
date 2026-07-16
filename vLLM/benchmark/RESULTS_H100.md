@@ -30,23 +30,32 @@ after the async-scheduling fix (see
 ## Accuracy (% correct, 200 questions)
 
 Full-KV ceiling on this harness: **~91%** (181–182/200; Full-KV runs with async
-scheduling, so it varies ±1 question run-to-run).
+scheduling, so it varies ±1 question run-to-run). R-KV uses `mix_lambda=0.1`
+(matches SGLang; see note below).
 
 | budget \ buffer | 16 | 64 | 128 | 256 |
 | --- | --- | --- | --- | --- |
-| **128** | 64.0 | 75.5 | 82.0 | 90.5 |
-| **256** | 83.0 | 87.5 | 90.5 | 91.5 |
-| **512** | 89.5 | 90.0 | 91.0 | 91.5 |
+| **128** | 65.5 | 74.5 | 83.5 | 90.5 |
+| **256** | 85.5 | 89.0 | 91.5 | 91.5 |
+| **512** | 90.5 | 90.5 | 91.5 | 91.5 |
 
 - **Buffer is the accuracy knob at tight budgets.** At `budget=128`, raising the
-  buffer 16 → 256 recovers **+26.5 points** (64.0 → 90.5). At `budget=512` the
-  model is already near-lossless at every buffer (89.5 – 91.5).
-- **`budget=256 buffer=64` = 87.5%** matches the SGLang reference (88.5%) within
-  n=200 noise, and `buffer ≥ 128` is **lossless** (90.5 – 91.5% ≥ the ~91%
-  ceiling — the ≥100% cases are within noise).
-- Tighter configs also **generate longer** (avg gen-len 258 tok at
-  `b128/buf16` vs 171 at Full-KV): once critical context is evicted the model
-  rambles, which both lowers accuracy and adds work.
+  buffer 16 → 256 recovers **+25 points** (65.5 → 90.5). At `budget=512` the
+  model is already near-lossless at every buffer (90.5 – 91.5).
+- **`budget=256`: buf64 = 89.0% and buf128 = 91.5%** meet or exceed the SGLang
+  reference (88.5% / 89.0%). `buffer ≥ 128` is **lossless** (91.5% ≥ the ~91%
+  ceiling). `buf16 = 85.5%` still trails SGLang (88.0%) by ~2.5 pts — a
+  borderline top-k sensitivity to the FlashAttention-vs-FlashInfer K/Q numerics,
+  amplified by buf16's ~12 compactions/request (not a config or logic bug: the
+  algorithm parameters now match SGLang exactly).
+- **`mix_lambda` matters and is buffer-sensitive.** The joint score is
+  `mix_lambda·importance − (1−mix_lambda)·redundancy`. vLLM originally defaulted
+  to `0.07` (the R-KV *algorithm* class default); SGLang's runtime and the HF
+  reference eval use **`0.1`**. Switching to `0.1` lifts every tight-buffer
+  config (b256/buf16 83.0→85.5, buf64 87.5→89.0, buf128 90.5→91.5) and is the
+  bug behind the earlier buffer-sensitivity vs SGLang.
+- Tighter configs also **generate longer** (once critical context is evicted the
+  model rambles), which both lowers accuracy and adds work.
 
 ## Decode throughput (output tok/s, 8-way parallel, batched scoring)
 
@@ -93,21 +102,23 @@ compaction) are unchanged, as expected.
 
 ## Full per-config results
 
+Accuracy at `mix_lambda=0.1` (the default); throughput columns are from the
+batched-scoring run and are `mix_lambda`-independent.
+
 | Config | Accuracy | Decode tok/s | Total tok/s | Wall (s) | Avg gen len |
 | --- | --- | --- | --- | --- | --- |
-| Full-KV (async) | 90.5% (181/200) | 5138 | 26179 | 6.6 | 170 |
-| Full-KV (sync) | 90.0% (180/200) | 5330 | 27407 | 6.3 | 168 |
-| budget=128 buffer=16 | 64.0% (128/200) | 1812 | 6702 | 28.5 | 258 |
-| budget=128 buffer=64 | 75.5% (151/200) | 1969 | 8637 | 20.9 | 206 |
-| budget=128 buffer=128 | 82.0% (164/200) | 1947 | 9630 | 18.1 | 177 |
+| Full-KV (async) | ~91% (181/200) | 5138 | 26179 | 6.6 | 170 |
+| budget=128 buffer=16 | 65.5% (131/200) | 1812 | 6702 | 28.5 | 258 |
+| budget=128 buffer=64 | 74.5% (149/200) | 1969 | 8637 | 20.9 | 206 |
+| budget=128 buffer=128 | 83.5% (167/200) | 1947 | 9630 | 18.1 | 177 |
 | budget=128 buffer=256 | 90.5% (181/200) | 1946 | 9953 | 17.4 | 169 |
-| budget=256 buffer=16 | 83.0% (166/200) | 1723 | 7305 | 25.0 | 215 |
-| budget=256 buffer=64 | 87.5% (175/200) | 1977 | 8942 | 20.0 | 198 |
-| budget=256 buffer=128 | 90.5% (181/200) | 2058 | 9580 | 18.5 | 191 |
+| budget=256 buffer=16 | 85.5% (171/200) | 1723 | 7305 | 25.0 | 215 |
+| budget=256 buffer=64 | 89.0% (178/200) | 1977 | 8942 | 20.0 | 198 |
+| budget=256 buffer=128 | 91.5% (183/200) | 2058 | 9580 | 18.5 | 191 |
 | budget=256 buffer=256 | 91.5% (183/200) | 2017 | 10334 | 16.8 | 169 |
-| budget=512 buffer=16 | 89.5% (179/200) | 1492 | 7583 | 22.9 | 171 |
-| budget=512 buffer=64 | 90.0% (180/200) | 1892 | 9505 | 18.3 | 173 |
-| budget=512 buffer=128 | 91.0% (182/200) | 1962 | 10115 | 17.1 | 168 |
+| budget=512 buffer=16 | 90.5% (181/200) | 1492 | 7583 | 22.9 | 171 |
+| budget=512 buffer=64 | 90.5% (181/200) | 1892 | 9505 | 18.3 | 173 |
+| budget=512 buffer=128 | 91.5% (183/200) | 1962 | 10115 | 17.1 | 168 |
 | budget=512 buffer=256 | 91.5% (183/200) | 1985 | 10054 | 17.3 | 172 |
 
 ## Takeaways & recommendations
@@ -115,7 +126,10 @@ compaction) are unchanged, as expected.
 1. **`buffer ≈ budget` is the sweet spot** — it maximises both accuracy (lossless
    at `budget ≥ 256`) and throughput (fewest compactions). `budget=256
    buffer=256` = **91.5% @ 2017 tok/s**.
-2. **Tiny buffers hurt accuracy, not throughput (anymore).** `buffer=16` is the
+2. **`budget=256 buffer≥64` matches or beats SGLang** (buf64 89.0 vs 88.5, buf128
+   91.5 vs 89.0). `buffer=16` still trails by ~2.5 pts (85.5 vs 88.0) — residual
+   K/Q numerics near the top-k cutoff.
+3. **Tiny buffers hurt accuracy, not throughput (anymore).** `buffer=16` is the
    worst on accuracy (frequent, aggressive compaction); with batched scoring its
    throughput penalty is now only ~10–25% (was ~2.5×). Still avoid it for
    accuracy.
