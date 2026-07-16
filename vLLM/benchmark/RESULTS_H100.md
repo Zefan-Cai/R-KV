@@ -118,6 +118,30 @@ is graphed. Accuracy is within n=200 noise of eager; decode throughput is
 
 Run the sweep under cudagraph with `RKV_EAGER=0 bash run_sweep.sh`.
 
+> The R-KV rows above predate the `record_query` vectorization (P4a) below,
+> which lifts every R-KV config by +33–48%. See the next section for the
+> post-P4a numbers.
+
+### `record_query` vectorization (P4a)
+
+`record_query` was R-KV's #1 decode cost — a per-request Python loop doing a
+tiny GPU copy per request (~4.5k micro-launches/step at high concurrency), run
+once per layer. Replacing it with a fixed-address ring buffer written by a single
+`index_copy_` per layer (commit `cefd16a5`) recovers most of that overhead.
+Single-process on one H100 (b256, 200q, controlled A/B); **accuracy unchanged —
+eager buf64 = 89.0% (178/200), exactly matching pre-change**:
+
+| config | before tok/s | after tok/s | speedup |
+| --- | --- | --- | --- |
+| buf64 eager | 2122 | **3030** | **+43%** |
+| buf64 PIECEWISE | 2623 | **3880** | **+48%** |
+| buf16 PIECEWISE | 2103 | 2807 | +33% |
+| buf128 PIECEWISE | 2705 | 3747 | +39% |
+| buf256 PIECEWISE | 2686 | 3611 | +34% |
+
+With P4a, R-KV buf64 under PIECEWISE (3880) closes to ~48% of Full-KV PIECEWISE
+(8054) — up from ~33% before.
+
 ## Full per-config results
 
 Accuracy at `mix_lambda=0.1` (the default); throughput columns are from the
