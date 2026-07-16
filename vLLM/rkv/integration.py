@@ -391,53 +391,80 @@ class RKVCompressor:
         # ``compact_step`` can score/evict every layer with one global decision.
         attn_metadata.rkv_layer_caches.append((key_cache, value_cache, layer_wq))
 
-    def _batched_scores(self, layer_caches, i, slots, block_size):
-        """Cross-layer R-KV score for request ``i`` in one batched GEMM.
+    def _score_group(self, layer_caches, req_indices, slots_list, block_size):
+        """Cross-layer R-KV scores for a GROUP of requests sharing ``seq_len``.
 
-        Ports the SGLang R-KV optimization: instead of ``num_layers`` bsz=1
-        scoring calls interleaved in the forward, gather every registered
-        layer's K for this request, stack them with ``num_layers`` as the batch
-        dim, and run a single :meth:`R1KV._scores` call (cross-head **mean**,
-        then cross-layer **sum** in layer order -- identical to the per-layer
-        reference, since the batch GEMM computes independent per-layer results).
-        Chunked over layers so the transient cosine-similarity matrix stays
-        under ``score_chunk_bytes``. Returns ``(seq_len - window_size,)`` or
-        ``None`` if the observation window was not recorded for this request.
+        Generalizes the single-request batched score across requests: requests
+        in a group have the same cache length, so their per-layer keys stack
+        into one ``(num_layers*num_reqs, kv_heads, seq_len, hd)`` batch and the
+        whole group's cosine-similarity + attention GEMMs run in one
+        :meth:`R1KV._scores` call, with a single concatenated K gather per layer
+        for all requests (instead of a gather + score per request). Chunked over
+        layers to bound the transient cosine matrix. The cross-layer reduction
+        stays a **sequential** per-layer sum, so the result is bit-identical to
+        the per-request path. Returns ``(num_reqs, seq_len - window_size)`` or
+        ``None`` if any request's observation window was not recorded.
         """
-        wq = [lc[2].get(i) for lc in layer_caches]
-        if any(q is None for q in wq):
-            return None
-        blk = slots // block_size
-        off = slots % block_size
+        num_reqs = len(req_indices)
         num_layers = len(layer_caches)
         kv_heads = layer_caches[0][0].shape[2]
-        seq_len = slots.shape[0]
-        elt = layer_caches[0][0].element_size()
-        # cosine matrix (key dtype, x2 for softmax r/w) + bool mask + int32 idx,
-        # per (kv_heads, seq, seq) element -- bound the transient matrix memory.
-        per_layer = max(1, (2 * elt + 1 + 4) * kv_heads * seq_len * seq_len)
-        chunk = max(1, min(num_layers, self.config.score_chunk_bytes // per_layer))
+        head_dim = layer_caches[0][0].shape[3]
+        window = self.config.window_size
+        seq_len = slots_list[0].shape[0]
 
-        acc = None
+        for lc in layer_caches:
+            wqd = lc[2]
+            for i in req_indices:
+                if wqd.get(i) is None:
+                    return None
+
+        # One K gather per layer for the whole group (concatenated slots), in
+        # request order so the flat rows reshape back to (num_reqs, seq_len).
+        slots_cat = torch.cat(slots_list)
+        blk = slots_cat // block_size
+        off = slots_cat % block_size
+
+        elt = layer_caches[0][0].element_size()
+        # Transient cosine matrix per (layer, request) unit; bound total memory
+        # by chunking over layers (each chunk covers every request in the group).
+        per_unit = max(1, (2 * elt + 1 + 4) * kv_heads * seq_len * seq_len)
+        chunk = max(
+            1, min(num_layers, self.config.score_chunk_bytes // (per_unit * num_reqs))
+        )
+
+        acc = None  # (num_reqs, seq_len - window)
         for c in range(0, num_layers, chunk):
             hi = min(c + chunk, num_layers)
-            # (chunk, seq_len, kv_heads, hd) -> (chunk, kv_heads, seq_len, hd)
+            cl = hi - c
+            # (cl, num_reqs*seq_len, kv_heads, hd)
+            #   -> (cl*num_reqs, kv_heads, seq_len, hd)
             keys = (
                 torch.stack([layer_caches[l][0][blk, off] for l in range(c, hi)])
-                .transpose(1, 2)
+                .view(cl, num_reqs, seq_len, kv_heads, head_dim)
+                .permute(0, 1, 3, 2, 4)
+                .reshape(cl * num_reqs, kv_heads, seq_len, head_dim)
                 .contiguous()
             )
-            # (chunk, window, q_heads, hd) -> (chunk, q_heads, window, hd)
+            # (cl, num_reqs, window, q_heads, hd)
+            #   -> (cl*num_reqs, q_heads, window, hd)
+            queries = torch.stack(
+                [
+                    torch.stack([layer_caches[l][2][i] for i in req_indices])
+                    for l in range(c, hi)
+                ]
+            )
+            q_heads = queries.shape[3]
             queries = (
-                torch.stack([wq[l] for l in range(c, hi)])
-                .transpose(1, 2)
+                queries.permute(0, 1, 3, 2, 4)
+                .reshape(cl * num_reqs, q_heads, window, head_dim)
                 .contiguous()
             )
-            # (chunk, kv_heads, seq_len - window) -> cross-head mean
+            # (cl*num_reqs, kv_heads, seq_len - window) -> cross-head mean
             layer_scores = self.algo._scores(keys, queries).mean(dim=1)
-            for li in range(layer_scores.shape[0]):
-                s = layer_scores[li]
-                acc = s if acc is None else acc + s
+            layer_scores = layer_scores.view(cl, num_reqs, seq_len - window)
+            # Sequential per-layer sum (bit-identical to the per-request path).
+            for li in range(cl):
+                acc = layer_scores[li] if acc is None else acc + layer_scores[li]
         return acc
 
     def compact_step(
@@ -486,31 +513,50 @@ class RKVCompressor:
         seq_starts_cpu = seq_starts.tolist()
         seq_ends_cpu = seq_ends.tolist()
 
-        # Phase A: pick each armed request's kept set and collect its source /
-        # destination slot ids. The physical relocation is deferred to Phase B so
-        # it can run as ONE gather+scatter per layer across ALL requests, instead
-        # of per (request, layer) -- that per-request x per-layer loop was the
-        # dominant compaction cost at small buffers (many tiny kernel launches).
-        src_slots: list[torch.Tensor] = []
-        dst_slots: list[torch.Tensor] = []
+        # Phase A0: collect the armed-and-over-threshold requests and their
+        # occupied slots.
+        armed: list[tuple[int, int, int, torch.Tensor]] = []
         for i in range(num_reqs):
             if not should_compress[i]:
                 continue
             seq_len = seq_lens_cpu[i]
             if seq_len < threshold:
                 continue
-
             kv_start = seq_starts_cpu[i]
             kv_end = seq_ends_cpu[i]
-            slots = occupied_slot_mapping[kv_start:kv_end]
+            armed.append((i, seq_len, kv_start, occupied_slot_mapping[kv_start:kv_end]))
+        if not armed:
+            return
 
-            # Cross-layer score: accumulated per layer during the forward
-            # (reference mode) or computed now in one batched GEMM (batched
-            # mode). Batched matches the reference sum (independent per-layer
-            # GEMMs) with far fewer kernel launches.
-            score = score_acc[i]
-            if score is None:
-                score = self._batched_scores(layer_caches, i, slots, block_size)
+        # Phase A1: cross-layer scoring. In batched mode, group requests by cache
+        # length so every request in a group shares ONE cosine-similarity +
+        # attention scoring call (and one K gather per layer) -- the redundancy
+        # scoring is launch-bound, so amortizing it across the ~budget/buffer
+        # requests that compact together is the dominant win at small buffers.
+        # Reference mode already has each request's score in ``score_acc``.
+        scores: dict[int, torch.Tensor] = {}
+        if self.config.score_mode == "batched":
+            groups: dict[int, list[tuple[int, torch.Tensor]]] = {}
+            for (i, seq_len, kv_start, slots) in armed:
+                groups.setdefault(seq_len, []).append((i, slots))
+            for members in groups.values():
+                idxs = [m[0] for m in members]
+                grp = self._score_group(
+                    layer_caches, idxs, [m[1] for m in members], block_size
+                )
+                if grp is not None:
+                    for r, i in enumerate(idxs):
+                        scores[i] = grp[r]
+
+        # Phase A2: pick each request's kept set and collect its source /
+        # destination slot ids. The physical relocation is deferred to Phase B so
+        # it can run as ONE gather+scatter per layer across ALL requests, instead
+        # of per (request, layer) -- that per-request x per-layer loop was the
+        # dominant eviction cost at small buffers (many tiny kernel launches).
+        src_slots: list[torch.Tensor] = []
+        dst_slots: list[torch.Tensor] = []
+        for (i, seq_len, kv_start, slots) in armed:
+            score = score_acc[i] if score_acc[i] is not None else scores.get(i)
             if score is None:
                 continue
 
