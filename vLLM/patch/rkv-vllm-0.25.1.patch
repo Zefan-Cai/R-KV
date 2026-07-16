@@ -86,10 +86,10 @@ index e8796a3..ac9afe3 100644
              logger.info_once("Performance mode set to '%s'.", self.performance_mode)
  
 diff --git a/vllm/envs.py b/vllm/envs.py
-index 13a19b8..0c57509 100755
+index 13a19b8..bc2f4dc 100755
 --- a/vllm/envs.py
 +++ b/vllm/envs.py
-@@ -150,6 +150,13 @@ if TYPE_CHECKING:
+@@ -150,6 +150,14 @@ if TYPE_CHECKING:
      VLLM_RUST_FRONTEND_PATH: str | None = "auto"
      VLLM_SERVER_DEV_MODE: bool = False
      VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
@@ -100,10 +100,11 @@ index 13a19b8..0c57509 100755
 +    VLLM_V1_R_KV_BUFFER: int = 0
 +    VLLM_V1_R_KV_WINDOW: int = 8
 +    VLLM_V1_R_KV_KERNEL: int = 7
++    VLLM_V1_R_KV_FREE_BLOCKS: bool = True
      VLLM_MLA_DISABLE: bool = False
      VLLM_RAY_PER_WORKER_GPUS: float = 1.0
      VLLM_RAY_BUNDLE_INDICES: str = ""
-@@ -1323,6 +1330,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
+@@ -1323,6 +1331,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
      "VLLM_V1_OUTPUT_PROC_CHUNK_SIZE": lambda: int(
          os.getenv("VLLM_V1_OUTPUT_PROC_CHUNK_SIZE", "128")
      ),
@@ -113,6 +114,12 @@ index 13a19b8..0c57509 100755
 +    "VLLM_V1_R_KV_BUFFER": lambda: int(os.getenv("VLLM_V1_R_KV_BUFFER", "0")),
 +    "VLLM_V1_R_KV_WINDOW": lambda: int(os.getenv("VLLM_V1_R_KV_WINDOW", "8")),
 +    "VLLM_V1_R_KV_KERNEL": lambda: int(os.getenv("VLLM_V1_R_KV_KERNEL", "7")),
++    # Free the KV blocks R-KV evicts (bounded footprint) instead of only
++    # flagging them; set 0 to keep the pre-fix behavior (blocks held per logical
++    # token). On by default.
++    "VLLM_V1_R_KV_FREE_BLOCKS": lambda: bool(
++        int(os.getenv("VLLM_V1_R_KV_FREE_BLOCKS", "1"))
++    ),
      # If set, vLLM will disable the MLA attention optimizations.
      "VLLM_MLA_DISABLE": lambda: bool(int(os.getenv("VLLM_MLA_DISABLE", "0"))),
      # If set, vLLM will pick up the provided Flash Attention MLA
@@ -233,6 +240,84 @@ index db5b0dd..322d36b 100755
                  return output
  
          # Cascade attention (rare case).
+diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
+index a759d7a..568c6db 100644
+--- a/vllm/v1/core/kv_cache_coordinator.py
++++ b/vllm/v1/core/kv_cache_coordinator.py
+@@ -351,6 +351,15 @@ class KVCacheCoordinator(ABC):
+                 request_id, total_computed_tokens, num_prompt_tokens
+             )
+ 
++    def remove_rkv_evicted_blocks(
++        self, request_id: str, num_keep_blocks: int
++    ) -> None:
++        """R-KV: free each group's blocks above ``num_keep_blocks`` (the request's
++        bounded physical footprint after compaction). See
++        ``SingleTypeKVCacheManager.remove_rkv_evicted_blocks``."""
++        for manager in self.single_type_managers:
++            manager.remove_rkv_evicted_blocks(request_id, num_keep_blocks)
++
+     def get_blocks(self, request_id: str) -> tuple[list[KVCacheBlock], ...]:
+         """
+         Get the blocks for the request.
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+index 89ec30b..4643c03 100644
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -9,6 +9,7 @@ from typing import Literal, overload
+ from vllm.distributed.kv_events import BlockStored, KVCacheEvent
+ from vllm.logger import init_logger
+ from vllm.utils.math_utils import cdiv
++import vllm.envs as envs
+ from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
+ from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+ from vllm.v1.core.kv_cache_utils import KVCacheBlock
+@@ -161,6 +162,18 @@ class KVCacheManager:
+         self.block_pool = self.coordinator.block_pool
+         self.kv_cache_config = kv_cache_config
+ 
++        # R-KV: when enabled, a compacted request's physical KV is bounded at
++        # ``budget + buffer`` tokens, so its block reservation is capped there
++        # and the excess (evicted) blocks are freed. Cached here (env is fixed
++        # for the process). ``block_size`` (one token per slot) sizes the cap.
++        self.block_size = scheduler_block_size
++        self._rkv_free_blocks = (
++            bool(envs.VLLM_V1_R_KV_FREE_BLOCKS) and envs.VLLM_V1_R_KV_BUDGET > 0
++        )
++        self._rkv_cap_tokens = (
++            envs.VLLM_V1_R_KV_BUDGET + envs.VLLM_V1_R_KV_BUFFER + scheduler_block_size
++        )
++
+         # Watermark: minimum number of KV cache blocks to keep free when
+         # admitting waiting/preempted requests, to avoid frequent preemptions.
+         assert watermark >= 0.0, "watermark must be non-negative"
+@@ -395,6 +408,26 @@ class KVCacheManager:
+             num_tokens_main_model + num_lookahead_tokens, self.max_model_len
+         )
+ 
++        # R-KV: after a compaction the request's *physical* KV cache is bounded
++        # at ``budget + buffer`` tokens (eviction returns it to ``budget`` every
++        # ``buffer`` decode steps and the freed physical slots are reused), even
++        # though the logical sequence keeps growing. Cap the block reservation at
++        # that bound and free the high blocks that now hold only evicted KV, so
++        # R-KV actually shrinks the KV-cache footprint instead of holding a block
++        # per logical token. Guarded on ``num_dropped_tokens > 0`` -- set only by
++        # R-KV and only once a request has compacted -- so prefill and non-R-KV
++        # requests are untouched. The worker never indexes past the cap (physical
++        # positions stay below it), so the block table needs no update.
++        if self._rkv_free_blocks and request.num_dropped_tokens > 0:
++            if self._rkv_cap_tokens < num_tokens_need_slot:
++                num_tokens_need_slot = self._rkv_cap_tokens
++                num_tokens_main_model = min(
++                    num_tokens_main_model, self._rkv_cap_tokens
++                )
++            self.coordinator.remove_rkv_evicted_blocks(
++                request.request_id, cdiv(self._rkv_cap_tokens, self.block_size)
++            )
++
+         # Free the blocks that are skipped during the attention computation
+         # (e.g., tokens outside the sliding window).
+         # We can do this even if we cannot schedule this request due to
 diff --git a/vllm/v1/core/sched/output.py b/vllm/v1/core/sched/output.py
 index 291e73b..0cb1151 100644
 --- a/vllm/v1/core/sched/output.py
@@ -348,6 +433,39 @@ index 8e01035..375f014 100644
              generated_token_ids = (
                  sampled_token_ids[req_index] if sampled_token_ids else []
              )
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index 642fe3e..7fb7aad 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -543,6 +543,28 @@ class SingleTypeKVCacheManager(ABC):
+         num_skipped_blocks = min(num_skipped_blocks, len(blocks))
+         self._remove_blocks_in_range(request_id, 0, num_skipped_blocks)
+ 
++    def remove_rkv_evicted_blocks(
++        self, request_id: str, num_keep_blocks: int
++    ) -> None:
++        """R-KV: free the blocks above the request's bounded physical footprint.
++
++        After an R-KV compaction the physical KV cache is at most
++        ``budget + buffer`` tokens laid out contiguously from position 0 (the
++        survivors are relocated into the low slots and new tokens reuse the same
++        high slots each cycle), even though the logical sequence keeps growing.
++        Blocks beyond ``num_keep_blocks`` therefore hold only evicted KV and are
++        returned to the pool so other requests can reuse them -- this is what
++        turns R-KV's compaction into an actual KV-cache-memory saving instead of
++        a per-logical-token allocation. The worker never indexes past the cap
++        (physical positions stay below it), so no block-table update is needed;
++        freed entries become ``null_block``, mirroring ``remove_skipped_blocks``.
++        """
++        if request_id not in self.req_to_blocks:
++            return
++        self._remove_blocks_in_range(
++            request_id, num_keep_blocks, len(self.req_to_blocks[request_id])
++        )
++
+     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
+         """
+         Get the number of tokens that will be skipped for attention computation.
 diff --git a/vllm/v1/outputs.py b/vllm/v1/outputs.py
 index 9f13ad9..9934b30 100644
 --- a/vllm/v1/outputs.py
