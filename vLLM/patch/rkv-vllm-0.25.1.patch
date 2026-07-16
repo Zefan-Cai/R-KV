@@ -1,5 +1,5 @@
 diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
-index e8796a3..ac9afe3 100644
+index e8796a3..2860ba0 100644
 --- a/vllm/config/vllm.py
 +++ b/vllm/config/vllm.py
 @@ -517,6 +517,11 @@ class VllmConfig:
@@ -14,7 +14,7 @@ index e8796a3..ac9afe3 100644
          use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
          if use_v2_model_runner is not None:
              return use_v2_model_runner
-@@ -872,6 +877,70 @@ class VllmConfig:
+@@ -872,6 +877,73 @@ class VllmConfig:
          # To give each torch profile run a unique instance name.
          self.instance_id = f"{time.time_ns()}"
  
@@ -43,10 +43,13 @@ index e8796a3..ac9afe3 100644
 +        # the next decode token overwrites a surviving KV slot -- a
 +        # batch-dependent cache corruption that only appears under the memory
 +        # pressure of many concurrent requests. Force synchronous scheduling
-+        # when R-KV is enabled so the eviction accounting is always current.
++        # when R-KV is enabled so the eviction accounting is always current --
++        # unless ``VLLM_V1_R_KV_ASYNC`` opts in to the runner-authoritative path
++        # (the runner applies the drop itself right after compaction).
 +        if (
 +            envs.VLLM_V1_R_KV_BUDGET > 0
 +            and envs.VLLM_V1_R_KV_BUFFER > 0
++            and not envs.VLLM_V1_R_KV_ASYNC
 +            and self.scheduler_config is not None
 +            and self.scheduler_config.async_scheduling is not False
 +        ):
@@ -86,10 +89,10 @@ index e8796a3..ac9afe3 100644
              logger.info_once("Performance mode set to '%s'.", self.performance_mode)
  
 diff --git a/vllm/envs.py b/vllm/envs.py
-index 13a19b8..bc2f4dc 100755
+index 13a19b8..0c3448a 100755
 --- a/vllm/envs.py
 +++ b/vllm/envs.py
-@@ -150,6 +150,14 @@ if TYPE_CHECKING:
+@@ -150,6 +150,15 @@ if TYPE_CHECKING:
      VLLM_RUST_FRONTEND_PATH: str | None = "auto"
      VLLM_SERVER_DEV_MODE: bool = False
      VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
@@ -101,10 +104,11 @@ index 13a19b8..bc2f4dc 100755
 +    VLLM_V1_R_KV_WINDOW: int = 8
 +    VLLM_V1_R_KV_KERNEL: int = 7
 +    VLLM_V1_R_KV_FREE_BLOCKS: bool = True
++    VLLM_V1_R_KV_ASYNC: bool = False
      VLLM_MLA_DISABLE: bool = False
      VLLM_RAY_PER_WORKER_GPUS: float = 1.0
      VLLM_RAY_BUNDLE_INDICES: str = ""
-@@ -1323,6 +1331,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
+@@ -1323,6 +1332,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
      "VLLM_V1_OUTPUT_PROC_CHUNK_SIZE": lambda: int(
          os.getenv("VLLM_V1_OUTPUT_PROC_CHUNK_SIZE", "128")
      ),
@@ -120,6 +124,11 @@ index 13a19b8..bc2f4dc 100755
 +    "VLLM_V1_R_KV_FREE_BLOCKS": lambda: bool(
 +        int(os.getenv("VLLM_V1_R_KV_FREE_BLOCKS", "1"))
 +    ),
++    # Allow R-KV to run under async scheduling (the runner then applies its
++    # evicted-token count itself, right after compaction, instead of waiting for
++    # the scheduler's one-step-delayed feedback). Off by default = force
++    # synchronous scheduling (the safe pre-P8 behavior).
++    "VLLM_V1_R_KV_ASYNC": lambda: bool(int(os.getenv("VLLM_V1_R_KV_ASYNC", "0"))),
      # If set, vLLM will disable the MLA attention optimizations.
      "VLLM_MLA_DISABLE": lambda: bool(int(os.getenv("VLLM_MLA_DISABLE", "0"))),
      # If set, vLLM will pick up the provided Flash Attention MLA
@@ -543,10 +552,10 @@ index 28d1a04..b0310b6 100644
  
              self.request_lora_mapping[empty_index] = self.request_lora_mapping[
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index e9b23f1..3b7b8b8 100644
+index e9b23f1..9c6d074 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
-@@ -769,6 +769,38 @@ class GPUModelRunner(
+@@ -769,6 +769,45 @@ class GPUModelRunner(
              self.max_num_reqs, dtype=torch.int32
          )
  
@@ -563,6 +572,13 @@ index e9b23f1..3b7b8b8 100644
 +            self._rkv_threshold = (
 +                envs.VLLM_V1_R_KV_BUDGET + envs.VLLM_V1_R_KV_BUFFER
 +            )
++            # Async-scheduling compatibility (opt-in). When on, the runner is
++            # authoritative on ``num_dropped_tokens``: it applies each request's
++            # evicted count to ``input_batch.num_dropped_tokens_cpu`` right after
++            # compaction (below) and _update_states skips the scheduler's
++            # one-step-delayed feedback, so the next step's physical KV positions
++            # are always current (avoids the bug #10 async corruption).
++            self.rkv_async = bool(envs.VLLM_V1_R_KV_ASYNC)
 +            self.rkv_physical_positions = self._make_buffer(
 +                self.max_num_tokens, dtype=torch.int64
 +            )
@@ -585,7 +601,7 @@ index e9b23f1..3b7b8b8 100644
          self.encoder_seq_lens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
          if self.dcp_world_size > 1:
              self.dcp_local_seq_lens = self._make_buffer(
-@@ -1312,6 +1344,8 @@ class GPUModelRunner(
+@@ -1312,6 +1351,8 @@ class GPUModelRunner(
              new_block_ids = req_data.new_block_ids[i]
              resumed_from_preemption = req_id in req_data.resumed_req_ids
              num_output_tokens = req_data.num_output_tokens[i]
@@ -594,7 +610,7 @@ index e9b23f1..3b7b8b8 100644
              req_index = self.input_batch.req_id_to_index.get(req_id)
  
              if req_state.prev_num_draft_len and self.use_async_scheduling:
-@@ -1358,7 +1392,7 @@ class GPUModelRunner(
+@@ -1358,7 +1399,7 @@ class GPUModelRunner(
  
              # Update the cached states.
              req_state.num_computed_tokens = num_computed_tokens
@@ -603,16 +619,20 @@ index e9b23f1..3b7b8b8 100644
              if not is_last_rank:
                  if not req_data.new_token_ids:
                      # Async scheduled PP: Sampled tokens propagated via GPU broadcast.
-@@ -1424,6 +1458,8 @@ class GPUModelRunner(
+@@ -1424,6 +1465,12 @@ class GPUModelRunner(
  
              # Update the persistent batch.
              self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
-+            self.input_batch.num_dropped_tokens_cpu[req_index] = num_dropped_tokens
++            if not (self.rkv_enabled and self.rkv_async):
++                # Async R-KV: the runner owns num_dropped (applied right after
++                # compaction); do not clobber it with the scheduler's one-step-
++                # delayed feedback. Otherwise the scheduler count is current.
++                self.input_batch.num_dropped_tokens_cpu[req_index] = num_dropped_tokens
 +            self.input_batch.should_compress_list[req_index] = should_compress
              if new_block_ids is not None:
                  self.input_batch.block_table.append_row(new_block_ids, req_index)
  
-@@ -1911,6 +1947,101 @@ class GPUModelRunner(
+@@ -1911,6 +1958,101 @@ class GPUModelRunner(
  
          return encoder_seq_lens, encoder_seq_lens_cpu
  
@@ -714,7 +734,7 @@ index e9b23f1..3b7b8b8 100644
      def _prepare_inputs(
          self,
          scheduler_output: "SchedulerOutput",
-@@ -2143,16 +2274,29 @@ class GPUModelRunner(
+@@ -2143,16 +2285,29 @@ class GPUModelRunner(
              self.num_computed_tokens[req_indices_gpu].to(torch.int64)
              + self.query_pos.gpu[:total_num_scheduled_tokens]
          )
@@ -753,7 +773,7 @@ index e9b23f1..3b7b8b8 100644
  
          # Copy the tensors to the GPU.
          self._prepare_input_ids(
-@@ -2395,6 +2539,29 @@ class GPUModelRunner(
+@@ -2395,6 +2550,29 @@ class GPUModelRunner(
              rswa_prefix_lens=rswa_prefix_lens,
          )
  
@@ -783,7 +803,7 @@ index e9b23f1..3b7b8b8 100644
          if self.dcp_world_size > 1:
              self.dcp_local_seq_lens.cpu[:num_reqs] = get_dcp_local_seq_lens(
                  self.optimistic_seq_lens_cpu[:num_reqs],
-@@ -4358,6 +4525,22 @@ class GPUModelRunner(
+@@ -4358,6 +4536,33 @@ class GPUModelRunner(
                  **model_kwargs,
              )
  
@@ -802,11 +822,22 @@ index e9b23f1..3b7b8b8 100644
 +                self._rkv_layer_caches,
 +                self._rkv_num_dropped_tokens_list,
 +            )
++            if self.rkv_async:
++                # Runner-authoritative num_dropped: fold this step's evictions
++                # into the persistent count now, so the next step's physical
++                # positions are current without the scheduler round-trip.
++                drops = self._rkv_num_dropped_tokens_list
++                self.input_batch.num_dropped_tokens_cpu[: len(drops)] += (
++                    np.asarray(
++                        drops,
++                        dtype=self.input_batch.num_dropped_tokens_cpu.dtype,
++                    )
++                )
 +
          with record_function_or_nullcontext("gpu_model_runner: postprocess"):
              if self.use_aux_hidden_state_outputs:
                  # True when EAGLE 3 is used.
-@@ -4682,6 +4865,11 @@ class GPUModelRunner(
+@@ -4682,6 +4887,11 @@ class GPUModelRunner(
                  routed_experts=None,
              )
  
