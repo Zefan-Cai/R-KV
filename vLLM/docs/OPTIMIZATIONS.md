@@ -193,15 +193,22 @@ vectorized `index_copy_` (`_rolling_q_flat[layer].index_copy_(0, index, q)`); it
 fused **Triton kernel is for the redundancy cosine-similarity in the *scoring***
 (`cal_similarity`), a different hot path already handled here by batched scoring.
 
-**Remaining P4a headroom** (not yet done): the per-layer version repeats the
-Python slot loop + the small H2D of the flat index **28×/step** (once per layer,
-identical each time). Centralizing it — compute the ring index **once per step**
-in the runner and pass it via `attn_metadata` (matching SGLang's single
-`rolling_q_flat`) — removes that redundancy and makes recording graph-capturable,
-which unlocks FULL cudagraph. A cheap complementary win is to **gate recording to
-the observation window** — only the last `window` (8) steps before each
-compaction need queries, so record `window / buffer` of steps (8× fewer at buf64,
-64× fewer at buf512).
+**Remaining P4a headroom — done (P4a′, centralized).** The per-layer version
+still repeated the Python slot loop + the small H2D of the flat index **28×/step**
+(once per layer, identical each time). This is now computed **once per step** in
+the runner: `RKVCompressor.plan_qwrite(req_ids, device)` runs on the runner's
+compactor and returns `(flat_index, slots, max_slots)`, shared with every
+attention layer through a new `attn_metadata.rkv_qplan` field. Each layer only
+grows its ring and scatters its own queries with the precomputed index. This
+lifts b256/buf64 PIECEWISE from 3880 → **4233 tok/s = ~99% of the
+`record_query`-skipped ceiling (4267)** — `record_query` is now effectively free.
+Accuracy is unchanged (eager buf64 = 89.0% = 178/200, exact match). Because the
+plan is a single shared index, recording is now graph-capturable, so a future
+FULL-cudagraph pass (P4b) no longer has a per-layer Python obstacle here.
+
+A cheap complementary win that remains is to **gate recording to the observation
+window** — only the last `window` (8) steps before each compaction need queries,
+so record `window / buffer` of steps (8× fewer at buf64, 64× at buf512).
 
 ### Decode CUDA graph (PIECEWISE) — implemented
 
@@ -353,6 +360,7 @@ the principled default). **Use `buffer ≥ 64`** (`buffer=128` is lossless).
 | P3 | FlashInfer + other backends | todo | broader coverage |
 | P4 | Decode CUDA graph (PIECEWISE, auto-selected) | **done** | +30–40% decode tok/s (Full-KV +62%), same accuracy; no `--enforce-eager` |
 | **P4a** | **Vectorize `record_query`** (fixed-address ring + single `index_copy_` per layer) | **done** | **+43–48% decode tok/s @ b256/buf64 (2623→3880 PIECEWISE), accuracy unchanged** |
-| P4a′ | Centralize `record_query` (compute ring index once/step in the runner; gate to observation window) | todo | removes the 28×/step redundant Python+H2D; unlocks FULL cudagraph |
+| **P4a′** | **Centralize `record_query`** (compute ring index once/step in the runner; share via `attn_metadata.rkv_qplan`) | **done** | **+8–12% more (buf64 3880→4233 = ~99% of the record-free ceiling); recording now graph-capturable** |
+| P4a″ | Gate recording to the observation window (record only the last `window` steps before each compaction) | todo (cheap) | `window/buffer` fewer records (8× @buf64, 64× @buf512) |
 | P4b | Full hybrid graph (also graph attention, eager only on compaction) | todo (low value here: attention-graph = +3%) | recover the attention-eager cost |
 | P7 | Memory-bound benchmark (long context / high concurrency) | todo | demonstrate R-KV's *benefit* (constant KV footprint), not just its overhead |

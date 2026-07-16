@@ -142,6 +142,29 @@ eager buf64 = 89.0% (178/200), exactly matching pre-change**:
 With P4a, R-KV buf64 under PIECEWISE (3880) closes to ~48% of Full-KV PIECEWISE
 (8054) — up from ~33% before.
 
+### `record_query` centralization (P4a′)
+
+The per-layer P4a version still repeated the slot bookkeeping (Python loop) and
+the flat-index host→device copy once per layer — 28×/step of identical work. P4a′
+(commit `fb76433d`) computes the ring write-plan **once per step** in the runner
+(`RKVCompressor.plan_qwrite`) and shares it with every layer via
+`attn_metadata.rkv_qplan`. Single-process, one H100 (b256, 200q); **accuracy
+unchanged — eager buf64 = 89.0% (178/200), exact match**:
+
+| config | P4a tok/s | P4a′ tok/s | Δ | pre-P4a → P4a′ |
+| --- | --- | --- | --- | --- |
+| buf64 eager | 3030 | **3476** | +15% | 2122 → 3476 (+64%) |
+| buf16 PIECEWISE | 2807 | 3031 | +8% | 2103 → 3031 (+44%) |
+| buf64 PIECEWISE | 3880 | **4233** | +9% | 2623 → 4233 (+61%) |
+| buf128 PIECEWISE | 3747 | 4138 | +10% | 2705 → 4138 (+53%) |
+| buf256 PIECEWISE | 3611 | 4030 | +12% | 2686 → 4030 (+50%) |
+| buf512 PIECEWISE | — | 4103 | — | — |
+
+`record_query` is now effectively free: buf64 PIECEWISE (4233) reaches ~99% of
+the `record_query`-skipped ceiling (4267), and every buffer ≥64 clusters at
+~4000–4230 tok/s (only buf16 stays lower, at 3031, from its 4× more frequent
+compaction). The shared single index also makes recording graph-capturable.
+
 ## Full per-config results
 
 Accuracy at `mix_lambda=0.1` (the default); throughput columns are from the
