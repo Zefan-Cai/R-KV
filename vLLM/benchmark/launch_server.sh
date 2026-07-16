@@ -25,7 +25,9 @@
 #     per-compaction cost low, so small buffers stay fast.
 #
 # Env overrides: MODEL, PORT, BUFFER, WINDOW, MEM_FRAC, HOST, EXTRA
-#   EXTRA is appended verbatim (e.g. EXTRA="--tensor-parallel-size 2").
+#   EXTRA is appended verbatim. R-KV is correct under tensor & data parallelism
+#   (it all-reduces its eviction scores across each replica's TP group), e.g.
+#   EXTRA="--tensor-parallel-size 2" or EXTRA="--data-parallel-size 2".
 #
 # Evaluate with any OpenAI-compatible client, or:
 #   vllm bench serve --model "$MODEL" --port "$PORT" ...

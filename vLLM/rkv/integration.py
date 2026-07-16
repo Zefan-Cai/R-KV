@@ -22,6 +22,16 @@ Design (mirrors the SGLang R-KV port):
     how many tokens were dropped so the scheduler / model-runner can shrink the
     logical->physical position mapping consistently.
 
+* **Tensor parallelism**: each rank holds only a shard of the KV heads, so its
+  per-token score is partial. All ranks share one physical KV layout, so the
+  eviction decision must be identical on every rank -- :meth:`compact_step`
+  therefore sums the per-token scores across the tensor-parallel group before
+  the top-k. The armed requests, cache lengths and grouping are already
+  identical on every rank (replicated scheduler state), and the collective is
+  skipped entirely when TP is off. **Data parallelism** needs no coordination:
+  each replica owns an independent KV cache and compactor and evicts its own
+  requests (the all-reduce above uses the TP sub-group, so DP+TP is correct).
+
 * Config is read from environment variables (see :meth:`RKVConfig.from_env`) so
   the wiring patch does not have to touch vLLM's argument parser.
 
@@ -161,10 +171,34 @@ class RKVCompressor:
         # Running count of physical compactions performed (one per request
         # eviction). Cheap observability; the per-event log is env-gated.
         self._n_compactions = 0
+        # Tensor-parallel group coordinator for the cross-rank score sum,
+        # resolved lazily on first compaction (the distributed groups are set up
+        # after this object is constructed) and cached. Stays ``None`` when TP is
+        # off so single-GPU decode never touches a collective.
+        self._tp_grp = None
+        self._tp_grp_resolved = False
 
     @property
     def enabled(self) -> bool:
         return self.config.enabled
+
+    def _tp_group(self):
+        """Tensor-parallel group for the cross-rank score sum, or ``None``.
+
+        Resolved lazily and cached. Returns ``None`` when tensor parallelism is
+        off (world size 1) or the distributed state is unavailable, so the
+        single-GPU path skips the collective at zero cost.
+        """
+        if not self._tp_grp_resolved:
+            self._tp_grp_resolved = True
+            try:
+                from vllm.distributed.parallel_state import get_tp_group
+
+                grp = get_tp_group()
+                self._tp_grp = grp if grp.world_size > 1 else None
+            except (ImportError, AssertionError):
+                self._tp_grp = None
+        return self._tp_grp
 
     def plan_qwrite(self, req_ids, device) -> tuple | None:
         """Compute this step's shared ring write-plan (runner-owned, once/step).
@@ -548,6 +582,16 @@ class RKVCompressor:
                 grp_scores = torch.stack([score_acc[i] for i in idxs])
             if grp_scores is None:
                 continue
+            # Tensor parallelism: this rank scored only its shard of the KV
+            # heads, so ``grp_scores`` is partial. The armed requests, their
+            # cache lengths and this grouping are identical on every TP rank
+            # (replicated scheduler state), so summing the per-token scores
+            # across the group makes every rank's top-k -- and thus the set it
+            # physically keeps at the leading ``budget`` slots -- identical,
+            # keeping the sharded KV consistent. No-op when TP is off.
+            tp = self._tp_group()
+            if tp is not None:
+                grp_scores = tp.all_reduce(grp_scores.contiguous())
             g = len(idxs)
             dev = grp_scores.device
 

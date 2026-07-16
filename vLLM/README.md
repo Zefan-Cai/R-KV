@@ -103,6 +103,16 @@ VLLM_V1_R_KV_BUDGET=256 VLLM_V1_R_KV_BUFFER=64 VLLM_V1_R_KV_ASYNC=1 \
 When `BUDGET` or `BUFFER` is `0`, **every** R-KV code path is inert and vLLM
 behaves exactly as upstream.
 
+### Multi-GPU (tensor & data parallelism)
+
+R-KV works with **tensor parallelism** and **data parallelism** — add
+`--tensor-parallel-size` / `--data-parallel-size` as usual (or pass them through
+`EXTRA` to `launch_server.sh`). Under TP each rank holds only a shard of the KV
+heads, so R-KV all-reduces its per-token eviction scores across the TP group,
+guaranteeing every rank evicts the identical set (TP=2 few-shot GSM8K accuracy
+bit-matches single-GPU). DP replicas are independent, and DP+TP reduces within
+each replica's TP sub-group. Pipeline parallelism is not yet supported.
+
 ## Tests
 
 ```bash

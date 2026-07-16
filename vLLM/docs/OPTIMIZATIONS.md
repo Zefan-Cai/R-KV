@@ -20,6 +20,18 @@ default PIECEWISE cudagraph + async scheduling; also cross-checked under
 - **Quality scales with budget** — see the GSM8K sweep below.
 - **Batch > 1** — validated up to 64 concurrent requests; each compresses
   independently.
+- **Tensor & data parallelism** — under tensor parallelism (TP) each rank holds
+  only a shard of the KV heads, so `compact_step` all-reduces the per-token
+  scores across the TP group before the top-k; every rank then evicts the
+  identical set and the sharded KV stays consistent. Validated: TP=2 few-shot
+  GSM8K `b256/buf64` = **88/100, bit-matching TP=1's 88/100** (the all-reduce
+  reconstructs TP=1's global cross-head score), plus coherent 700-token forced
+  generations. Data parallelism (DP) needs no coordination — each replica owns
+  an independent KV cache + compactor — and DP+TP is correct because the
+  reduction targets the per-replica TP **sub-group** (`get_tp_group()`), not the
+  world; validated on a DP=2×TP=2 server with 8 concurrent forced-long
+  generations, all coherent. The collective is skipped entirely when TP is off,
+  so single-GPU decode is unchanged.
 - **Out-of-the-box** — setting `BUDGET`/`BUFFER` auto-selects the V1 runner and
   the PIECEWISE cudagraph path; no extra flags required (do **not** pass
   `--enforce-eager` — it disables the decode cudagraph and is ~30–40% slower).
@@ -424,9 +436,12 @@ the principled default). **Use `buffer ≥ 64`** (`buffer=128` is lossless).
    bound (`max_seq_len`), so an over-estimate is safe, but a few code paths that
    read the CPU seq-len copy should be audited on GPU.
 
-6. **Interactions not yet exercised:** speculative decoding, chunked prefill,
-   prefix caching / block reuse, tensor/pipeline parallelism, async scheduling,
-   M-RoPE models. Start validation with these **off**.
+6. **Interactions not yet exercised:** speculative decoding, **pipeline**
+   parallelism (R-KV's cross-layer score would be split across PP ranks and
+   would need a further reduction), M-RoPE models. Start validation with these
+   **off**. Tensor & data parallelism **are** supported (see the validation
+   record); prefix caching is auto-disabled (bug #6); async scheduling is
+   opt-in via `VLLM_V1_R_KV_ASYNC`.
 
 ## Roadmap
 
@@ -442,6 +457,7 @@ the principled default). **Use `buffer ≥ 64`** (`buffer=128` is lossless).
 | **P4a** | **Vectorize `record_query`** (fixed-address ring + single `index_copy_` per layer) | **done** | **+43–48% decode tok/s @ b256/buf64 (2623→3880 PIECEWISE), accuracy unchanged** |
 | **P4a′** | **Centralize `record_query`** (compute ring index once/step in the runner; share via `attn_metadata.rkv_qplan`) | **done** | **+8–12% more (buf64 3880→4233 = ~99% of the record-free ceiling); recording now graph-capturable** |
 | — | *Per-step decode overhead* | **eliminated** | R-KV buf≥64 = Full-KV **no-prefix** baseline (3729 vs 3744); nothing left to tune per step |
+| **P10** | **Tensor & data parallelism** (all-reduce R-KV scores across the TP group; DP replicas stay independent) | **done** | correct multi-GPU: TP=2 bit-matches TP=1 accuracy (88/100); DP=2×TP=2 coherent |
 | **P9** | **Prefix-caching compatibility** (COW-privatize a request's shared blocks before compaction overwrites them) | **todo — biggest lever** | **prefix caching = −36% on shared-prefix prompts (bug #6); the only way to approach the prefix-cached Full-KV number** |
 | **P8** | **R-KV async-scheduling compatibility** (runner-authoritative `num_dropped`, applied right after `compact_step`; `VLLM_V1_R_KV_ASYNC=1`, gated) | **done (opt-in)** | **+16.7% decode tok/s @ b256/buf64 sustained (8659→10102, gap to Full-KV −26%→−13%); correctness bit-identical under cudagraph, robust under memory pressure. Default off (re-enables the bug #10 path) pending broader validation.** |
 | P4a″ | Gate recording to the observation window | todo (now low value: `record_query` is only ~3% after P4a′) | mainly helps buf16 |
