@@ -1,5 +1,5 @@
 diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
-index e8796a3..d6da5fb 100644
+index e8796a3..bf891c6 100644
 --- a/vllm/config/vllm.py
 +++ b/vllm/config/vllm.py
 @@ -517,6 +517,11 @@ class VllmConfig:
@@ -14,7 +14,7 @@ index e8796a3..d6da5fb 100644
          use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
          if use_v2_model_runner is not None:
              return use_v2_model_runner
-@@ -872,6 +877,23 @@ class VllmConfig:
+@@ -872,6 +877,45 @@ class VllmConfig:
          # To give each torch profile run a unique instance name.
          self.instance_id = f"{time.time_ns()}"
  
@@ -34,6 +34,28 @@ index e8796a3..d6da5fb 100644
 +                "is incompatible with shared prefix blocks)."
 +            )
 +            self.cache_config.enable_prefix_caching = False
++
++        # R-KV compaction reports its per-request evicted-token count as a model
++        # output (``num_dropped_tokens``) that the scheduler must apply before
++        # the next step's *physical* KV positions are computed. Async scheduling
++        # prepares step N+1 before step N's output is processed, so immediately
++        # after a compaction the dropped-token count is stale for one step and
++        # the next decode token overwrites a surviving KV slot -- a
++        # batch-dependent cache corruption that only appears under the memory
++        # pressure of many concurrent requests. Force synchronous scheduling
++        # when R-KV is enabled so the eviction accounting is always current.
++        if (
++            envs.VLLM_V1_R_KV_BUDGET > 0
++            and envs.VLLM_V1_R_KV_BUFFER > 0
++            and self.scheduler_config is not None
++            and self.scheduler_config.async_scheduling is not False
++        ):
++            logger.info_once(
++                "R-KV enabled: disabling async scheduling (compaction's "
++                "dropped-token feedback must be applied before the next step's "
++                "KV positions are computed)."
++            )
++            self.scheduler_config.async_scheduling = False
 +
          if self.performance_mode != "balanced":
              logger.info_once("Performance mode set to '%s'.", self.performance_mode)
