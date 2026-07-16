@@ -240,20 +240,26 @@ the principled default). **Use `buffer ≥ 64`** (`buffer=128` is lossless).
    the V1 runner and auto-selects it whenever enabled. **Roadmap P0** — port the
    wiring to V2.
 
-2. **Requires `--enforce-eager`.** `RKVCompressor` uses data-dependent control
-   flow (`.item()`, per-request Python loops, dynamic shapes) that is
-   incompatible with full CUDA-graph capture. Run with `--enforce-eager` until a
-   graph-safe path exists (the SGLang port runs a *hybrid* graph/eager path —
-   window/compaction steps eager, the rest replayed).
+2. **Decode CUDA graphs: PIECEWISE, auto-selected (no `--enforce-eager` needed).**
+   R-KV runs its scoring/eviction hooks *inside* the attention forward (eager)
+   plus a post-forward compaction. vLLM's default FULL / FULL_AND_PIECEWISE
+   cudagraph **captures** the decode attention, so those Python hooks run only
+   at capture → R-KV silently no-ops (runs as Full-KV). vLLM's **PIECEWISE**
+   cudagraph keeps attention eager (a graph *splitting* op), so the hooks fire
+   every decode step while the rest of the layer is graphed. R-KV therefore
+   **force-selects PIECEWISE** in `VllmConfig.__post_init__` when enabled and
+   cudagraphs are on (a no-op under `--enforce-eager`). Measured: **same accuracy
+   as eager** (within n=200 noise) at **+30–40% decode throughput** (Full-KV:
+   +62%). A full SGLang-style hybrid that *also* graphs attention on
+   non-compaction steps (in-graph fixed-address query buffer + eager dispatch on
+   compaction steps) would recover the remaining attention-eager cost —
+   **Roadmap P4b**.
 
-3. **Slight accuracy dip at very tight buffers.** At `budget=256` `buffer=64`
-   scores 87.5% vs the 90.5% Full-KV ceiling (SGLang: 88.5%); `buffer=128` is
-   lossless (90.5%). A smaller buffer compacts more often and each compaction
-   keeps a slightly different top-k set, so a small selection error can compound
-   — a tuning property, not a bug. The earlier large `buffer=64` gap was the
-   async-scheduling corruption (bug #10), now fixed; the remaining ~1-point
-   spread vs SGLang is attention-backend numerics (vLLM FlashAttention vs SGLang
-   FlashInfer) near the score cutoff. Recommended: `buffer ≈ budget`.
+3. **Tight-buffer accuracy dip.** At `budget=256`, `buffer=64` = 89.0% and
+   `buffer=128` = 91.5% (≥ SGLang); only `buffer=16` (85.5%) trails SGLang
+   (88.0%) by ~2.5 pts — residual FlashAttention-vs-FlashInfer K/Q numerics near
+   the top-k cutoff, amplified by buf16's ~12 compactions/request (bug #12 fixed
+   the larger part via `mix_lambda`). Recommended: `buffer ≥ 64`.
 
 4. **FlashAttention backend only.** Other backends (FlashInfer, Triton, MLA) are
    untouched — R-KV is a no-op there. **Roadmap P3.**
@@ -276,4 +282,5 @@ the principled default). **Use `buffer ≥ 64`** (`buffer=128` is lossless).
 | P6 | Batched cross-layer scoring (SGLang parity) | **done** | +22.5% decode tok/s @ b256/buf64 (1622→1987), identical accuracy |
 | P0 | Port wiring to the V2 GPU model runner | todo | works on the default runner |
 | P3 | FlashInfer + other backends | todo | broader coverage |
-| P4 | Hybrid CUDA-graph path (window/compaction eager, rest replay) | todo | throughput (avoid full eager; ~45% of compaction cost) |
+| P4 | Decode CUDA graph (PIECEWISE, auto-selected) | **done** | +30–40% decode tok/s (Full-KV +62%), same accuracy; no `--enforce-eager` |
+| P4b | Full hybrid graph (also graph attention, eager only on compaction) | todo | recover the remaining attention-eager cost |

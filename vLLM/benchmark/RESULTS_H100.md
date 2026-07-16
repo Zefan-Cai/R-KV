@@ -100,6 +100,24 @@ most frequent:
 Tight buffers (frequent compaction) roughly **double**; large buffers (rare
 compaction) are unchanged, as expected.
 
+### Decode CUDA graph (PIECEWISE)
+
+R-KV runs under vLLM's **PIECEWISE** cudagraph by default (no `--enforce-eager`):
+attention stays eager so the R-KV hooks fire, while the rest of the decode layer
+is graphed. Accuracy is within n=200 noise of eager; decode throughput is
+**+30–40%** on R-KV configs and **+62%** on Full-KV. (The eager numbers above use
+`--enforce-eager`.)
+
+| config | eager tok/s | PIECEWISE tok/s | speedup |
+| --- | --- | --- | --- |
+| Full-KV | 5138 | 8317 | +62% |
+| b256/buf16 | 1635 | 2103 | +29% |
+| b256/buf64 | 1931 | 2623 | +36% |
+| b256/buf128 | 1968 | 2705 | +37% |
+| b256/buf256 | 2069 | 2686 | +30% |
+
+Run the sweep under cudagraph with `RKV_EAGER=0 bash run_sweep.sh`.
+
 ## Full per-config results
 
 Accuracy at `mix_lambda=0.1` (the default); throughput columns are from the

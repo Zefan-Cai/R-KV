@@ -1,5 +1,5 @@
 diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
-index e8796a3..bf891c6 100644
+index e8796a3..ac9afe3 100644
 --- a/vllm/config/vllm.py
 +++ b/vllm/config/vllm.py
 @@ -517,6 +517,11 @@ class VllmConfig:
@@ -14,7 +14,7 @@ index e8796a3..bf891c6 100644
          use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
          if use_v2_model_runner is not None:
              return use_v2_model_runner
-@@ -872,6 +877,45 @@ class VllmConfig:
+@@ -872,6 +877,70 @@ class VllmConfig:
          # To give each torch profile run a unique instance name.
          self.instance_id = f"{time.time_ns()}"
  
@@ -56,6 +56,31 @@ index e8796a3..bf891c6 100644
 +                "KV positions are computed)."
 +            )
 +            self.scheduler_config.async_scheduling = False
++
++        # R-KV runs its scoring/eviction hooks *inside* the attention forward and
++        # compacts right after it. vLLM's default FULL / FULL_AND_PIECEWISE
++        # cudagraph **captures** the decode attention, so the R-KV Python hooks
++        # execute only once at capture and never on replay -- R-KV then silently
++        # no-ops (runs as Full-KV). PIECEWISE keeps attention eager (it is a
++        # graph *splitting* op) so the hooks fire every decode step while the
++        # rest of the layer is still graphed (~25% faster than full eager, same
++        # accuracy). Force PIECEWISE when R-KV is enabled and cudagraphs are on
++        # (a no-op under --enforce-eager, which sets cudagraph_mode = NONE).
++        if (
++            envs.VLLM_V1_R_KV_BUDGET > 0
++            and envs.VLLM_V1_R_KV_BUFFER > 0
++            and self.model_config is not None
++            and not self.model_config.enforce_eager
++            and self.compilation_config is not None
++            and self.compilation_config.cudagraph_mode != CUDAGraphMode.PIECEWISE
++        ):
++            logger.info_once(
++                "R-KV enabled: forcing PIECEWISE cudagraph (FULL cudagraph "
++                "captures the attention forward, so R-KV's in-forward hooks "
++                "would never run on replay and compaction would silently "
++                "no-op)."
++            )
++            self.compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
 +
          if self.performance_mode != "balanced":
              logger.info_once("Performance mode set to '%s'.", self.performance_mode)

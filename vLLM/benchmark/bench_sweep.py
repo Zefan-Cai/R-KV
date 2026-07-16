@@ -68,7 +68,10 @@ if CONC > 0:
     kw["max_num_seqs"] = CONC
 if os.environ.get("RKV_NOASYNC") == "1":
     kw["async_scheduling"] = False
-llm = LLM(model=MODEL, enforce_eager=True, gpu_memory_utilization=0.85,
+# RKV_EAGER=1 (default) forces eager; RKV_EAGER=0 lets R-KV run under PIECEWISE
+# cudagraph (the config auto-forces PIECEWISE when R-KV is on and not eager).
+_eager = os.environ.get("RKV_EAGER", "1") == "1"
+llm = LLM(model=MODEL, enforce_eager=_eager, gpu_memory_utilization=0.85,
           max_model_len=4096, disable_log_stats=True, seed=0, block_size=16, **kw)
 tok = llm.get_tokenizer()
 in_toks = sum(len(tok(p).input_ids) for p in prompts)
