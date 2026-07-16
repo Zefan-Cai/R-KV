@@ -136,12 +136,18 @@ class RKVCompressor:
             if self.config.enabled
             else None
         )
-        # Rolling observation-window queries, keyed by request id so they
-        # survive vLLM's batch reordering (condense on finish). Each entry is
-        # this layer's last ``window_size`` decode queries; the R-KV importance
-        # score means over them (order-invariant), matching the SGLang port's
-        # observation window. Populated every decode step by ``record_query``.
-        self._qwin: dict[str, torch.Tensor] = {}
+        # Rolling observation-window queries in a fixed-address ring buffer
+        # ``(window, max_slots, q_heads, head_dim)``, written with ONE vectorized
+        # ``index_copy_`` per layer per step (the old per-request GPU copy was
+        # ~4.5k micro-launches/step and R-KV's #1 decode cost). ``_slot`` maps a
+        # request id to a persistent ring column (freed + reused on finish) so
+        # the window survives vLLM's batch reordering; ``_qcount`` is the
+        # per-request step count (ring cursor = ``count % window``). The score
+        # means over the window (order-invariant), so no un-rotation is needed.
+        self._qring: torch.Tensor | None = None
+        self._slot: dict[str, int] = {}
+        self._free: list[int] = []
+        self._next_slot: int = 0
         self._qcount: dict[str, int] = {}
         # Running count of physical compactions performed (one per request
         # eviction). Cheap observability; the per-event log is env-gated.
@@ -182,23 +188,61 @@ class RKVCompressor:
         last_q = query.index_select(0, last_idx)
 
         window = self.config.window_size
+        # Free the ring columns of finished requests for reuse.
         present = set(req_ids)
-        # Drop finished requests so the buffers do not grow unbounded.
-        if len(self._qwin) > num_reqs:
-            for rid in [r for r in self._qwin if r not in present]:
-                self._qwin.pop(rid, None)
+        if len(self._slot) > num_reqs:
+            for rid in [r for r in self._slot if r not in present]:
+                self._free.append(self._slot.pop(rid))
                 self._qcount.pop(rid, None)
 
+        # Assign each request a persistent ring column + its current cursor
+        # (``step_count % window``), then write ALL requests' queries in one
+        # ``index_copy_`` -- no per-request GPU launch.
+        slots = [0] * num_reqs
+        curs = [0] * num_reqs
         for i, rid in enumerate(req_ids):
-            buf = self._qwin.get(rid)
-            if buf is None:
-                buf = last_q.new_zeros((window, last_q.shape[1], last_q.shape[2]))
-                self._qwin[rid] = buf
+            s = self._slot.get(rid)
+            if s is None:
+                s = self._free.pop() if self._free else self._next_slot
+                if s == self._next_slot:
+                    self._next_slot += 1
+                self._slot[rid] = s
                 self._qcount[rid] = 0
             cnt = self._qcount[rid]
-            # No host sync: a plain GPU slice copy into the ring slot.
-            buf[cnt % window].copy_(last_q[i])
+            slots[i] = s
+            curs[i] = cnt % window
             self._qcount[rid] = cnt + 1
+
+        max_slots = self._ensure_ring(last_q, window)
+        dev = last_q.device
+        flat = (
+            torch.as_tensor(curs, device=dev, dtype=torch.long) * max_slots
+            + torch.as_tensor(slots, device=dev, dtype=torch.long)
+        )
+        self._qring.view(
+            window * max_slots, last_q.shape[1], last_q.shape[2]
+        ).index_copy_(0, flat, last_q)
+
+    def _ensure_ring(self, last_q: torch.Tensor, window: int) -> int:
+        """Allocate/grow the fixed-address query ring to fit every live column.
+
+        Returns the ring width (``max_slots``). Growth (a realloc + copy) only
+        happens when a new concurrency peak is reached, so it is rare after the
+        first prefill wave. Reading ``_qring[:, slot]`` (2-D) stays correct
+        across widths; only the flat ``index_copy_`` uses the current width.
+        """
+        need = self._next_slot
+        if self._qring is None or self._qring.shape[1] < need:
+            new_max = max(need, 16)
+            if self._qring is not None:
+                new_max = max(new_max, self._qring.shape[1] * 2)
+            new_ring = last_q.new_zeros(
+                (window, new_max, last_q.shape[1], last_q.shape[2])
+            )
+            if self._qring is not None:
+                new_ring[:, : self._qring.shape[1]] = self._qring
+            self._qring = new_ring
+        return self._qring.shape[1]
 
     def observe_layer(
         self,
@@ -267,8 +311,10 @@ class RKVCompressor:
             # The importance score means over them (order-invariant), so the
             # ring buffer needs no un-rotation. Falls back to the current step's
             # query if the window has not been recorded yet (e.g. first step).
-            qbuf = self._qwin.get(req_ids[i]) if req_ids is not None else None
-            if qbuf is None:
+            slot = self._slot.get(req_ids[i]) if req_ids is not None else None
+            if slot is not None and self._qring is not None:
+                qbuf = self._qring[:, slot]  # (window, q_heads, head_dim)
+            else:
                 q_start = query_start_loc[i].item()
                 q_end = query_start_loc[i + 1].item()
                 qbuf = query[q_start:q_end]
