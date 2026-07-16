@@ -142,6 +142,51 @@ win. The restructure stays entirely inside `rkv/integration.py` (the per-layer
 window queries ride along in the already-shared `rkv_layer_caches` list), so the
 wiring patch is untouched.
 
+### Throughput profile — where the time goes (next optimization)
+
+Measured decomposition under PIECEWISE cudagraph (b256, Qwen2.5-Math-7B, 200q,
+H100 decode tok/s):
+
+| config | tok/s | isolates |
+| --- | --- | --- |
+| Full-KV FULL cudagraph | 8317 | ceiling |
+| Full-KV PIECEWISE (attention eager) | 8054 | **graphing attention = +3% only** |
+| R-KV buf512 (rare compaction) | 2784 | **R-KV per-step hooks = −65%** |
+| ↳ `record_query` skipped | **4267** | **`record_query` alone = +53%** |
+| R-KV buf16 (frequent compaction) | 2103 | compaction cost = −24% |
+
+Two conclusions redirect the roadmap:
+
+1. **`record_query` is the dominant cost, not compaction scoring.** It runs
+   28×/step (once per attention layer) with a **per-request Python loop that does
+   a tiny GPU `copy_` per request** — thousands of micro-kernel-launches per step
+   for a large batch. Skipping it recovers +53% at `buffer=512`.
+2. **Graphing attention buys only ~3%** here, so a full SGLang-style hybrid that
+   FULL-captures attention (roadmap P4b) is *low* value on this workload.
+
+**Next optimization (roadmap P4a): vectorize `record_query`.** Mirror the SGLang
+port: replace the per-request dict + per-request copies with a single
+**`index_copy_` scatter** into a **fixed-address** ring buffer
+`(num_layers, window, max_reqs, q_heads, head_dim)`, indexed by a persistent
+per-request slot and a per-request step counter. This (a) removes the
+per-request launches (one scatter per layer) and (b) makes recording **graph
+capturable**, which in turn unlocks FULL cudagraph. A cheap complementary win is
+to **gate recording to the observation window** — only the last `window` (8)
+steps before each compaction need queries, so record `window / buffer` of steps
+(8× fewer at buf64, 64× fewer at buf512). Note: SGLang's query recording is *not*
+a Triton kernel — it is exactly this vectorized `index_copy_`
+(`_rolling_q_flat[layer].index_copy_(0, index, q)`); its fused **Triton kernel is
+for the redundancy cosine-similarity in the *scoring*** (`cal_similarity`), a
+different hot path already handled here by batched scoring.
+
+### Decode CUDA graph (PIECEWISE) — implemented
+
+R-KV runs under vLLM's PIECEWISE cudagraph by default (auto-selected in
+`VllmConfig.__post_init__`; no `--enforce-eager`). Attention stays eager so the
+R-KV hooks fire; the rest of the decode layer is graphed. Same accuracy as eager
+(within n=200 noise) at **+30–40% decode throughput** on R-KV configs and **+62%**
+on Full-KV. See Known limitations #2.
+
 ### Bugs found & fixed during GPU validation
 
 1. `RKVCompressor` constructed `R1KV` even when disabled → assertion crash at
@@ -283,4 +328,6 @@ the principled default). **Use `buffer ≥ 64`** (`buffer=128` is lossless).
 | P0 | Port wiring to the V2 GPU model runner | todo | works on the default runner |
 | P3 | FlashInfer + other backends | todo | broader coverage |
 | P4 | Decode CUDA graph (PIECEWISE, auto-selected) | **done** | +30–40% decode tok/s (Full-KV +62%), same accuracy; no `--enforce-eager` |
-| P4b | Full hybrid graph (also graph attention, eager only on compaction) | todo | recover the remaining attention-eager cost |
+| **P4a** | **Vectorize `record_query`** (fixed-address ring + single `index_copy_`, gate to observation window) | **todo — next** | **the largest measured lever (+53% at buf512); unlocks FULL cudagraph** |
+| P4b | Full hybrid graph (also graph attention, eager only on compaction) | todo (low value here: attention-graph = +3%) | recover the attention-eager cost |
+| P7 | Memory-bound benchmark (long context / high concurrency) | todo | demonstrate R-KV's *benefit* (constant KV footprint), not just its overhead |
