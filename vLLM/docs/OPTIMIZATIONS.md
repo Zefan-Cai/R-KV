@@ -123,6 +123,25 @@ largest factor (~4× on this tiny model), and (b) **compaction overhead**
 short, non-memory-bound decode. Raising `buffer` (compact less often) and
 larger models shrink the relative overhead.
 
+### Batched cross-layer scoring (ported from SGLang)
+
+The compaction score is O(seq²) per layer (the redundancy cosine matrix) and
+dominates R-KV's overhead. The default `score_mode="batched"` (env
+`VLLM_V1_R_KV_SCORE_MODE`) defers scoring out of the per-layer `forward` and runs
+it as a **single GEMM over all layers** at compaction time (`num_layers` as the
+batch dim, chunked so the transient cosine matrix stays under
+`VLLM_V1_R_KV_SCORE_CHUNK_MB`), instead of 28 separate bsz=1 scoring calls. The
+batch GEMM computes independent per-layer results, so the kept set is **identical**
+to the per-layer `score_mode="reference"` path — verified: both score 87.5%
+(175/200) at `budget=256 buffer=64`, with the **same 508 compactions** — while
+cutting kernel launches.
+
+Measured (b256/buf64, Qwen2.5-Math-7B, 200q, H100): **1987 vs 1622 decode tok/s
+(+22.5%)**, wall 24.4s → 19.9s, matching the SGLang port's ~+23% batched-compaction
+win. The restructure stays entirely inside `rkv/integration.py` (the per-layer
+window queries ride along in the already-shared `rkv_layer_caches` list), so the
+wiring patch is untouched.
+
 ### Bugs found & fixed during GPU validation
 
 1. `RKVCompressor` constructed `R1KV` even when disabled → assertion crash at
@@ -212,6 +231,7 @@ larger models shrink the relative overhead.
 | P5 | Accuracy sweep (GSM8K, Math-7B) | **done** | SGLang parity: 90% @ b256/buf256, near-lossless @ 512 |
 | P2 | Skip `occupied_slot_mapping` build when nothing compacts | **done** | lower pre-compaction overhead |
 | P1 | Observation-window + cross-layer scoring | **done** | +13.5 pts @ b256/buf64 (68.5→82.0); matches SGLang at buf=128 (88.0 vs 88.5) |
+| P6 | Batched cross-layer scoring (SGLang parity) | **done** | +22.5% decode tok/s @ b256/buf64 (1622→1987), identical accuracy |
 | P0 | Port wiring to the V2 GPU model runner | todo | works on the default runner |
 | P3 | FlashInfer + other backends | todo | broader coverage |
-| P4 | Hybrid CUDA-graph path | todo | throughput (avoid full eager) |
+| P4 | Hybrid CUDA-graph path (window/compaction eager, rest replay) | todo | throughput (avoid full eager; ~45% of compaction cost) |
