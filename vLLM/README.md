@@ -34,7 +34,7 @@ same *patch-not-fork* layout as the [SGLang port](../SGLang/README.md).
 ## Why a patch, not a fork?
 
 R-KV touches vLLM in a **small, purely additive** way: one self-contained
-package (`rkv/`) plus ~241 lines of wiring across **10** existing files. Instead
+package (`rkv/`) plus ~522 lines of wiring across **13** existing files. Instead
 of vendoring the entire vLLM tree, this directory ships:
 
 - `rkv/` — the R-KV code (browsable, the source of truth);
@@ -77,10 +77,16 @@ scripts/apply_rkv.sh
 # 2. Install it (source build — needs CUDA + a GPU).
 pip install -e vllm-src
 
-# 3. Serve a model with R-KV enabled. Compression activates automatically once
-#    BUDGET and BUFFER are both > 0. Use --enforce-eager (see limitations).
-VLLM_V1_R_KV_BUDGET=512 VLLM_V1_R_KV_BUFFER=64 \
-  vllm serve Qwen/Qwen2.5-Math-7B-Instruct --enforce-eager
+# 3. Serve a model with R-KV at **best throughput**. Compression activates
+#    automatically once BUDGET and BUFFER are both > 0. Do NOT pass
+#    --enforce-eager: R-KV auto-selects PIECEWISE cudagraph (attention stays
+#    eager so its hooks fire; the rest of the layer is graphed). ASYNC=1 turns
+#    on async scheduling (+16.7% decode tok/s). See benchmark/launch_server.sh.
+VLLM_V1_R_KV_BUDGET=256 VLLM_V1_R_KV_BUFFER=64 VLLM_V1_R_KV_ASYNC=1 \
+  vllm serve Qwen/Qwen2.5-Math-7B-Instruct
+
+#    ...or use the wrapper (best-throughput flags baked in):
+#    benchmark/launch_server.sh rkv 256
 ```
 
 ### Configuration (environment variables)
@@ -91,6 +97,8 @@ VLLM_V1_R_KV_BUDGET=512 VLLM_V1_R_KV_BUFFER=64 \
 | `VLLM_V1_R_KV_BUFFER` | `0` (off) | compress every N generated tokens |
 | `VLLM_V1_R_KV_WINDOW` | `8` | trailing observation window (always retained) |
 | `VLLM_V1_R_KV_KERNEL` | `7` | max-pool kernel size for the importance term |
+| `VLLM_V1_R_KV_ASYNC` | `0` (off) | allow async scheduling for best throughput (+16.7%); the runner applies its evicted-token count itself so async stays correct |
+| `VLLM_V1_R_KV_FREE_BLOCKS` | `1` (on) | free the KV blocks R-KV evicts so the footprint is bounded at `budget+buffer`; set `0` for the pre-fix behavior |
 
 When `BUDGET` or `BUFFER` is `0`, **every** R-KV code path is inert and vLLM
 behaves exactly as upstream.

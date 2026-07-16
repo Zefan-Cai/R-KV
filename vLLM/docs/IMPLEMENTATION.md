@@ -1,7 +1,7 @@
 # R-KV Integration — Implementation Notes (vLLM v0.25.1)
 
 This document maps the R-KV runtime wiring onto vLLM v1. The patch is
-**small and additive** — 10 files, ~241 inserted lines — and every hook is gated
+**small and additive** — 13 files, ~522 inserted lines — and every hook is gated
 so that when `VLLM_V1_R_KV_BUDGET`/`BUFFER` are unset the code is fully inert.
 R-KV is wired into vLLM's **V1 GPU model runner**
 (`vllm/v1/worker/gpu_model_runner.py`); because v0.25.1 defaults to a newer V2

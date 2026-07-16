@@ -24,18 +24,35 @@ R-KV is a drop-in serving change gated by environment variables, so any of
 vLLM's standard benchmarks also work — just launch the server twice (Full-KV vs
 R-KV) and compare.
 
-## Fair A/B setup
+## Serving (best throughput)
 
-Launch **Full-KV** (baseline) and **R-KV** with identical flags except the R-KV
-env vars, and use `--enforce-eager` for both so the comparison is apples-to-apples:
+`launch_server.sh` bakes in every throughput lever (PIECEWISE cudagraph, async
+scheduling, evicted-block freeing — see [`../docs/OPTIMIZATIONS.md`](../docs/OPTIMIZATIONS.md)):
 
 ```bash
-# Full-KV baseline
-vllm serve Qwen/Qwen2.5-Math-7B-Instruct --enforce-eager --port 8000
+benchmark/launch_server.sh rkv 256    # R-KV budget=256 (BUFFER=64 default; env-overridable)
+benchmark/launch_server.sh fullkv     # Full-KV baseline (upstream defaults)
+# env overrides: MODEL, PORT, BUFFER, WINDOW, MEM_FRAC, HOST, EXTRA
+```
 
-# R-KV (budget=512, compress every 64 tokens)
-VLLM_V1_R_KV_BUDGET=512 VLLM_V1_R_KV_BUFFER=64 \
-  vllm serve Qwen/Qwen2.5-Math-7B-Instruct --enforce-eager --port 8001
+Equivalent explicit command (do **not** pass `--enforce-eager` — R-KV
+auto-selects PIECEWISE cudagraph, and eager is ~30–40% slower):
+
+```bash
+VLLM_V1_R_KV_BUDGET=256 VLLM_V1_R_KV_BUFFER=64 VLLM_V1_R_KV_ASYNC=1 \
+  vllm serve Qwen/Qwen2.5-Math-7B-Instruct --port 8001
+```
+
+## Fair A/B (R-KV vs Full-KV)
+
+R-KV must disable prefix caching (in-place eviction corrupts shared prefix
+blocks), so for an apples-to-apples **decode** comparison, launch Full-KV with
+prefix caching off too — otherwise Full-KV gets a large one-time prefill dedup on
+shared-prefix prompts (e.g. few-shot) that inflates its decode tok/s:
+
+```bash
+# Full-KV, fair baseline (prefix caching off, matching R-KV)
+vllm serve Qwen/Qwen2.5-Math-7B-Instruct --no-enable-prefix-caching --port 8000
 ```
 
 ## Accuracy (GSM8K / MATH)

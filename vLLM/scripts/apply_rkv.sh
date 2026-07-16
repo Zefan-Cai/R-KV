@@ -6,7 +6,7 @@
 #   1. Clones upstream vLLM at the EXACT tag R-KV was ported against (v0.25.1).
 #   2. Copies the standalone R-KV package (rkv/) into the vLLM source tree
 #      (as vllm/rkv/).
-#   3. Applies the small wiring patch (10 files) that hooks R-KV into the v1
+#   3. Applies the small wiring patch (13 files) that hooks R-KV into the v1
 #      runtime.
 #
 # After this, install the tree (see README.md) and run with R-KV enabled by
@@ -62,7 +62,7 @@ mkdir -p "$DEST"
 cp "$HERE"/rkv/*.py "$DEST"/
 echo "         copied $(ls "$HERE"/rkv/*.py | wc -l | tr -d ' ') files -> $DEST"
 
-echo ">> [3/3] Applying R-KV wiring patch (10 files)"
+echo ">> [3/3] Applying R-KV wiring patch (13 files)"
 git -C "$VLLM_SRC" apply --check "$PATCH"     # fail loudly if it won't apply cleanly
 git -C "$VLLM_SRC" apply --whitespace=nowarn "$PATCH"
 echo "         patch applied cleanly"
@@ -76,8 +76,10 @@ Next steps (see README.md for the full guide):
   1. Install the patched tree (a source build; needs CUDA + a GPU):
        pip install -e "$VLLM_SRC"
      (or follow vLLM's build-from-source instructions for your platform)
-  2. Serve a model with R-KV on (decode-time compression):
-       VLLM_V1_R_KV_BUDGET=512 VLLM_V1_R_KV_BUFFER=64 \\
-         vllm serve Qwen/Qwen2.5-Math-7B-Instruct --enforce-eager
+  2. Serve a model with R-KV at best throughput (decode-time compression):
+       VLLM_V1_R_KV_BUDGET=256 VLLM_V1_R_KV_BUFFER=64 VLLM_V1_R_KV_ASYNC=1 \\
+         vllm serve Qwen/Qwen2.5-Math-7B-Instruct
+     (or just: benchmark/launch_server.sh rkv 256 -- best-throughput flags baked
+      in. Do NOT pass --enforce-eager: R-KV auto-selects PIECEWISE cudagraph.)
   3. R-KV activates automatically once BUDGET and BUFFER are > 0.
 EOF

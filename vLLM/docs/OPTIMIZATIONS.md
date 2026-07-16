@@ -4,6 +4,7 @@ This port re-implements the R-KV runtime wiring against vLLM **v0.25.1**. The
 `rkv/` algorithm is CPU bit-parity tested, the wiring patch applies cleanly to a
 pristine v0.25.1 tree, and the end-to-end serving path is **validated on an
 NVIDIA H100** (vLLM 0.25.1, torch 2.11+cu130, `Qwen2.5-0.5B` / `Qwen2.5-Math-7B`,
+default PIECEWISE cudagraph + async scheduling; also cross-checked under
 `--enforce-eager`).
 
 ## Validation record
@@ -19,8 +20,9 @@ NVIDIA H100** (vLLM 0.25.1, torch 2.11+cu130, `Qwen2.5-0.5B` / `Qwen2.5-Math-7B`
 - **Quality scales with budget** — see the GSM8K sweep below.
 - **Batch > 1** — validated up to 64 concurrent requests; each compresses
   independently.
-- **Out-of-the-box** — setting `BUDGET`/`BUFFER` auto-selects the V1 runner; no
-  flags required beyond `--enforce-eager`.
+- **Out-of-the-box** — setting `BUDGET`/`BUFFER` auto-selects the V1 runner and
+  the PIECEWISE cudagraph path; no extra flags required (do **not** pass
+  `--enforce-eager` — it disables the decode cudagraph and is ~30–40% slower).
 
 ### Accuracy — GSM8K, Qwen2.5-Math-7B-Instruct (200 questions, greedy)
 
