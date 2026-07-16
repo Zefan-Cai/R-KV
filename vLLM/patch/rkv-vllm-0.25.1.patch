@@ -166,7 +166,7 @@ index bfecb3c..641aa56 100644
      _seq_lens_cpu: torch.Tensor | None = None
      _num_computed_tokens_cpu: torch.Tensor | None = None
 diff --git a/vllm/v1/attention/backends/flash_attn.py b/vllm/v1/attention/backends/flash_attn.py
-index db5b0dd..322d36b 100755
+index db5b0dd..af6352f 100755
 --- a/vllm/v1/attention/backends/flash_attn.py
 +++ b/vllm/v1/attention/backends/flash_attn.py
 @@ -268,6 +268,17 @@ class FlashAttentionMetadata:
@@ -230,7 +230,7 @@ index db5b0dd..322d36b 100755
 +                    self.rkv_compressor.record_query(
 +                        query[:num_actual_tokens], attn_metadata
 +                    )
-+                if attn_metadata.should_compress_list is not None:
++                if attn_metadata.occupied_slot_mapping is not None:
 +                    self.rkv_compressor.observe_layer(
 +                        query[:num_actual_tokens],
 +                        key_cache,

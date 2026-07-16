@@ -330,6 +330,9 @@ class RKVCompressor:
         seq_lens = attn_metadata.seq_lens
         seq_ends = torch.cumsum(seq_lens, dim=0)
         seq_starts = seq_ends - seq_lens
+        # One host copy per layer instead of a GPU->CPU ``.item()`` sync per
+        # request inside the armed loop (this runs once per attention layer).
+        seq_lens_cpu = seq_lens.tolist()
         query_start_loc = attn_metadata.query_start_loc
 
         score_acc = attn_metadata.rkv_score_acc
@@ -347,7 +350,7 @@ class RKVCompressor:
         for i in range(num_reqs):
             if not should_compress[i]:
                 continue
-            if seq_lens[i].item() < threshold:
+            if seq_lens_cpu[i] < threshold:
                 continue
 
             # Observation queries: this request's rolling window (last
@@ -477,16 +480,28 @@ class RKVCompressor:
         block_size = layer_caches[0][0].size(1)
         seq_ends = torch.cumsum(seq_lens, dim=0)
         seq_starts = seq_ends - seq_lens
+        # One host copy up front instead of a GPU->CPU ``.item()`` sync per
+        # request inside the loop.
+        seq_lens_cpu = seq_lens.tolist()
+        seq_starts_cpu = seq_starts.tolist()
+        seq_ends_cpu = seq_ends.tolist()
 
+        # Phase A: pick each armed request's kept set and collect its source /
+        # destination slot ids. The physical relocation is deferred to Phase B so
+        # it can run as ONE gather+scatter per layer across ALL requests, instead
+        # of per (request, layer) -- that per-request x per-layer loop was the
+        # dominant compaction cost at small buffers (many tiny kernel launches).
+        src_slots: list[torch.Tensor] = []
+        dst_slots: list[torch.Tensor] = []
         for i in range(num_reqs):
             if not should_compress[i]:
                 continue
-            if seq_lens[i].item() < threshold:
+            seq_len = seq_lens_cpu[i]
+            if seq_len < threshold:
                 continue
 
-            kv_start = seq_starts[i].item()
-            kv_end = seq_ends[i].item()
-            seq_len = kv_end - kv_start
+            kv_start = seq_starts_cpu[i]
+            kv_end = seq_ends_cpu[i]
             slots = occupied_slot_mapping[kv_start:kv_end]
 
             # Cross-layer score: accumulated per layer during the forward
@@ -507,21 +522,8 @@ class RKVCompressor:
             )
             kept = torch.sort(torch.cat([past_idx, window_idx])).values
 
-            src = slots[kept]
-            src_blk = src // block_size
-            src_off = src % block_size
-            dst = occupied_slot_mapping[kv_start : kv_start + budget]
-            dst_blk = dst // block_size
-            dst_off = dst % block_size
-
-            # Advanced-index gather returns a fresh tensor before the scatter, so
-            # the overlapping src/dst front-slot ranges do not alias-corrupt.
-            for key_cache, value_cache, _wq in layer_caches:
-                kept_k = key_cache[src_blk, src_off]
-                kept_v = value_cache[src_blk, src_off]
-                key_cache[dst_blk, dst_off] = kept_k
-                value_cache[dst_blk, dst_off] = kept_v
-
+            src_slots.append(slots[kept])
+            dst_slots.append(occupied_slot_mapping[kv_start : kv_start + budget])
             num_dropped_tokens_list[i] = seq_len - budget
 
             self._n_compactions += 1
@@ -532,3 +534,23 @@ class RKVCompressor:
                     f"kept={int(kept.numel())} dropped={seq_len - budget}",
                     flush=True,
                 )
+
+        if not src_slots:
+            return
+
+        # Phase B: relocate the kept KV for every request with ONE gather +
+        # scatter per layer, batched across all requests. Destination slots are
+        # disjoint across requests, and the advanced-index gather returns a fresh
+        # tensor before the scatter, so the overlapping front-slot ranges do not
+        # alias-corrupt.
+        src = torch.cat(src_slots)
+        dst = torch.cat(dst_slots)
+        src_blk = src // block_size
+        src_off = src % block_size
+        dst_blk = dst // block_size
+        dst_off = dst % block_size
+        for key_cache, value_cache, _wq in layer_caches:
+            kept_k = key_cache[src_blk, src_off]
+            kept_v = value_cache[src_blk, src_off]
+            key_cache[dst_blk, dst_off] = kept_k
+            value_cache[dst_blk, dst_off] = kept_v
