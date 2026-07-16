@@ -210,48 +210,66 @@ A cheap complementary win that remains is to **gate recording to the observation
 window** — only the last `window` (8) steps before each compaction need queries,
 so record `window / buffer` of steps (8× fewer at buf64, 64× at buf512).
 
-### What's left after `record_query` — async scheduling is the #1 lever
+### What's left after `record_query` — R-KV's per-step decode overhead is ~0
 
-Once `record_query` is free (P4a′), a controlled A/B (single-process, N=128,
-buf512 so compaction is rare, H100) shows the remaining R-KV overhead is **not**
-CPU time in the R-KV hooks (a monkeypatch timer puts `record_query` +
-`_rkv_prepare_physical` + `plan_qwrite` + `observe_layer` at ~11% of wall, most of
-it hidden by GPU overlap) — it is the **decode features R-KV disables to run its
-per-step Python hooks**:
+Once `record_query` is free (P4a′), a controlled A/B (single-process, N=128, H100)
+shows R-KV has **no measurable per-step decode overhead** left. The apparent
+"R-KV is 2× slower than Full-KV" is entirely **two features R-KV disables for
+correctness** — prefix caching and async scheduling — plus a benchmark artifact
+(shared-prefix few-shot prompts). Decode tok/s = output tokens ÷ total wall, so
+the one-time prefill is folded in; prefix caching slashes the *prefill* of these
+shared-prefix prompts.
 
-| config | decode tok/s | isolates |
+| config (async off unless noted) | tok/s | isolates |
 | --- | --- | --- |
-| Full-KV, async **on**, FULL graph | 7613 | ceiling |
-| Full-KV, async **on**, PIECEWISE | 7581 | **attention-graph = ~0% when async on** |
-| Full-KV, async **off**, FULL graph | 5772 | **async scheduling = −24%** |
-| R-KV buf512 (async off, PIECEWISE) | 3729 | R-KV |
-| ↳ `record_query` skipped | 3857 | **`record_query` = only −3.4%** |
+| Full-KV, async **on**, FULL, prefix on | 7613 | absolute ceiling |
+| Full-KV, FULL, prefix on | 5846 | **async scheduling = −23%** |
+| Full-KV, PIECEWISE, prefix on | 5826 | **attention-graph = ~0%** |
+| Full-KV, PIECEWISE, **prefix off** | 3756 | **prefix caching = −36%** |
+| **R-KV buf512** (PIECEWISE, prefix off) | 3729 | **= Full-KV no-prefix (0 R-KV overhead)** |
+| R-KV buf64 | 3758 | = baseline (0 overhead) |
+| ↳ record + observe + physical-prep all no-op'd | 3854 | R-KV hooks ≈ noise |
+| R-KV buf16 | 2733 | compaction every 16 steps (niche) |
 
-Two corrections to the earlier profile:
+Three conclusions:
 
-1. **Async scheduling (−24%) is the biggest single lever, and R-KV forfeits it.**
-   `VllmConfig.__post_init__` force-disables async scheduling under R-KV because
-   compaction feeds its evicted-token count (`num_dropped_tokens`) back through
-   the *model output → scheduler → next step's physical KV positions*, and async
-   prepares step N+1 before step N's output is applied (bug #10 corruption). The
-   earlier "attention-graph = +3%" was measured with async **on**, which hides
-   the eager-attention CPU cost by overlapping it with the scheduler; with async
-   **off** (R-KV's real config) that overlap is gone.
-2. **`record_query` is already ~free** (−3.4%), so further gating (P4a″) is low
-   value; the remaining gap is structural (async + full cudagraph), not CPU.
+1. **R-KV decode is already at parity with Full-KV.** With prefix caching off on
+   both sides (the fair comparison), Full-KV = 3744–3756 and R-KV buf≥64 =
+   3729–3758 — identical. No-op'ing every R-KV hook (`record_query`,
+   `observe_layer`, `_rkv_prepare_physical`) leaves it at 3854, so the per-step
+   CPU is noise. **There is no per-step overhead to optimize.**
+2. **Prefix caching (−36% here) is the biggest lever, and R-KV cannot use it.**
+   R-KV evicts *prompt* KV (budget < prompt length), and its in-place compaction
+   overwrites the shared prefix blocks → cross-request corruption (bug #6). So
+   `VllmConfig.__post_init__` force-disables prefix caching. This is **fundamental
+   to R-KV, not a vLLM defect** — SGLang R-KV likewise requires
+   `--disable-radix-cache`. The −36% is also **inflated by this benchmark**: the
+   few-shot prompts share a long exemplar prefix, so prefix caching dedups almost
+   all the prefill. With diverse production prompts (no shared prefix) prefix
+   caching helps Full-KV little, and R-KV is at parity.
+3. **Async scheduling (−23%) is the next lever, also a correctness disable**
+   (bug #10). The earlier "attention-graph = +3%" was measured with async **on**,
+   which overlaps/hides the eager-attention cost; with async off, FULL vs
+   PIECEWISE is still only ~3%, so the cudagraph mode is not the issue either.
 
-**Next (roadmap P8): make R-KV async-scheduling compatible.** The only consumer
-of `num_dropped_tokens` that matters for correctness is the runner's own
-`_rkv_prepare_physical` (via `input_batch.num_dropped_tokens_cpu`); the scheduler
-merely accumulates the count and hands it back a step later. Because
-`compact_step` runs *in* the forward, the runner already knows each request's
-evicted count immediately — so it can be the **authority**: apply the drop to its
-local `num_dropped` right after `compact_step` (immune to the async delay) and
-stop depending on the scheduler round-trip for physical positions. This is a
-correctness-sensitive change to the exact path that caused bug #10, so it should
-land **gated** (env opt-in, default = today's safe synchronous behavior) and be
-re-validated for accuracy in the many-request memory-pressure regime before
-becoming the default.
+So the only ways to make R-KV approach the prefix-cached Full-KV number are the
+two **correctness-sensitive** features it disables — prefix-caching compatibility
+(P9) and async scheduling (P8) — each a deliberate, gated, re-validated change
+(both re-enable a path that previously corrupted the KV cache), not a per-step
+tuning win.
+
+**Roadmap P9 (prefix-caching compat):** allow prefix caching but make R-KV's
+compaction copy-on-write safe — before a compacting request overwrites a shared
+prefix block, un-share (privatize) its blocks so the raw slot writes cannot bleed
+into other requests. Recovers the shared-prefill dedup while keeping eviction
+correct; needs block-manager integration.
+
+**Roadmap P8 (async compat):** make the runner authoritative on
+`num_dropped_tokens` (apply the drop right after `compact_step` instead of the
+async-delayed scheduler round-trip). The scheduler's only use of the count is to
+feed it back, so a runner-local update removes the bug #10 race; land it gated
+(env opt-in, default = today's safe synchronous behavior) and re-validate accuracy
+in the many-request memory-pressure regime.
 
 ### Decode CUDA graph (PIECEWISE) — implemented
 
@@ -404,7 +422,9 @@ the principled default). **Use `buffer ≥ 64`** (`buffer=128` is lossless).
 | P4 | Decode CUDA graph (PIECEWISE, auto-selected) | **done** | +30–40% decode tok/s (Full-KV +62%), same accuracy; no `--enforce-eager` |
 | **P4a** | **Vectorize `record_query`** (fixed-address ring + single `index_copy_` per layer) | **done** | **+43–48% decode tok/s @ b256/buf64 (2623→3880 PIECEWISE), accuracy unchanged** |
 | **P4a′** | **Centralize `record_query`** (compute ring index once/step in the runner; share via `attn_metadata.rkv_qplan`) | **done** | **+8–12% more (buf64 3880→4233 = ~99% of the record-free ceiling); recording now graph-capturable** |
-| **P8** | **Make R-KV async-scheduling compatible** (runner-authoritative `num_dropped`, applied right after `compact_step` instead of the async-delayed scheduler round-trip) | **todo — #1 throughput lever** | **async scheduling = ~24% (measured); R-KV force-disables it for bug #10** |
+| — | *Per-step decode overhead* | **eliminated** | R-KV buf≥64 = Full-KV **no-prefix** baseline (3729 vs 3744); nothing left to tune per step |
+| **P9** | **Prefix-caching compatibility** (COW-privatize a request's shared blocks before compaction overwrites them) | **todo — biggest lever** | **prefix caching = −36% on shared-prefix prompts (bug #6); the only way to approach the prefix-cached Full-KV number** |
+| **P8** | **Make R-KV async-scheduling compatible** (runner-authoritative `num_dropped`, applied right after `compact_step` instead of the async-delayed scheduler round-trip) | **todo — 2nd lever** | **async scheduling = ~23% (measured); R-KV force-disables it for bug #10** |
 | P4a″ | Gate recording to the observation window | todo (now low value: `record_query` is only ~3% after P4a′) | mainly helps buf16 |
-| P4b | Full hybrid graph (also graph attention, eager only on compaction) | todo | with async **off** (R-KV's config) FULL-vs-PIECEWISE matters more than the +3% measured with async on; blocked by the in-attention hooks |
+| P4b | Full hybrid graph (also graph attention, eager only on compaction) | **dropped** | FULL vs PIECEWISE is only ~3% even with async off; not worth the in-attention-hook complexity |
 | P7 | Memory-bound benchmark (long context / high concurrency) | todo | demonstrate R-KV's *benefit* (constant KV footprint), not just its overhead |
