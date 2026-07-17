@@ -1,6 +1,9 @@
 # Upstream SGLang checkout produced by scripts/apply_rkv.sh — NOT vendored here.
 sglang-src/
 
+# Local virtualenvs used for GPU validation / benchmarking.
+.venv*/
+
 # Python / OS cruft
 __pycache__/
 *.py[cod]

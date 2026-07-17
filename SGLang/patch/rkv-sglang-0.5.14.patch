@@ -656,7 +656,7 @@ index 0feeca831..403e02c19 100644
              if isinstance(extend_seq_lens, list):
                  # Main path: H2D from host lists; populate *_cpu mirrors.
 diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
-index 1cff5c983..071dd303b 100644
+index 1cff5c983..33e67bd08 100644
 --- a/python/sglang/srt/model_executor/model_runner.py
 +++ b/python/sglang/srt/model_executor/model_runner.py
 @@ -417,6 +417,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
@@ -833,24 +833,59 @@ index 1cff5c983..071dd303b 100644
  
      def _preprocess_logits(
 diff --git a/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py b/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
-index db4c8ad8e..5aef18eaa 100644
+index db4c8ad8e..2ee27b6d6 100644
 --- a/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
 +++ b/python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py
-@@ -1015,6 +1015,24 @@ class ModelRunnerKVCacheMixin:
+@@ -1015,6 +1015,59 @@ class ModelRunnerKVCacheMixin:
                  requested_per_worker,
                  max_num_reqs,
              )
 +
-+        # R-KV: optionally cap the concurrent decode requests to shrink the fixed
-+        # rolling observation-query buffer. Every --enable-rkv request is an R-KV
-+        # request, so the decode concurrency IS the rolling_q row count
-+        # (rolling_q rows == req_to_token rows == max_running_requests + 1).
-+        # Capping here cascades to the req_to_token pool, rolling_q, and the
-+        # aux-memory reservation (_reserve_rkv_decode_aux_bytes, which calls this
-+        # method for its provisional row count). Trades peak concurrency for
-+        # memory.
++        # R-KV: cap the concurrent decode requests to size the fixed rolling
++        # observation-query buffer to the KV cache. Every --enable-rkv request is
++        # an R-KV request, so the decode concurrency IS the rolling_q row count
++        # (rolling_q rows == req_to_token rows == max_running_requests + 1), and
++        # rolling_q is allocated out of the SAME GPU budget as the KV pool. An
++        # over-large max_running_requests therefore steals KV capacity for rows
++        # that can never be used. Capping here cascades to the req_to_token pool,
++        # rolling_q, and the aux-memory reservation (_reserve_rkv_decode_aux_bytes,
++        # which calls this method for its provisional row count).
 +        rkv_cap = getattr(self.server_args, "rkv_max_active_requests", None)
-+        if self.enable_rkv and rkv_cap is not None and max_num_reqs > rkv_cap:
++        if self.enable_rkv and rkv_cap is None and requested_per_worker is None:
++            # Neither --rkv-max-active-requests nor --max-running-requests set:
++            # derive a KV-cache-aware ceiling instead of the generic 2048-4096
++            # estimate. R-KV holds each request's physical KV at a bounded ceiling
++            # of budget + buffer_size tokens (see RKVCompressor.admission_reserve),
++            # so the pool can serve at most token_capacity // (budget + buffer_size)
++            # concurrent requests -- rolling_q rows beyond that only waste KV. This
++            # ties the rolling buffer to the pool size; override with
++            # --rkv-max-active-requests (tighter, when memory-bound) or
++            # --max-running-requests.
++            budget = self.server_args.rkv_budget
++            buffer_size = self.server_args.rkv_buffer_size
++            if self.server_args.rkv_config:
++                import json
++
++                _cfg = json.loads(self.server_args.rkv_config)
++                budget = _cfg.get("budget", budget)
++                buffer_size = _cfg.get("buffer_size", buffer_size)
++            derived = self._rkv_autocap_max_reqs(
++                token_capacity, budget, buffer_size
++            )
++            if derived < max_num_reqs:
++                logger.info(
++                    "R-KV: auto-capping max_running_requests %d -> %d (KV pool %d "
++                    "tokens / (budget %d + buffer %d)); the rolling-query buffer "
++                    "scales with this. Override with --rkv-max-active-requests or "
++                    "--max-running-requests.",
++                    max_num_reqs,
++                    derived,
++                    token_capacity,
++                    budget,
++                    buffer_size,
++                )
++                max_num_reqs = derived
++        elif self.enable_rkv and rkv_cap is not None and max_num_reqs > rkv_cap:
 +            logger.info(
 +                "R-KV: capping max_running_requests %d -> %d "
 +                "(--rkv-max-active-requests) to shrink the rolling-query buffer.",
@@ -861,7 +896,7 @@ index db4c8ad8e..5aef18eaa 100644
          return max_num_reqs
  
      def _apply_memory_pool_config(self: ModelRunner, config: MemoryPoolConfig):
-@@ -1048,6 +1066,132 @@ class ModelRunnerKVCacheMixin:
+@@ -1048,6 +1101,150 @@ class ModelRunnerKVCacheMixin:
  
          self._init_pools()
  
@@ -889,6 +924,24 @@ index db4c8ad8e..5aef18eaa 100644
 +            * int(head_dim)
 +            * int(elem_size)
 +        )
++
++    @staticmethod
++    def _rkv_autocap_max_reqs(
++        token_capacity: int, budget: int, buffer_size: int
++    ) -> int:
++        """KV-cache-aware ceiling on concurrent R-KV decode requests.
++
++        R-KV holds each request's physical KV at a bounded ceiling of
++        ``budget + buffer_size`` tokens (the pre-compaction peak; see
++        ``RKVCompressor.admission_reserve``), so a pool of ``token_capacity``
++        tokens can serve at most ``ceil(token_capacity / (budget + buffer_size))``
++        of them concurrently. The fixed rolling-query buffer reserves one row per
++        possibly-concurrent request, so rows beyond this bound can never be used;
++        capping ``max_running_requests`` here ties that buffer to the KV pool.
++        Pure arithmetic so it is unit-testable without a GPU.
++        """
++        footprint = max(1, int(budget) + int(buffer_size))
++        return max(1, -(-int(token_capacity) // footprint))  # ceil division
 +
 +    def _reserve_rkv_decode_aux_bytes(
 +        self: ModelRunner, configurator, available_bytes: int, page_size: int
@@ -994,7 +1047,7 @@ index db4c8ad8e..5aef18eaa 100644
      def _resolve_memory_pool_config(
          self: ModelRunner, pre_model_load_memory: int
      ) -> MemoryPoolConfig:
-@@ -1060,6 +1204,15 @@ class ModelRunnerKVCacheMixin:
+@@ -1060,6 +1257,15 @@ class ModelRunnerKVCacheMixin:
          page_size = self.server_args.page_size
  
          configurator = create_memory_pool_configurator(self)
