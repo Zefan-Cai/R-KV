@@ -39,7 +39,39 @@ observation-query rings and redundancy-score workspace are static allocations:
 shrinks *faster* than Full-KV's as memory tightens: at `0.40` R-KV still fits
 **more** (232 vs 185), but by `0.30` its pool has collapsed to 45K and it fits
 **fewer** (54 vs 100), and at `0.25` it can't allocate a single running slot
-(`AssertionError: max_running_request is zero`).
+(`AssertionError: max_running_request is zero`). But most of this overhead is the
+rolling-query buffer sized for 4096 requests — the next section shrinks it to the
+pool.
+
+## Shrinking the overhead — size the rolling buffer to the pool (auto-cap)
+
+Most of that "~7 GB fixed" cost is **not inherently fixed**. It is the per-layer
+**rolling observation-query buffer** (`rolling_q`), sized
+
+    rolling_q = layers × window × (max_running_requests + 1) × q_heads × head_dim
+
+i.e. **one row per possibly-concurrent request**. SGLang's generic estimate sets
+`max_running_requests = 4096`, so for Qwen2.5-Math-7B (28 layers, window 8, 28
+heads, dim 128, bf16) `rolling_q` = **6.13 GiB** — yet at `mem-frac 0.50` the pool
+only holds ~411 concurrent requests, so **~90 % of those rows can never be used**.
+
+R-KV holds each request's KV at a bounded ceiling of `budget + buffer` tokens, so
+the pool serves at most `ceil(pool / (budget + buffer))` concurrent requests.
+Capping `max_running_requests` to that ceiling ties `rolling_q` to the KV cache.
+This is now the **default** when neither `--rkv-max-active-requests` nor
+`--max-running-requests` is set (and is still tunable):
+
+| `mem-frac 0.50` config | `max_running` | `rolling_q` | R-KV KV pool | vs Full-KV (466K) |
+| --- | ---: | ---: | ---: | ---: |
+| default (before) | 4096 | 6.13 GiB | 340K | −27 % |
+| **auto-cap (now default)** | 1096 | 1.82 GiB | **421K** | **−9.8 %** |
+| `--rkv-max-active-requests 512` | 512 | 0.77 GiB | **440K** | **−5.5 %** |
+
+The auto-cap (1096) stays **well above** the ~500 requests the pool can actually
+admit, so no achievable concurrency is lost — the reclaimed ~80–100K tokens go
+straight back to the KV pool, nearly closing the gap to Full-KV. Lower
+`--rkv-max-active-requests` reclaims even more when you are memory-bound. (Numbers
+are from the server startup log's `R-KV decode: reserving …` line.)
 
 ## Isolating the concurrency benefit — healthy pool, heavier load
 
