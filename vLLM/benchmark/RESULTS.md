@@ -85,13 +85,32 @@ during the run (from the compactor's counter).
    buffer=64` sustains **425 compactions still lossless** (0.920).
 4. **This bench is not memory-bound, so it shows R-KV's *overhead*, not its
    benefit.** At `mem_frac 0.85` the KV pool holds all 200 short-CoT requests
-   easily, so R-KV only *adds* work here (compaction compute + the eager
-   attention window around each compaction) — hence the −7 % to −44 % throughput
-   vs constrained Full-KV, tracking compaction frequency and budget (a smaller
-   budget shrinks decode attention, partly offsetting more-frequent compaction).
-   The **benefit** side — a constant, prompt-independent KV footprint that lets
-   more requests run concurrently under fixed VRAM — appears only under memory
-   pressure; the [DP report](./RESULTS_dp.md) fans the work across replicas.
+   easily, so R-KV only *adds* work here (the per-compaction cross-layer scoring
+   + gather/scatter relocation, plus a small per-step hook cost) — hence the
+   throughput sits below constrained Full-KV. The **benefit** side — a constant,
+   prompt-independent KV footprint that lets more requests run concurrently under
+   fixed VRAM — appears only under memory pressure; the
+   [DP report](./RESULTS_dp.md) fans the work across replicas.
+5. **Throughput vs `buffer` is non-monotonic — and it tracks *attention length*,
+   not compaction count.** This surprises people: `buffer=64` (565 compactions)
+   is **faster** than `buffer=256` (33 compactions). Decode attention is
+   `O(live KV length)` per step, and the **first compaction cannot fire until
+   output token #`buffer`** (it takes `buffer` decode steps to arm it). With
+   ~170–220-token outputs:
+   - `buffer=256 ≈ the output length`, so **~83 % of requests never compact even
+     once** (~0.17 compactions/req) and attend over the **full ~700-token prompt
+     + output on every step** — essentially Full-KV attention. That long per-step
+     attention, *not* the 33 compactions, is the cost → **3982 tok/s**.
+   - `buffer=64` evicts the prompt down to `budget` after just 64 steps, so most
+     decode steps attend over a **~3× shorter** KV (~290 vs ~770 tokens). That
+     per-step saving beats its 565 compactions → **4427 tok/s (fastest)**.
+   - `buffer=16` keeps the KV shortest but 2600+ compaction passes finally
+     dominate → back down to **3648 tok/s**.
+
+   So throughput is a **U-shape** with a sweet spot at `buffer=64` (short-enough
+   KV, not-too-frequent compaction). Accuracy still favors `buffer ≥ 128`, so the
+   overall recommendation is unchanged — but note the fastest *and* the slowest
+   R-KV rows share the same `budget`.
 
 **Sweet spot:** `budget = 256–512`, `buffer = 128` — lossless-to-near-lossless
 accuracy with ~180 compactions per 200 requests.
