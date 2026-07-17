@@ -55,17 +55,19 @@ def to_num(x):
         return None
 
 
-def generate(port: int, prompt: str, max_tokens: int):
-    body = json.dumps(
-        {
-            "text": prompt,
-            "sampling_params": {
-                "temperature": 0.0,
-                "max_new_tokens": max_tokens,
-                "stop": ["\nProblem"],
-            },
-        }
-    ).encode()
+def generate(port: int, prompt: str, max_tokens: int, ignore_eos: bool = False):
+    sp = {
+        "temperature": 0.0,
+        "max_new_tokens": max_tokens,
+    }
+    # ignore_eos forces fixed-length generation (stress test: load the KV cache
+    # regardless of the model's natural stop); otherwise stop at the next
+    # few-shot problem boundary for accurate GSM8K judging.
+    if ignore_eos:
+        sp["ignore_eos"] = True
+    else:
+        sp["stop"] = ["\nProblem"]
+    body = json.dumps({"text": prompt, "sampling_params": sp}).encode()
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}/generate",
         data=body,
@@ -90,6 +92,11 @@ def main():
         help="Number of in-flight requests. >1 forces the server to batch "
         "(exercises the R-KV batch>=2 per-request path).",
     )
+    ap.add_argument(
+        "--ignore-eos",
+        action="store_true",
+        help="generate exactly --max-tokens per request (stress test)",
+    )
     args = ap.parse_args()
 
     data = []
@@ -104,7 +111,7 @@ def main():
     def run_one(item):
         prompt = item["request"]["messages"][0]["content"]
         gold = extract_gold(item["answer"])
-        gen, ntok = generate(args.port, prompt, args.max_tokens)
+        gen, ntok = generate(args.port, prompt, args.max_tokens, args.ignore_eos)
         pred = extract_pred(gen)
         g, p = to_num(gold), to_num(pred)
         ok = g is not None and p is not None and abs(g - p) < 1e-4
