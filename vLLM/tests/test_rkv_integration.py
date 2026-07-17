@@ -49,6 +49,7 @@ _load("vllm.rkv.algo", "rkv/algo.py")
 _integration = _load("vllm.rkv.integration", "rkv/integration.py")
 RKVConfig = _integration.RKVConfig
 RKVCompressor = _integration.RKVCompressor
+is_genuine_decode = _integration.is_genuine_decode
 
 
 def make_paged_cache(num_blocks, block_size, kv_heads, head_dim, base=0.0, sign=1.0):
@@ -395,6 +396,49 @@ class TestCompactionSafety(unittest.TestCase):
         comp.plan_qwrite(["a", "b"], dev, genuine_decode=[True, False])
         self.assertEqual(comp._qcount["a"], 2)
         self.assertEqual(comp._qcount["b"], 0)
+
+    def test_is_genuine_decode_predicate(self):
+        """Directly test the phase-mask *derivation* (the error-prone step). The
+        key subtlety: num_computed lags num_tokens by one on a decode step, so a
+        genuine decode is 'reaches the frontier while past the prompt', NOT
+        num_computed >= num_tokens (which is never true during decode -- the bug
+        that silently disabled all compaction)."""
+        import numpy as np
+        # Columns: num_computed, num_tokens, num_prompt, num_scheduled -> expected
+        cases = [
+            # normal decode: computed lags total by 1, past prompt, one new token
+            (99, 100, 50, 1, True),
+            # a later decode step
+            (150, 151, 50, 1, True),
+            # single-token post-preemption recompute chunk (still behind frontier)
+            (90, 100, 50, 1, False),
+            # single-token prefill chunk finishing the prompt (reaches frontier
+            # but NOT past prompt) -> not a decode
+            (49, 50, 50, 1, False),
+            # multi-token chunked prefill
+            (0, 50, 50, 16, False),
+            # last multi-token prefill chunk (reaches prompt end, still prefill)
+            (34, 50, 50, 16, False),
+            # unscheduled row (no tokens this step)
+            (100, 100, 50, 0, False),
+            # post-preemption catch-up step: indistinguishable from decode by
+            # counts -> True (safe: window check skips until the ring refills)
+            (99, 100, 50, 1, True),
+        ]
+        for nc, nt, npr, ns, expected in cases:
+            got = bool(is_genuine_decode(nc, nt, npr, ns))
+            self.assertEqual(
+                got, expected,
+                f"is_genuine_decode(nc={nc}, nt={nt}, nprompt={npr}, "
+                f"nsched={ns}) = {got}, expected {expected}",
+            )
+        # Vectorized over a batch (numpy arrays), mixed phases.
+        nc = np.array([99, 90, 0, 100])
+        nt = np.array([100, 100, 50, 100])
+        npr = np.array([50, 50, 50, 50])
+        ns = np.array([1, 1, 16, 0])
+        out = is_genuine_decode(nc, nt, npr, ns)
+        self.assertEqual(out.tolist(), [True, False, False, False])
 
     def test_insufficient_window_skips_first_but_raises_after_drop(self):
         """A required request whose observation window hasn't refilled (e.g. it

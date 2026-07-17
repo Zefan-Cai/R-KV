@@ -526,18 +526,22 @@ the principled default). **Use `buffer ≥ 64`** (`buffer=128` is lossless).
    inferred from per-step batch membership — a merely-unscheduled request keeps
    its window, while a preempted one hands its fixed-address slot back to the
    free list so a long preemption cannot leak ring slots. A **preempted**
-   request does not arm compaction while it recomputes (the scheduler skips
-   arming for any request whose `num_computed_tokens` is still catching up, on
-   top of the `is_prefill_chunk` gate), and if it crosses a boundary before its
-   reset window refills it is left Full-KV that step (safe: it has not dropped
-   anything). The observation window advances **only on a genuine new-token
-   decode step**, detected by *phase* — `num_computed_tokens >= num_tokens`, i.e.
-   every existing token is already cached and this step generates a new one —
-   **not** by `num_scheduled == 1` (the scheduler can split a chunked prefill or
-   a post-preemption recompute down to exactly one token). A non-decode step
-   still writes its chunk-tail query into the current ring cell but does not
-   advance the cursor/count, so a compaction right after a resume is scored
-   against real decode queries, never the recompute tail. Under tensor parallelism a readiness handshake compares the
+   request does not arm compaction while it recomputes (`is_prefill_chunk`
+   suppresses arming on every chunk that is still (re)processing materialised
+   tokens), and its single catch-up step is left Full-KV by the incomplete-window
+   check (safe: it has not dropped anything). The observation window advances
+   **only on a genuine new-token decode step**, detected by *phase*
+   (`rkv.integration.is_genuine_decode`): the step **reaches the frontier**
+   (`num_computed + num_scheduled >= num_tokens`) while **past the prompt**
+   (`num_computed >= num_prompt`). Note `num_computed` **lags `num_tokens` by one
+   during decode** (the last-sampled token is counted in `num_tokens` but its KV
+   is computed this step), so the naive `num_computed >= num_tokens` is never
+   true during decode — using it silently disables all compaction, which
+   accuracy-alone cannot detect (real R-KV ≈ 0.88 vs Full-KV ≈ 0.90); confirm via
+   the `[RKV-COMPACT]` TRACE count. A non-decode step still writes its chunk-tail
+   query into the current ring cell but does not advance the cursor/count, so a
+   compaction right after a resume is scored against real decode queries, never
+   the recompute tail. Under tensor parallelism a readiness handshake compares the
    **minimum and maximum** of a collision-resistant ordered-plan fingerprint
    across the TP group (not a sum, which an average collision could mask); the
    fingerprint folds each row's **request-id digest** (a stable cross-process

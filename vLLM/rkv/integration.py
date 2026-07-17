@@ -54,9 +54,45 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 
 from vllm.rkv.algo import R1KV
+
+
+def is_genuine_decode(num_computed, num_tokens, num_prompt, num_scheduled):
+    """Per-request mask: does this step generate a genuinely new decode token?
+
+    The R-KV observation window must advance only on real decode steps, not on
+    chunked prefill or a preempted request's recompute. The subtlety is that
+    ``num_computed`` **lags ``num_tokens`` by one on a normal decode step**: the
+    token sampled last step is already counted in ``num_tokens`` but its KV is
+    computed *this* step. So a genuine decode is NOT ``num_computed >=
+    num_tokens`` (that is never true during decode); it is:
+
+    * this step reaches the sequence frontier -- ``num_computed + num_scheduled
+      >= num_tokens`` -- so it is not a mid-prefill / mid-recompute chunk, AND
+    * the request is already past its prompt -- ``num_computed >= num_prompt`` --
+      so the last prompt chunk (which also reaches the frontier) is excluded, AND
+    * the step actually has tokens -- ``num_scheduled > 0``.
+
+    The single post-preemption *catch-up* step is indistinguishable from a decode
+    step by these counts and returns True; that is safe because the query ring
+    was released on preemption, so ``compact_step`` sees an incomplete window and
+    skips until it refills with genuine decode queries.
+
+    Arguments are per-request numpy int arrays (or scalars); returns a bool
+    array (or numpy bool scalar).
+    """
+    num_computed = np.asarray(num_computed)
+    num_tokens = np.asarray(num_tokens)
+    num_prompt = np.asarray(num_prompt)
+    num_scheduled = np.asarray(num_scheduled)
+    return (
+        (num_scheduled > 0)
+        & (num_computed + num_scheduled >= num_tokens)
+        & (num_computed >= num_prompt)
+    )
 
 __all__ = ["RKVConfig", "RKVCompressor"]
 
