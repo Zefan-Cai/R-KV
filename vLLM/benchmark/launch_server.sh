@@ -1,69 +1,88 @@
 #!/usr/bin/env bash
-# Launch a vLLM (v0.25.1 + R-KV) OpenAI server at BEST THROUGHPUT.
+# Launch a vLLM (v0.25.1 + R-KV) OpenAI server for the R-KV benchmark.
 #
 # Usage:
-#   ./launch_server.sh rkv 256       # R-KV ON, budget=256 (fastest R-KV path)
-#   ./launch_server.sh fullkv        # Full-KV baseline (upstream defaults)
+#   ./launch_server.sh rkv 256         # R-KV ON, budget=256 (PIECEWISE cudagraph + async)
+#   ./launch_server.sh fullkv          # Full-KV, production (prefix caching + full cudagraph)
+#   ./launch_server.sh constrained     # Full-KV under R-KV's flags (prefix caching OFF)
 #
-# BEST-THROUGHPUT R-KV path (all levers measured on 8x H100, Qwen2.5-Math-7B;
-# see RESULTS_H100.md / ../docs/OPTIMIZATIONS.md):
-#   * NO  --enforce-eager  -> R-KV auto-selects PIECEWISE cudagraph (attention
-#     stays eager so the in-forward hooks fire, the rest of the layer is graphed).
-#     +30-40% decode tok/s vs eager. FULL cudagraph would capture attention and
-#     silently no-op R-KV, so PIECEWISE is auto-forced -- do NOT pass
-#     --enforce-eager.
-#   * VLLM_V1_R_KV_ASYNC=1 -> async scheduling. R-KV normally force-disables it
-#     (compaction's evicted-token feedback would be one step stale under async);
-#     with this flag the runner applies the drop itself right after compaction
-#     (runner-authoritative num_dropped), so async is safe. +16.7% decode tok/s
-#     at budget=256/buffer=64 sustained (gap to Full-KV -26% -> -13%).
-#   * VLLM_V1_R_KV_FREE_BLOCKS=1 (default) -> R-KV frees the KV blocks it evicts,
-#     so the per-request KV footprint is bounded at budget+buffer. Under memory
-#     pressure this fits many more concurrent requests (e.g. +76% at a tight KV
-#     budget); harmless when not memory-bound.
-#   * Batched cross-layer scoring + batched compaction (in the patch) keep the
-#     per-compaction cost low, so small buffers stay fast.
+# Parallelism (optional, mutually exclusive -- TP wins if both are set):
+#   DP=N ./launch_server.sh rkv 256    # N data-parallel replicas (tp=1)
+#   TP=N ./launch_server.sh rkv 256    # N-way tensor parallel (R-KV all-reduces the score)
 #
-# Env overrides: MODEL, PORT, BUFFER, WINDOW, MEM_FRAC, HOST, EXTRA
-#   EXTRA is appended verbatim. R-KV is correct under tensor & data parallelism
-#   (it all-reduces its eviction scores across each replica's TP group), e.g.
-#   EXTRA="--tensor-parallel-size 2" or EXTRA="--data-parallel-size 2".
+# NOTE ON METHODOLOGY: the numbers in RESULTS*.md were produced with the OFFLINE
+# driver (eval.py -> LLM.generate over all prompts at once), NOT with this
+# server. This launcher is for real serving / OpenAI-client benchmarking and
+# uses the exact same R-KV knobs; drive it with `vllm bench serve` or any
+# OpenAI-compatible client.
 #
-# Evaluate with any OpenAI-compatible client, or:
-#   vllm bench serve --model "$MODEL" --port "$PORT" ...
+# Best-throughput R-KV path (see ../docs/OPTIMIZATIONS.md):
+#   * NO --enforce-eager -> R-KV auto-selects PIECEWISE cudagraph (attention
+#     stays eager so the in-forward hooks fire; the rest of the layer is graphed).
+#   * VLLM_V1_R_KV_ASYNC=1 -> async scheduling (runner-authoritative num_dropped).
+#   * VLLM_V1_R_KV_FREE_BLOCKS=1 -> free evicted blocks (bounded KV footprint).
+#     Opt-in / experimental (no scheduler<->worker block-table version handshake
+#     yet -- see ../docs/IMPLEMENTATION.md 6.5); drop it for the default-safe path.
+#
+# Env overrides: MODEL, PORT, HOST, BUFFER, WINDOW, MEM_FRAC, DP, TP, EXTRA
+#   EXTRA is appended verbatim.
 set -euo pipefail
 
 MODE="${1:-rkv}"
 BUDGET="${2:-256}"
-MODEL="${MODEL:-Qwen/Qwen2.5-Math-7B-Instruct}"
+MODEL="${MODEL:-/data/model/Qwen2.5-Math-7B-Instruct}"
 PORT="${PORT:-8000}"
 HOST="${HOST:-127.0.0.1}"
-BUFFER="${BUFFER:-64}"
+BUFFER="${BUFFER:-128}"
 WINDOW="${WINDOW:-8}"
-MEM_FRAC="${MEM_FRAC:-0.9}"
+MEM_FRAC="${MEM_FRAC:-0.85}"
+DP="${DP:-1}"
+TP="${TP:-1}"
 EXTRA="${EXTRA:-}"
 
 COMMON=(--host "$HOST" --port "$PORT" --gpu-memory-utilization "$MEM_FRAC")
 
+# Parallelism (mutually exclusive; TP preferred when both >1). R-KV supports
+# tensor parallelism (the per-token eviction score is all-reduced across the
+# attention-TP group so every rank evicts identical tokens; see RESULTS_tp.md)
+# and plain data parallelism (each replica runs its own independent R-KV; see
+# RESULTS_dp.md).
+PAR_FLAGS=()
+if [[ "$TP" -gt 1 ]]; then
+  PAR_FLAGS=(--tensor-parallel-size "$TP")
+elif [[ "$DP" -gt 1 ]]; then
+  PAR_FLAGS=(--data-parallel-size "$DP" --tensor-parallel-size 1)
+fi
+
 case "$MODE" in
   rkv)
-    # Best-throughput R-KV: PIECEWISE cudagraph (no --enforce-eager) + async.
     export VLLM_V1_R_KV_BUDGET="$BUDGET"
     export VLLM_V1_R_KV_BUFFER="$BUFFER"
     export VLLM_V1_R_KV_WINDOW="$WINDOW"
-    export VLLM_V1_R_KV_ASYNC=1        # async scheduling (+16.7%), runner-authoritative
-    export VLLM_V1_R_KV_FREE_BLOCKS=1  # free evicted blocks (default); bounded KV footprint
-    echo ">> R-KV  budget=$BUDGET buffer=$BUFFER window=$WINDOW  async=ON  cudagraph=PIECEWISE"
+    export VLLM_V1_R_KV_ASYNC=1        # async scheduling (runner-authoritative)
+    export VLLM_V1_R_KV_FREE_BLOCKS=1  # free evicted blocks (opt-in; see note above)
+    echo ">> R-KV ON  | budget=$BUDGET buffer=$BUFFER window=$WINDOW dp=$DP tp=$TP (PIECEWISE cudagraph + async)"
     # shellcheck disable=SC2086
-    exec vllm serve "$MODEL" "${COMMON[@]}" $EXTRA
+    exec vllm serve "$MODEL" "${COMMON[@]}" "${PAR_FLAGS[@]}" $EXTRA
     ;;
   fullkv)
-    echo ">> Full-KV baseline (async + FULL cudagraph + prefix caching, all upstream defaults)"
+    # Production Full-KV: prefix caching + full cudagraph + async, all upstream
+    # defaults -- the fastest Full-KV baseline (best case for Full-KV).
+    echo ">> FULL-KV (production: prefix caching + full cudagraph + async, upstream defaults) dp=$DP tp=$TP"
     # shellcheck disable=SC2086
-    exec vllm serve "$MODEL" "${COMMON[@]}" $EXTRA
+    exec vllm serve "$MODEL" "${COMMON[@]}" "${PAR_FLAGS[@]}" $EXTRA
+    ;;
+  constrained|baseline)
+    # Full-KV under R-KV's required constraint (prefix caching OFF), no
+    # compression -- the FAIR A/B baseline: the throughput delta to `rkv` is
+    # purely R-KV's compression cost, with the shared-prefix prefill-dedup
+    # advantage (which R-KV structurally cannot use) removed from both sides.
+    echo ">> FULL-KV constrained (prefix caching OFF, matching R-KV; no compression) dp=$DP tp=$TP"
+    # shellcheck disable=SC2086
+    exec vllm serve "$MODEL" "${COMMON[@]}" --no-enable-prefix-caching "${PAR_FLAGS[@]}" $EXTRA
     ;;
   *)
-    echo "usage: $0 {rkv [budget]|fullkv}   (env: MODEL PORT BUFFER WINDOW MEM_FRAC HOST EXTRA)" >&2
+    echo "unknown mode: $MODE (use: rkv <budget> | fullkv | constrained)" >&2
     exit 1
     ;;
 esac
