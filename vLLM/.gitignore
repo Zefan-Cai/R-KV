@@ -1,0 +1,10 @@
+# Upstream vLLM checkout produced by scripts/apply_rkv.sh — NOT vendored here.
+vllm-src/
+
+# Local virtualenvs used for GPU validation.
+.venv*/
+
+# Python / OS cruft
+__pycache__/
+*.py[cod]
+.DS_Store
