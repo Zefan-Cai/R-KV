@@ -120,10 +120,17 @@ class RKVConfig:
     score_chunk_bytes: int = 512 * 1024 * 1024
 
     def __post_init__(self) -> None:
-        # Only validate an *enabled* config: with budget or buffer_size == 0
-        # R-KV is a pure no-op, so the (otherwise out-of-range) zero values must
-        # be tolerated rather than rejected.
-        if not (self.budget > 0 and self.buffer_size > 0):
+        # A partial config is a mistake, not "disabled": budget and buffer_size
+        # must be both zero (R-KV off) or both positive (on). Silently treating
+        # budget>0/buffer=0 as disabled would hide a typo.
+        if (self.budget > 0) != (self.buffer_size > 0):
+            raise ValueError(
+                "R-KV budget and buffer_size must both be zero (disabled) or "
+                f"both positive; got budget={self.budget}, "
+                f"buffer_size={self.buffer_size}."
+            )
+        # Disabled -> a pure no-op; tolerate the zero values.
+        if self.budget == 0:
             return
         if self.window_size <= 0:
             raise ValueError(
@@ -163,6 +170,16 @@ class RKVConfig:
             raise ValueError(
                 "R-KV score_chunk_bytes (VLLM_V1_R_KV_SCORE_CHUNK_MB) must be "
                 f"positive, got {self.score_chunk_bytes} bytes."
+            )
+        if self.retain_direction not in (
+            "last",
+            "first",
+            "last_percent",
+            "first_percent",
+        ):
+            raise ValueError(
+                f"R-KV retain_direction ({self.retain_direction!r}) must be one "
+                "of 'last', 'first', 'last_percent', 'first_percent'."
             )
 
     @classmethod
@@ -268,7 +285,6 @@ class RKVCompressor:
         """
         if self._tp_grp_resolved:
             return self._tp_grp
-        self._tp_grp_resolved = True
         expected = self._expected_tp_world_size
         if expected is None or expected <= 1:
             # Single-GPU / unset: reduction not required. Still avoid silently
@@ -277,22 +293,27 @@ class RKVCompressor:
                 from vllm.distributed.parallel_state import get_tp_group
 
                 grp = get_tp_group()
-                self._tp_grp = grp if grp.world_size > 1 else None
+                resolved = grp if grp.world_size > 1 else None
             except (ImportError, AssertionError):
-                self._tp_grp = None
-            return self._tp_grp
-        # expected > 1: the reduction is mandatory -- fail closed on any problem.
-        from vllm.distributed.parallel_state import get_tp_group
+                resolved = None
+        else:
+            # expected > 1: the reduction is mandatory. Resolve+validate BEFORE
+            # marking resolved, so a failure (or a caught exception upstream) is
+            # retried next step rather than cached as an unresolved ``None``
+            # that would silently degrade to a local decision.
+            from vllm.distributed.parallel_state import get_tp_group
 
-        grp = get_tp_group()  # raises if the group is not initialized
-        if grp.world_size != expected:
-            raise RuntimeError(
-                f"R-KV: tensor-parallel group world_size {grp.world_size} != "
-                f"expected {expected}; refusing to make a per-rank-inconsistent "
-                "eviction decision."
-            )
-        self._tp_grp = grp
-        return self._tp_grp
+            grp = get_tp_group()  # raises if the group is not initialized
+            if grp.world_size != expected:
+                raise RuntimeError(
+                    f"R-KV: tensor-parallel group world_size {grp.world_size} "
+                    f"!= expected {expected}; refusing to make a "
+                    "per-rank-inconsistent eviction decision."
+                )
+            resolved = grp
+        self._tp_grp = resolved
+        self._tp_grp_resolved = True
+        return resolved
 
     def _storage_id(self, t: torch.Tensor):
         """Identity of a tensor's underlying storage (data ptr + view geometry).
@@ -340,12 +361,20 @@ class RKVCompressor:
             return
         import torch.distributed as dist
 
-        total_reqs = sum(len(m) for m in groups.values())
-        sig = (
-            len(groups) * 1_000_003
-            + total_reqs * 1009
-            + sum(int(sl) * len(m) for sl, m in groups.items())
-        )
+        # Collision-resistant fingerprint of the FULL ordered plan: for each
+        # group (sorted by seq_len) the sorted member batch indices. Batch
+        # indices and seq_lens are identical across TP ranks (replicated batch),
+        # so any mismatch is real divergence. A weak (count, weighted-sum)
+        # signature can collide (different groupings sharing a sum); fold a
+        # polynomial hash over the ordered plan instead. MOD is kept < 2^52 so
+        # the all-reduce SUM (world_size x sig) cannot overflow int64.
+        MOD = (1 << 52) - 1
+        MUL = 1_000_000_007
+        sig = 1469598103934665603 % MOD
+        for sl in sorted(groups):
+            sig = (sig * MUL + int(sl) + 1) % MOD
+            for m in sorted(groups[sl], key=lambda x: x[0]):
+                sig = (sig * MUL + int(m[0]) + 1) % MOD
         t = torch.tensor([sig], dtype=torch.int64, device=device)
         dist.all_reduce(t, group=tp.device_group)
         if int(t.item()) != sig * tp.world_size:
@@ -353,6 +382,33 @@ class RKVCompressor:
                 "R-KV: tensor-parallel ranks disagree on the compaction plan; "
                 "refusing to make divergent eviction decisions."
             )
+
+    def release_requests(self, request_ids) -> None:
+        """Free the ring columns of requests the runner reports **finished**.
+
+        Called by the model runner with ``scheduler_output.finished_req_ids``.
+        Ring-slot lifecycle is driven explicitly (finish / preempt) instead of
+        inferred from per-step batch membership, so a request that is merely
+        unscheduled this step keeps its observation window intact.
+        """
+        for rid in request_ids:
+            s = self._slot.pop(rid, None)
+            if s is not None:
+                self._free.append(s)
+            self._qcount.pop(rid, None)
+
+    def reset_request_windows(self, request_ids) -> None:
+        """Restart the observation window of **preempted** requests.
+
+        Called with ``scheduler_output.preempted_req_ids``. A preempted request
+        recomputes its whole sequence from scratch (physical KV rebuilt,
+        ``num_dropped`` reset to 0), so its recorded queries are stale: reset the
+        step counter so the window re-warms and :meth:`compact_step` refuses to
+        compact it until ``window_size`` fresh queries have been recorded.
+        """
+        for rid in request_ids:
+            if rid in self._qcount:
+                self._qcount[rid] = 0
 
     def plan_qwrite(self, req_ids, device) -> tuple | None:
         """Compute this step's shared ring write-plan (runner-owned, once/step).
@@ -377,14 +433,14 @@ class RKVCompressor:
             return None
         num_reqs = len(req_ids)
         window = self.config.window_size
-        # Release the ring columns of any finished request every step (set
-        # difference), so a slot is reclaimed the step its request leaves rather
-        # than lingering until the tracked-slot count happens to exceed the batch
-        # -- otherwise a stale id could hold a column across request churn.
-        present = set(req_ids)
-        for rid in [r for r in self._slot if r not in present]:
-            self._free.append(self._slot.pop(rid))
-            self._qcount.pop(rid, None)
+        # NOTE: a request absent from ``req_ids`` this step is NOT necessarily
+        # finished -- vLLM's persistent batch also drops requests that were
+        # preempted or simply not scheduled this step, and they may return. A
+        # ring column is kept until the runner explicitly reports the request
+        # finished (:meth:`release_requests`) or preempted
+        # (:meth:`reset_request_windows`); inferring "finished" from batch
+        # absence here would reuse a still-running request's column and score it
+        # against another request's queries.
 
         # Assign each request a persistent ring column + its current cursor
         # (``step_count % window``); advance the step count once per step.
@@ -616,7 +672,8 @@ class RKVCompressor:
         # per-layer sum order is preserved, so the result is bit-identical to
         # scoring the whole group at once. compact_step guarantees each unit
         # itself fits the cap (it skips/raises otherwise), so ``units_cap >= 1``.
-        per_unit = max(1, (2 * elt + 1 + 4) * kv_heads * seq_len * seq_len)
+        # The 2x margin matches compact_step's admission estimate.
+        per_unit = max(1, 2 * (2 * elt + 1 + 4) * kv_heads * seq_len * seq_len)
         units_cap = max(1, self.config.score_chunk_bytes // per_unit)
         req_chunk = max(1, min(num_reqs, units_cap))
         layer_chunk = max(1, min(num_layers, units_cap // req_chunk))
@@ -681,6 +738,7 @@ class RKVCompressor:
         num_dropped_tokens_list,
         expected_layer_count: int | None = None,
         prev_dropped=None,
+        req_ids=None,
     ) -> None:
         """Evict every required request with one global cross-layer decision.
 
@@ -763,7 +821,10 @@ class RKVCompressor:
         groups: dict[int, list[tuple[int, int, torch.Tensor]]] = {}
         for i in required:
             seq_len = seq_lens_cpu[i]
-            unit_bytes = (2 * elt + 5) * kv_heads * seq_len * seq_len
+            # 2x safety margin over the analytic matrix size: the real peak also
+            # holds int64 index tensors, normalized key/query copies, matmul
+            # workspace, mask/reduction intermediates and allocator slack.
+            unit_bytes = 2 * (2 * elt + 5) * kv_heads * seq_len * seq_len
             if unit_bytes > cap:
                 if int(prev[i]) > 0:
                     raise RuntimeError(
@@ -781,6 +842,32 @@ class RKVCompressor:
                         flush=True,
                     )
                 continue
+            # A request about to compact must have a full observation window
+            # (>= window_size recorded queries), else scoring would use
+            # stale/zero ring rows. This happens legitimately right after a
+            # preemption: the window was reset and the resumed request can cross
+            # a compaction boundary before it refills. Treat it like the memory
+            # skip -- if it has never dropped KV (num_dropped == 0) it is safe to
+            # leave it Full-KV this step and compact once the window refills; if
+            # it has already dropped, a partial window is a real bug that must
+            # not silently produce a wrong eviction, so raise.
+            if req_ids is not None:
+                have = self._qcount.get(req_ids[i], 0)
+                if have < window:
+                    if int(prev[i]) > 0:
+                        raise RuntimeError(
+                            f"R-KV: request {req_ids[i]} has already compacted "
+                            f"(dropped={int(prev[i])}) but only {have} recorded "
+                            f"queries < window_size {window} -- cannot score a "
+                            "partial window and cannot fall back to Full-KV."
+                        )
+                    if os.getenv("VLLM_V1_R_KV_TRACE") == "1":
+                        print(
+                            f"[RKV-SKIP] req {req_ids[i]} window {have}/{window} "
+                            "incomplete (post-preempt); left Full-KV this step",
+                            flush=True,
+                        )
+                    continue
             kv_start = seq_starts_cpu[i]
             groups.setdefault(seq_len, []).append(
                 (i, kv_start, occupied_slot_mapping[kv_start : seq_ends_cpu[i]])

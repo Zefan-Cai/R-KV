@@ -227,6 +227,9 @@ class TestConfigValidation(unittest.TestCase):
             dict(budget=64, buffer_size=64, retain_ratio=0.0),  # out of (0,1]
             dict(budget=64, buffer_size=64, score_mode="bogus"),
             dict(budget=64, buffer_size=64, score_chunk_bytes=0),  # non-positive cap
+            dict(budget=64, buffer_size=0),  # partial enable (buffer off)
+            dict(budget=0, buffer_size=64),  # partial enable (budget off)
+            dict(budget=64, buffer_size=64, retain_direction="middle"),  # bad enum
         ]
         for kwargs in bad:
             with self.assertRaises(ValueError, msg=str(kwargs)):
@@ -344,20 +347,54 @@ class TestCompactionSafety(unittest.TestCase):
                 [0], expected_layer_count=1,
             )
 
-    def test_query_ring_reclaims_finished_slots_each_step(self):
-        """A finished request's ring column is reclaimed the step it leaves (set
-        difference), and a new request reuses it without growing the ring."""
+    def test_query_ring_lifecycle_is_explicit(self):
+        """plan_qwrite keeps an absent-but-running request's column (it may be
+        merely unscheduled); only an explicit finish frees it, and preemption
+        resets its window in place."""
         comp = RKVCompressor(RKVConfig(budget=64, buffer_size=64, window_size=8))
         dev = torch.device("cpu")
         comp.plan_qwrite(["a", "b", "c"], dev)
         self.assertEqual(set(comp._slot), {"a", "b", "c"})
-        comp.plan_qwrite(["a"], dev)  # b, c finished
+        # b unscheduled this step -> its column and window are KEPT.
+        comp.plan_qwrite(["a", "c"], dev)
+        self.assertEqual(set(comp._slot), {"a", "b", "c"})
+        self.assertGreater(comp._qcount["b"], 0)
+        # explicit finish frees b and c and drops their step counts.
+        comp.release_requests(["b", "c"])
         self.assertEqual(set(comp._slot), {"a"})
+        self.assertNotIn("b", comp._qcount)
         self.assertEqual(len(comp._free), 2)
-        width = comp._ring_width
-        comp.plan_qwrite(["a", "d"], dev)  # d reuses a freed column
-        self.assertEqual(set(comp._slot), {"a", "d"})
-        self.assertEqual(comp._ring_width, width)  # no growth
+        # preemption resets a's window but keeps its column (KV is rebuilt).
+        a_slot = comp._slot["a"]
+        comp.reset_request_windows(["a"])
+        self.assertEqual(comp._slot["a"], a_slot)
+        self.assertEqual(comp._qcount["a"], 0)
+
+    def test_insufficient_window_skips_first_but_raises_after_drop(self):
+        """A required request whose observation window hasn't refilled (e.g. it
+        just resumed from preemption) is left Full-KV if it never dropped, but
+        raises if it already dropped (a partial window cannot be scored)."""
+        cfg = RKVConfig(budget=6, buffer_size=2, window_size=2, score_mode="reference")
+        comp = RKVCompressor(cfg)
+        comp.plan_qwrite(["rq"], torch.device("cpu"))  # only 1 query < window 2
+        occupied = torch.arange(10, dtype=torch.long)
+        k = make_paged_cache(8, 4, 1, 2)
+        v = make_paged_cache(8, 4, 1, 2, sign=-1.0)
+        score = torch.tensor([10.0, 1, 9, 1, 8, 1, 7, 1])
+        # Never dropped -> skip (Full-KV): dropped stays 0, cache untouched.
+        nd = [0]
+        comp.compact_step(
+            1, torch.tensor([10]), occupied, (True,), [score], [(k, v, {})],
+            nd, expected_layer_count=1, req_ids=["rq"], prev_dropped=[0],
+        )
+        self.assertEqual(nd[0], 0)
+        self.assertEqual(slot_val(k, 1), 1.0)  # untouched
+        # Already dropped -> raise (cannot score a partial window).
+        with self.assertRaises(RuntimeError):
+            comp.compact_step(
+                1, torch.tensor([10]), occupied, (True,), [score], [(k, v, {})],
+                [0], expected_layer_count=1, req_ids=["rq"], prev_dropped=[3],
+            )
 
     def test_tp_group_mismatch_fails_closed(self):
         """With an expected TP world size > 1, a missing/mismatched group must

@@ -462,7 +462,8 @@ the principled default). **Use `buffer ≥ 64`** (`buffer=128` is lossless).
    - any non-FlashAttention cache layer.
 
    `RKVConfig` also validates its own knobs (`budget > window`, `buffer ≥
-   window`, positive odd `kernel_size`, positive `SCORE_CHUNK_MB`, parameter
+   window`, positive odd `kernel_size`, positive `SCORE_CHUNK_MB`, valid
+   `retain_direction`, budget & buffer both-zero-or-both-positive, parameter
    ranges) and raises on bad values; malformed env vars raise (naming the
    variable) instead of silently reverting to a default. **Supported:** tensor
    & data parallelism, PIECEWISE cudagraph, opt-in async scheduling
@@ -473,27 +474,39 @@ the principled default). **Use `buffer ≥ 64`** (`buffer=128` is lossless).
 7. **Compaction is transactional.** Once a request reaches the threshold its
    compaction *must* complete this step — a request that has already dropped KV
    cannot fall back to Full-KV (its old KV is gone and the block manager has
-   capped its allocation). Missing state, an incompletely registered layer set,
-   or a missing observation window therefore **raise** (fatal to the worker)
-   rather than silently skipping and letting the physical length drift past the
-   capped allocation into freed/null blocks. Under tensor parallelism a
-   readiness handshake makes divergent ranks fail together instead of
-   deadlocking, and the score all-reduce fails closed if the TP group is
-   missing/mismatched. Two last-line invariants back this up: the occupied slot
-   mapping is checked for the reserved **null block** (id 0) before any KV is
-   read/written (catches a physical length that ran past its allocation), and
-   the per-token scores are checked **finite** before the top-k (catches fp16
-   similarity underflow before a NaN ranking or a NaN TP all-reduce).
+   capped its allocation). The runner enters `compact_step` whenever compaction
+   was **armed** this step (not merely when some layer registered), so a step
+   that requires compaction but registers zero layers still hits the checks
+   instead of being silently skipped. Missing state, an incompletely registered
+   layer set, or an incomplete observation window on an already-dropped request
+   therefore **raise** rather than silently skip. Two last-line invariants back
+   this up: the occupied slot mapping is checked for the reserved **null block**
+   (id 0) before any KV is read/written, and the per-token scores are checked
+   **finite** before the top-k (fp16 similarity underflow). The query-ring
+   lifecycle is driven **explicitly** by the runner (free on `finished_req_ids`,
+   reset window on `preempted_req_ids`) rather than inferred from per-step batch
+   membership — a merely-unscheduled request keeps its window. A **preempted**
+   request does not arm compaction while it recomputes (`is_prefill_chunk`), and
+   if it crosses a boundary before its reset window refills it is left Full-KV
+   that step (safe: it has not dropped anything). Under tensor parallelism a
+   readiness handshake over a **collision-resistant ordered-plan fingerprint**
+   makes divergent ranks fail together instead of deadlocking, and the score
+   all-reduce fails closed if the TP group is missing/mismatched.
 
 8. **Long-sequence scoring is memory-guarded, not yet tiled.** The redundancy
    matrix is `~kv_heads × seq_len²`; scoring tiles over **both** the layer and
    request dimensions to keep each batch under `VLLM_V1_R_KV_SCORE_CHUNK_MB`
-   (default 512 MB). A single request whose *first* compaction still exceeds
-   the cap (a very long prompt) is left Full-KV (`num_dropped` stays 0, so it is
-   never capped — safe) rather than risking an OOM; an already-compacted
-   request that no longer fits raises. This trades R-KV's benefit on very long
-   prompts for safety until sequence-dimension **tiling** (blockwise reduction
-   without materializing the full `seq_len²` matrix) lands. **Roadmap.**
+   (default 512 MB), with a **2× safety margin** over the analytic estimate for
+   the index/workspace/intermediate overhead the formula omits. A single
+   request whose *first* compaction still exceeds the cap (a very long prompt)
+   is left Full-KV (`num_dropped` stays 0, so it is never capped — safe) rather
+   than risking an OOM; an already-compacted request that no longer fits raises.
+   The admission check runs in `compact_step` (default `batched` mode), so the
+   `reference` scoring mode — which scores inside each layer's forward — is not
+   memory-admitted and is a debugging/opt-in path only. This trades R-KV's
+   benefit on very long prompts for safety until sequence-dimension **tiling**
+   (blockwise reduction without materializing the full `seq_len²` matrix)
+   lands. **Roadmap.**
 
 ## Roadmap
 
