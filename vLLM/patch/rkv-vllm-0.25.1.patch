@@ -685,7 +685,7 @@ index 28d1a04..b0310b6 100644
  
              self.request_lora_mapping[empty_index] = self.request_lora_mapping[
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index e9b23f1..04b90a7 100644
+index e9b23f1..7dda60f 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
 @@ -769,6 +769,49 @@ class GPUModelRunner(
@@ -985,7 +985,7 @@ index e9b23f1..04b90a7 100644
  
          # Copy the tensors to the GPU.
          self._prepare_input_ids(
-@@ -2395,6 +2622,30 @@ class GPUModelRunner(
+@@ -2395,6 +2622,39 @@ class GPUModelRunner(
              rswa_prefix_lens=rswa_prefix_lens,
          )
  
@@ -1008,15 +1008,24 @@ index e9b23f1..04b90a7 100644
 +            # and flat scatter index are identical across all layers); every
 +            # layer's record_query/observe_layer reuses it via rkv_qplan instead
 +            # of repeating the Python loop + host->device copy 28x.
++            # Genuine new-token decode steps advance the observation window;
++            # chunked-prefill / post-preemption recompute steps do not. Mark
++            # them by phase -- num_computed_tokens >= num_tokens_no_spec means
++            # every existing token is already in cache and this step generates a
++            # new one -- not by num_scheduled == 1, since the scheduler can split
++            # a prefill or recompute down to exactly one token.
++            rkv_genuine_decode = (
++                self.input_batch.num_computed_tokens_cpu[:num_reqs]
++                >= self.input_batch.num_tokens_no_spec[:num_reqs]
++            )
 +            cm_base.rkv_qplan = self.rkv_compactor.plan_qwrite(
-+                cm_base.rkv_req_ids, self.device,
-+                self.num_scheduled_tokens.np[:num_reqs],
++                cm_base.rkv_req_ids, self.device, rkv_genuine_decode,
 +            )
 +
          if self.dcp_world_size > 1:
              self.dcp_local_seq_lens.cpu[:num_reqs] = get_dcp_local_seq_lens(
                  self.optimistic_seq_lens_cpu[:num_reqs],
-@@ -4358,6 +4609,39 @@ class GPUModelRunner(
+@@ -4358,6 +4618,39 @@ class GPUModelRunner(
                  **model_kwargs,
              )
  
@@ -1056,7 +1065,7 @@ index e9b23f1..04b90a7 100644
          with record_function_or_nullcontext("gpu_model_runner: postprocess"):
              if self.use_aux_hidden_state_outputs:
                  # True when EAGLE 3 is used.
-@@ -4682,6 +4966,11 @@ class GPUModelRunner(
+@@ -4682,6 +4975,11 @@ class GPUModelRunner(
                  routed_experts=None,
              )
  
@@ -1068,7 +1077,7 @@ index e9b23f1..04b90a7 100644
          if not self.use_async_scheduling:
              if self.routed_experts_initialized:
                  # Sync path: D2H was issued in ``_bookkeeping_sync`` and
-@@ -7419,6 +7708,8 @@ class GPUModelRunner(
+@@ -7419,6 +7717,8 @@ class GPUModelRunner(
          self.may_add_encoder_only_layers_to_kv_cache_config()
          self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
          self.initialize_attn_backend(kv_cache_config, is_profiling=is_profiling)
@@ -1077,7 +1086,7 @@ index e9b23f1..04b90a7 100644
          initialize_mamba_ssu_backend(
              self.vllm_config.mamba_config, self.kv_cache_config
          )
-@@ -7461,6 +7752,110 @@ class GPUModelRunner(
+@@ -7461,6 +7761,110 @@ class GPUModelRunner(
                  kv_transfer_group.register_kv_caches(kv_caches)
              kv_transfer_group.set_host_xfer_buffer_ops(copy_kv_blocks)
  

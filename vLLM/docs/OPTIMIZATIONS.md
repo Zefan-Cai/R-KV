@@ -502,15 +502,21 @@ the principled default). **Use `buffer ≥ 64`** (`buffer=128` is lossless).
    (compaction after acceptance; a cross-PP score reduction; per-group slot
    mappings).
 
-7. **Compaction is transactional.** Once a request reaches the threshold its
-   compaction *must* complete this step — a request that has already dropped KV
-   cannot fall back to Full-KV (its old KV is gone and the block manager has
-   capped its allocation). The runner enters `compact_step` whenever compaction
-   was **armed** this step (not merely when some layer registered), so a step
-   that requires compaction but registers zero layers still hits the checks
-   instead of being silently skipped. Missing state, an incompletely registered
-   layer set, or an incomplete observation window on an already-dropped request
-   therefore **raise** rather than silently skip. Two last-line invariants back
+7. **Compaction is fail-closed and all-or-nothing (host side).** Once a request
+   reaches the threshold its compaction *must* complete this step — a request
+   that has already dropped KV cannot fall back to Full-KV (its old KV is gone
+   and the block manager has capped its allocation). The runner enters
+   `compact_step` whenever compaction was **armed** this step (not merely when
+   some layer registered), so a step that requires compaction but registers zero
+   layers still hits the checks instead of being silently skipped. Missing
+   state, an incompletely registered layer set, or an incomplete observation
+   window on an already-dropped request therefore **raise** rather than silently
+   skip. (This is a host-side control-flow guarantee, not a CUDA transaction:
+   the relocation gather→scatter and the metadata/count publication are enqueued
+   in program order on the **same stream**, so they execute in order, but no
+   event/`synchronize` waits for kernel completion — a *deferred* async CUDA
+   error surfaces on the next sync, by which point the worker is already
+   unrecoverable, so there is nothing to roll back.) Two last-line invariants back
    this up: the occupied slot mapping is checked for the reserved **null block**
    (id 0) before any KV is read/written, and the per-token scores are checked
    **finite** before the top-k (fp16 similarity underflow — the fp16 key norm is
@@ -524,11 +530,14 @@ the principled default). **Use `buffer ≥ 64`** (`buffer=128` is lossless).
    arming for any request whose `num_computed_tokens` is still catching up, on
    top of the `is_prefill_chunk` gate), and if it crosses a boundary before its
    reset window refills it is left Full-KV that step (safe: it has not dropped
-   anything). The observation window advances **only on a genuine single-token
-   decode step**: a chunked-prefill or post-preemption recompute step writes its
-   chunk-tail query but does not advance the ring cursor/count, so a compaction
-   right after a resume is scored against real decode queries, never the
-   recompute tail. Under tensor parallelism a readiness handshake compares the
+   anything). The observation window advances **only on a genuine new-token
+   decode step**, detected by *phase* — `num_computed_tokens >= num_tokens`, i.e.
+   every existing token is already cached and this step generates a new one —
+   **not** by `num_scheduled == 1` (the scheduler can split a chunked prefill or
+   a post-preemption recompute down to exactly one token). A non-decode step
+   still writes its chunk-tail query into the current ring cell but does not
+   advance the cursor/count, so a compaction right after a resume is scored
+   against real decode queries, never the recompute tail. Under tensor parallelism a readiness handshake compares the
    **minimum and maximum** of a collision-resistant ordered-plan fingerprint
    across the TP group (not a sum, which an average collision could mask); the
    fingerprint folds each row's **request-id digest** (a stable cross-process

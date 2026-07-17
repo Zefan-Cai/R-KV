@@ -34,7 +34,7 @@ same *patch-not-fork* layout as the [SGLang port](../SGLang/README.md).
 ## Why a patch, not a fork?
 
 R-KV touches vLLM in a **small, purely additive** way: one self-contained
-package (`rkv/`) plus ~830 lines of wiring across **13** existing files. Instead
+package (`rkv/`) plus ~839 lines of wiring across **13** existing files. Instead
 of vendoring the entire vLLM tree, this directory ships:
 
 - `rkv/` — the R-KV code (browsable, the source of truth);

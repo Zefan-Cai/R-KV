@@ -443,7 +443,7 @@ class RKVCompressor:
                 self._free.append(s)
             self._qcount.pop(rid, None)
 
-    def plan_qwrite(self, req_ids, device, num_scheduled=None) -> tuple | None:
+    def plan_qwrite(self, req_ids, device, genuine_decode=None) -> tuple | None:
         """Compute this step's shared ring write-plan (runner-owned, once/step).
 
         Called ONCE per decode step by the model runner on its compactor, then
@@ -453,10 +453,13 @@ class RKVCompressor:
         differs), so doing this here removes the 28x-per-step Python slot loop
         and host->device index copy that :meth:`record_query` used to repeat.
 
-        ``num_scheduled`` is the per-request scheduled-token count this step;
-        only a genuine single-token decode step advances the observation window
-        (see the loop below). It is ``None`` only in the CPU unit tests, which
-        drive the ring one decode at a time.
+        ``genuine_decode`` is a per-request bool mask marking a genuine new-token
+        decode step; only those advance the observation window (see the loop).
+        The runner derives it from the *phase* (``num_computed_tokens >=
+        num_tokens``), not from ``num_scheduled == 1`` -- the scheduler can split
+        a chunked prefill or a post-preemption recompute down to exactly one
+        token, which is not a decode. It is ``None`` only in the CPU unit tests,
+        which drive the ring one decode at a time.
 
         Returns ``(flat_index, slots, max_slots)`` -- or ``None`` when R-KV is
         disabled:
@@ -495,16 +498,17 @@ class RKVCompressor:
             cnt = self._qcount[rid]
             slots[i] = s
             curs[i] = cnt % window
-            # Only a genuine single-token decode step advances the observation
-            # window. Multi-token steps -- the initial chunked prefill and, after
-            # a preemption, the recompute of the prompt + prior output -- still
-            # write their chunk-tail query into the current ring cell (harmless:
-            # the next genuine decode overwrites it), but must NOT advance the
-            # cursor/count, so the window stays "the last window_size real decode
-            # queries" and a post-preemption compaction is never scored against
-            # stale recompute queries. (num_scheduled is None only in the CPU
-            # unit tests, which drive the ring one decode at a time.)
-            if num_scheduled is None or num_scheduled[i] == 1:
+            # Only a genuine new-token decode step advances the observation
+            # window. A chunked-prefill or post-preemption recompute step -- even
+            # one the scheduler split down to exactly one token -- still writes
+            # its chunk-tail query into the current ring cell (harmless: the next
+            # real decode overwrites it) but must NOT advance the cursor/count,
+            # so the window stays "the last window_size real decode queries" and
+            # a compaction right after a resume is never scored against recompute
+            # queries. The runner marks genuine decode by phase, not by
+            # num_scheduled == 1. (genuine_decode is None only in the CPU unit
+            # tests, which drive one decode at a time.)
+            if genuine_decode is None or genuine_decode[i]:
                 self._qcount[rid] = cnt + 1
 
         # Ring width grows monotonically (doubling) with the concurrency peak,
@@ -551,7 +555,14 @@ class RKVCompressor:
 
         # Each request's most recent query token (vectorized, no host sync).
         window = self.config.window_size
-        last_idx = (query_start_loc[1 : num_reqs + 1] - 1).long()
+        # vLLM schedules every batched request with >= 1 token this step (the
+        # runner builds num_scheduled from an unconditional per-request lookup),
+        # so query_start_loc is strictly increasing and each last index is >= 0.
+        # clamp_min(0) is a cheap boundary guard should that upstream invariant
+        # ever change: a 0-token row would otherwise make last_idx -1 and
+        # index_select raise. Such a row never advances the window (the runner's
+        # genuine_decode mask is False for it), so the guarded read is harmless.
+        last_idx = (query_start_loc[1 : num_reqs + 1] - 1).clamp_min(0).long()
         last_q = query.index_select(0, last_idx)
 
         # Grow this layer's ring to the shared width, then scatter every
