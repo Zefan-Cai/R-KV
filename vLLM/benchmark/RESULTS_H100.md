@@ -17,7 +17,7 @@ after the async-scheduling fix (see
   (`SGLang/benchmark/data/gsm8k_fewshot.jsonl`), prompt ≈ 700 tokens (> every
   budget), **200 questions**, greedy (`temperature=0`), `max_tokens=512`,
   stop `"\nProblem"`. Decode-only R-KV (`window=8`), same extraction as the
-  `对拍` harness.
+  `difference check` harness.
 - **Hardware / execution:** 8× H100 80GB. The 13 configs were run **one per GPU,
   8 in parallel** (two waves), each an offline `LLM.generate` over all 200
   prompts (natural high-concurrency batching). Total wall for the whole sweep:
