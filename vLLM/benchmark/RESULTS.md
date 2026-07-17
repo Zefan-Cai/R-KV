@@ -99,7 +99,10 @@ accuracy with ~180 compactions per 200 requests.
 ## Reproduce
 
 ```bash
-cd vLLM/benchmark   # uses the .venv-rkv interpreter that has vllm installed
+# Prereq: build + install the patched vLLM once (see ../README.md):
+#   scripts/apply_rkv.sh && pip install -e vllm-src
+# then, in that Python env (set RKV_MODEL to a local path to skip the HF download):
+cd vLLM/benchmark
 
 # Full-KV production baseline:
 python eval.py --n 200 --label fullkv_production

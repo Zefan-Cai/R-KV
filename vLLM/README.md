@@ -34,7 +34,7 @@ same *patch-not-fork* layout as the [SGLang port](../SGLang/README.md).
 ## Why a patch, not a fork?
 
 R-KV touches vLLM in a **small, purely additive** way: one self-contained
-package (`rkv/`) plus ~839 lines of wiring across **13** existing files. Instead
+package (`rkv/`) plus ~849 lines of wiring across **13** existing files. Instead
 of vendoring the entire vLLM tree, this directory ships:
 
 - `rkv/` — the R-KV code (browsable, the source of truth);
@@ -52,7 +52,7 @@ vLLM/
 ├── rkv/                           # R-KV package (algo, integration)
 ├── patch/rkv-vllm-0.25.1.patch    # wiring diff (13 upstream files)
 ├── scripts/apply_rkv.sh           # clone pinned vLLM + drop in rkv/ + apply patch
-├── benchmark/                     # benchmarking notes
+├── benchmark/                     # GSM8K accuracy/throughput harness + H100 results
 ├── docs/                          # DESIGN, IMPLEMENTATION, OPTIMIZATIONS, REPRODUCE
 └── tests/                         # GPU-free CPU unit tests
 ```
@@ -110,14 +110,41 @@ R-KV works with **tensor parallelism** and **data parallelism** — add
 `EXTRA` to `launch_server.sh`). Under TP each rank holds only a shard of the KV
 heads, so R-KV all-reduces its per-token eviction scores across the TP group,
 guaranteeing every rank evicts the identical set (TP=2 few-shot GSM8K accuracy
-bit-matches single-GPU). DP replicas are independent, and DP+TP reduces within
+matches single-GPU within noise; see [`benchmark/RESULTS_tp.md`](benchmark/RESULTS_tp.md)).
+DP replicas are independent, and DP+TP reduces within
 each replica's TP sub-group. Pipeline parallelism is not yet supported.
 
 ## Tests
 
 ```bash
-python tests/test_rkv_algo.py     # GPU-free CPU parity tests for the algorithm
+# GPU-free CPU unit tests: algorithm bit-parity + integration/compaction logic.
+python -m unittest tests.test_rkv_algo tests.test_rkv_integration
 ```
+
+## Benchmark
+
+Accuracy + throughput on GSM8K (Qwen2.5-Math-7B-Instruct), regenerated on 8× H100:
+
+- [`benchmark/RESULTS.md`](benchmark/RESULTS.md) — `budget × buffer` sweep vs two
+  Full-KV baselines. `budget=512` is lossless, `budget=256` near-lossless at
+  `buffer ≥ 128`; every row reports its physical **compaction count**.
+- [`benchmark/RESULTS_tp.md`](benchmark/RESULTS_tp.md) — tensor-parallel scaling
+  (accuracy flat across TP=1/2/4; every rank evicts the identical set).
+- [`benchmark/RESULTS_dp.md`](benchmark/RESULTS_dp.md) — data-parallel scaling
+  (near-linear, **7.6× at DP=8**).
+
+```bash
+cd benchmark
+./prepare_data.sh                                    # verify the bundled dataset
+python eval.py --n 200 --label fullkv                 # Full-KV baseline
+VLLM_V1_R_KV_BUDGET=256 VLLM_V1_R_KV_BUFFER=128 \
+  python eval.py --n 200 --label rkv_b256_buf128      # R-KV
+```
+
+`eval.py` reports accuracy, offline throughput, **and the physical compaction
+count read back from every worker** — so it confirms compression is *active*
+(a broken build silently runs Full-KV at a nearly identical accuracy). Set
+`VLLM_V1_R_KV_TRACE=1` to log each `[RKV-COMPACT]` / `[RKV-SKIP]` event.
 
 ## Documentation
 

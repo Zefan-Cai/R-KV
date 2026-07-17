@@ -30,7 +30,7 @@ set -euo pipefail
 
 MODE="${1:-rkv}"
 BUDGET="${2:-256}"
-MODEL="${MODEL:-/data/model/Qwen2.5-Math-7B-Instruct}"
+MODEL="${MODEL:-Qwen/Qwen2.5-Math-7B-Instruct}"
 PORT="${PORT:-8000}"
 HOST="${HOST:-127.0.0.1}"
 BUFFER="${BUFFER:-128}"

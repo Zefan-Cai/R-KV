@@ -59,7 +59,10 @@ request stream. Companion to [`RESULTS.md`](./RESULTS.md) /
 ## Reproduce
 
 ```bash
-cd vLLM/benchmark   # uses the .venv-rkv interpreter that has vllm installed
+# Prereq: build + install the patched vLLM once (see ../README.md):
+#   scripts/apply_rkv.sh && pip install -e vllm-src
+# then, in that Python env (set RKV_MODEL to a local path to skip the HF download):
+cd vLLM/benchmark
 
 # 8 independent R-KV replicas (budget 256, buffer 128), 125 questions each,
 # one GPU per replica (offset shards the stream):

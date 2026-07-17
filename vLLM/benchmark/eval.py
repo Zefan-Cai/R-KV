@@ -41,8 +41,10 @@ from vllm import LLM, SamplingParams
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _DEFAULT_DATA = os.path.join(_HERE, "data", "gsm8k_fewshot.jsonl")
+# Portable default (resolved from the HF hub / local cache). Point RKV_MODEL at a
+# local checkout to avoid a download, e.g. RKV_MODEL=/path/to/Qwen2.5-Math-7B-Instruct.
 _DEFAULT_MODEL = os.environ.get(
-    "RKV_MODEL", "/data/model/Qwen2.5-Math-7B-Instruct"
+    "RKV_MODEL", "Qwen/Qwen2.5-Math-7B-Instruct"
 )
 
 

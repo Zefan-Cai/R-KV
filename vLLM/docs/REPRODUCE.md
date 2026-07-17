@@ -44,7 +44,7 @@ The source of truth for the *algorithm* is `rkv/`; the source of truth for the
 
 ```bash
 cd vllm-src
-# ... make wiring edits to the 9 tracked files ...
+# ... make wiring edits to the 13 tracked files ...
 git diff > ../patch/rkv-vllm-0.25.1.patch
 ```
 
@@ -52,7 +52,7 @@ Do **not** hand-edit the patch file. Do **not** rely on edits inside `vllm-src/`
 persisting — they are invisible to this repo's git and are wiped by
 `apply_rkv.sh --force`. Always fold wiring changes back into the patch.
 
-## The 10 wired files
+## The 13 wired files
 
 ```
 vllm/envs.py
@@ -65,4 +65,7 @@ vllm/v1/worker/gpu_input_batch.py
 vllm/v1/worker/gpu_model_runner.py
 vllm/v1/attention/backend.py
 vllm/v1/attention/backends/flash_attn.py
+vllm/v1/core/kv_cache_manager.py
+vllm/v1/core/kv_cache_coordinator.py
+vllm/v1/core/single_type_kv_cache_manager.py
 ```
