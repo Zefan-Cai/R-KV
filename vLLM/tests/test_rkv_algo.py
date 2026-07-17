@@ -29,6 +29,8 @@ _spec = importlib.util.spec_from_file_location("rkv_algo", _ALGO_PATH)
 _algo = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_algo)
 R1KV = _algo.R1KV
+cal_similarity = _algo.cal_similarity
+compute_attention_scores = _algo.compute_attention_scores
 
 
 # --------------------------------------------------------------------------- #
@@ -175,6 +177,37 @@ class TestR1KVParity(unittest.TestCase):
         out_k, _ = R1KV(budget=budget, window_size=window).update_kv(k, q, v)
         # The trailing observation window is always retained verbatim.
         self.assertTrue(torch.equal(out_k[:, :, -window:, :], k[:, :, -window:, :]))
+
+    def test_gqa_requires_divisible_heads(self):
+        # q_heads not a multiple of kv_heads must raise, not silently mis-group.
+        q = torch.randn(1, 6, 4, 16)   # 6 q heads
+        k = torch.randn(1, 4, 8, 16)   # 4 kv heads, 6 % 4 != 0
+        with self.assertRaises(ValueError):
+            compute_attention_scores(q, k)
+
+    def test_retain_first_finite_and_directional(self):
+        # The fixed "first"/"first_percent" retain uses a seq_len sentinel so it
+        # picks the smallest MATCHED index (the old bug collapsed to position 0),
+        # so it must differ from "last" on a mutually-similar key set.
+        torch.manual_seed(0)
+        seq = 6
+        base = torch.randn(1, 1, 1, 16)
+        key = base.expand(1, 1, seq, 16) + 0.02 * torch.randn(1, 1, seq, 16)
+        last = cal_similarity(key.clone(), threshold=0.0, retain_direction="last")
+        for direction in ("first", "first_percent"):
+            out = cal_similarity(
+                key.clone(), threshold=0.0, retain_direction=direction
+            )
+            self.assertTrue(torch.isfinite(out).all())
+            self.assertFalse(torch.allclose(out, last))
+
+    def test_retain_first_no_match_rows_do_not_crash(self):
+        # Orthogonal keys + high threshold -> no matches -> every row holds the
+        # out-of-range sentinel; the clamp must keep the scatter in bounds.
+        key = torch.randn(1, 1, 8, 16)
+        out = cal_similarity(key.clone(), threshold=0.999, retain_direction="first")
+        self.assertTrue(torch.isfinite(out).all())
+        self.assertEqual(tuple(out.shape), (1, 1, 8))
 
 
 if __name__ == "__main__":

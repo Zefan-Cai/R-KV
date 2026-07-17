@@ -332,6 +332,33 @@ class TestCompactionSafety(unittest.TestCase):
                 [0], expected_layer_count=1, prev_dropped=[3],  # already dropped
             )
 
+    def test_nonfinite_scores_raise(self):
+        """Non-finite (NaN/Inf) scores must raise before the top-k, not evict on
+        a corrupt ranking."""
+        _, comp, occupied, k, v, score = self._ref_setup()
+        bad = score.clone()
+        bad[0] = float("nan")
+        with self.assertRaises(RuntimeError):
+            comp.compact_step(
+                1, torch.tensor([10]), occupied, (True,), [bad], [(k, v, {})],
+                [0], expected_layer_count=1,
+            )
+
+    def test_query_ring_reclaims_finished_slots_each_step(self):
+        """A finished request's ring column is reclaimed the step it leaves (set
+        difference), and a new request reuses it without growing the ring."""
+        comp = RKVCompressor(RKVConfig(budget=64, buffer_size=64, window_size=8))
+        dev = torch.device("cpu")
+        comp.plan_qwrite(["a", "b", "c"], dev)
+        self.assertEqual(set(comp._slot), {"a", "b", "c"})
+        comp.plan_qwrite(["a"], dev)  # b, c finished
+        self.assertEqual(set(comp._slot), {"a"})
+        self.assertEqual(len(comp._free), 2)
+        width = comp._ring_width
+        comp.plan_qwrite(["a", "d"], dev)  # d reuses a freed column
+        self.assertEqual(set(comp._slot), {"a", "d"})
+        self.assertEqual(comp._ring_width, width)  # no growth
+
     def test_tp_group_mismatch_fails_closed(self):
         """With an expected TP world size > 1, a missing/mismatched group must
         raise rather than degrade to a per-rank-local decision."""

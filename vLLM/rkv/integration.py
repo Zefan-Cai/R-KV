@@ -377,12 +377,14 @@ class RKVCompressor:
             return None
         num_reqs = len(req_ids)
         window = self.config.window_size
-        # Free the ring columns of finished requests for reuse.
+        # Release the ring columns of any finished request every step (set
+        # difference), so a slot is reclaimed the step its request leaves rather
+        # than lingering until the tracked-slot count happens to exceed the batch
+        # -- otherwise a stale id could hold a column across request churn.
         present = set(req_ids)
-        if len(self._slot) > num_reqs:
-            for rid in [r for r in self._slot if r not in present]:
-                self._free.append(self._slot.pop(rid))
-                self._qcount.pop(rid, None)
+        for rid in [r for r in self._slot if r not in present]:
+            self._free.append(self._slot.pop(rid))
+            self._qcount.pop(rid, None)
 
         # Assign each request a persistent ring column + its current cursor
         # (``step_count % window``); advance the step count once per step.
@@ -822,6 +824,15 @@ class RKVCompressor:
             # identical. No-op when TP is off.
             if tp is not None:
                 grp_scores = tp.all_reduce(grp_scores.contiguous())
+            # Fail closed on a corrupt ranking: fp16 similarity normalization can
+            # underflow to a zero key norm (NaN/Inf), which would make top-k --
+            # and thus the kept set -- garbage and, under TP, spread NaN across
+            # ranks. Check once per group before the top-k.
+            if not torch.isfinite(grp_scores).all():
+                raise RuntimeError(
+                    "R-KV computed non-finite (NaN/Inf) scores for requests "
+                    f"{idxs}; refusing to evict on a corrupt ranking."
+                )
             g = len(idxs)
             gdev = grp_scores.device
 

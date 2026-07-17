@@ -454,6 +454,11 @@ the principled default). **Use `buffer ≥ 64`** (`buffer=128` is lossless).
      (hybrid / Mamba / sliding-window models);
    - cross-layer KV cache **sharing** (two layers aliasing one storage would be
      relocated twice and corrupt the kept set);
+   - dual-batch overlap / microbatching (`enable_dbo` / `ubatch_size > 1`):
+     `split_attn_metadata` drops R-KV's metadata fields, so compaction would be
+     silently skipped for a microbatched request;
+   - KV connectors / disaggregated prefill (`kv_transfer_config`): the connector
+     transfers the original logical KV layout with no notion of dropped tokens;
    - any non-FlashAttention cache layer.
 
    `RKVConfig` also validates its own knobs (`budget > window`, `buffer ≥
@@ -474,7 +479,11 @@ the principled default). **Use `buffer ≥ 64`** (`buffer=128` is lossless).
    capped allocation into freed/null blocks. Under tensor parallelism a
    readiness handshake makes divergent ranks fail together instead of
    deadlocking, and the score all-reduce fails closed if the TP group is
-   missing/mismatched.
+   missing/mismatched. Two last-line invariants back this up: the occupied slot
+   mapping is checked for the reserved **null block** (id 0) before any KV is
+   read/written (catches a physical length that ran past its allocation), and
+   the per-token scores are checked **finite** before the top-k (catches fp16
+   similarity underflow before a NaN ranking or a NaN TP all-reduce).
 
 8. **Long-sequence scoring is memory-guarded, not yet tiled.** The redundancy
    matrix is `~kv_heads × seq_len²`; scoring tiles over **both** the layer and

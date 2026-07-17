@@ -1,5 +1,5 @@
 diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
-index e8796a3..157f438 100644
+index e8796a3..bfb1b80 100644
 --- a/vllm/config/vllm.py
 +++ b/vllm/config/vllm.py
 @@ -517,6 +517,11 @@ class VllmConfig:
@@ -14,7 +14,7 @@ index e8796a3..157f438 100644
          use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
          if use_v2_model_runner is not None:
              return use_v2_model_runner
-@@ -872,6 +877,127 @@ class VllmConfig:
+@@ -872,6 +877,146 @@ class VllmConfig:
          # To give each torch profile run a unique instance name.
          self.instance_id = f"{time.time_ns()}"
  
@@ -58,6 +58,25 @@ index e8796a3..157f438 100644
 +                    "uses physical KV seq_lens while DCP derives local seq "
 +                    "lengths from logical positions; the two are not yet "
 +                    "reconciled."
++                )
++            if (
++                self.parallel_config is not None
++                and self.parallel_config.use_ubatching
++            ):
++                raise ValueError(
++                    "R-KV does not support dual-batch overlap / microbatching "
++                    "(enable_dbo / ubatch_size > 1): split_attn_metadata builds "
++                    "a fresh CommonAttentionMetadata that drops R-KV's fields, "
++                    "so the in-forward hooks never fire and compaction is "
++                    "silently skipped for a microbatched request."
++                )
++            if self.kv_transfer_config is not None:
++                raise ValueError(
++                    "R-KV does not support KV connectors / disaggregated "
++                    "prefill: R-KV relocates KV in place right after the "
++                    "forward, while the connector saves/loads the original "
++                    "logical KV layout and has no notion of R-KV's dropped "
++                    "tokens, so the transferred cache would be inconsistent."
 +                )
 +            if self.cache_config is not None and self.cache_config.cache_dtype not in (
 +                "auto",
@@ -606,7 +625,7 @@ index 28d1a04..b0310b6 100644
  
              self.request_lora_mapping[empty_index] = self.request_lora_mapping[
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index e9b23f1..fe298d7 100644
+index e9b23f1..a038bf5 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
 @@ -769,6 +769,49 @@ class GPUModelRunner(
@@ -690,7 +709,7 @@ index e9b23f1..fe298d7 100644
              if new_block_ids is not None:
                  self.input_batch.block_table.append_row(new_block_ids, req_index)
  
-@@ -1911,6 +1962,111 @@ class GPUModelRunner(
+@@ -1911,6 +1962,128 @@ class GPUModelRunner(
  
          return encoder_seq_lens, encoder_seq_lens_cpu
  
@@ -794,6 +813,23 @@ index e9b23f1..fe298d7 100644
 +        max_blocks = block_table_np.shape[1]
 +        occ_block_idx = occ_req * max_blocks + occ_positions // block_size
 +        block_numbers = block_table_np.reshape(-1)[occ_block_idx].astype(np.int64)
++        # Last-line invariant: every occupied (physical live) slot must map to a
++        # real block. Block 0 is vLLM's reserved null/placeholder block, never
++        # handed out for real KV; if it shows up inside a request's live range
++        # the physical length has run past its (block-freeing-capped) allocation
++        # into a freed entry, so the next R-KV read/scatter would read stale KV
++        # or write a survivor into the shared null block and silently poison
++        # every other request. Fail fast instead.
++        if np.any(block_numbers == NULL_BLOCK_ID):
++            bad = int(np.argmax(block_numbers == NULL_BLOCK_ID))
++            r = int(occ_req[bad])
++            raise RuntimeError(
++                "R-KV occupied range references NULL_BLOCK_ID (freed/unallocated "
++                f"block): batch row {r}, live_len={int(num_live[r])}, "
++                f"dropped={int(dropped_np[r])}, budget={self.rkv_compactor.config.budget}, "
++                f"buffer={self.rkv_compactor.config.buffer_size}, "
++                f"first_null_pos={int(occ_positions[bad])}."
++            )
 +        occ_slots = block_numbers * block_size + occ_positions % block_size
 +        self._rkv_occupied_slot_mapping = torch.from_numpy(occ_slots).to(
 +            self.device, non_blocking=True
@@ -802,7 +838,7 @@ index e9b23f1..fe298d7 100644
      def _prepare_inputs(
          self,
          scheduler_output: "SchedulerOutput",
-@@ -2143,16 +2299,29 @@ class GPUModelRunner(
+@@ -2143,16 +2316,29 @@ class GPUModelRunner(
              self.num_computed_tokens[req_indices_gpu].to(torch.int64)
              + self.query_pos.gpu[:total_num_scheduled_tokens]
          )
@@ -841,7 +877,7 @@ index e9b23f1..fe298d7 100644
  
          # Copy the tensors to the GPU.
          self._prepare_input_ids(
-@@ -2395,6 +2564,29 @@ class GPUModelRunner(
+@@ -2395,6 +2581,29 @@ class GPUModelRunner(
              rswa_prefix_lens=rswa_prefix_lens,
          )
  
@@ -871,7 +907,7 @@ index e9b23f1..fe298d7 100644
          if self.dcp_world_size > 1:
              self.dcp_local_seq_lens.cpu[:num_reqs] = get_dcp_local_seq_lens(
                  self.optimistic_seq_lens_cpu[:num_reqs],
-@@ -4358,6 +4550,35 @@ class GPUModelRunner(
+@@ -4358,6 +4567,35 @@ class GPUModelRunner(
                  **model_kwargs,
              )
  
@@ -907,7 +943,7 @@ index e9b23f1..fe298d7 100644
          with record_function_or_nullcontext("gpu_model_runner: postprocess"):
              if self.use_aux_hidden_state_outputs:
                  # True when EAGLE 3 is used.
-@@ -4682,6 +4903,11 @@ class GPUModelRunner(
+@@ -4682,6 +4920,11 @@ class GPUModelRunner(
                  routed_experts=None,
              )
  
@@ -919,7 +955,7 @@ index e9b23f1..fe298d7 100644
          if not self.use_async_scheduling:
              if self.routed_experts_initialized:
                  # Sync path: D2H was issued in ``_bookkeeping_sync`` and
-@@ -7419,6 +7645,8 @@ class GPUModelRunner(
+@@ -7419,6 +7662,8 @@ class GPUModelRunner(
          self.may_add_encoder_only_layers_to_kv_cache_config()
          self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
          self.initialize_attn_backend(kv_cache_config, is_profiling=is_profiling)
@@ -928,7 +964,7 @@ index e9b23f1..fe298d7 100644
          initialize_mamba_ssu_backend(
              self.vllm_config.mamba_config, self.kv_cache_config
          )
-@@ -7461,6 +7689,71 @@ class GPUModelRunner(
+@@ -7461,6 +7706,71 @@ class GPUModelRunner(
                  kv_transfer_group.register_kv_caches(kv_caches)
              kv_transfer_group.set_host_xfer_buffer_ops(copy_kv_blocks)
  

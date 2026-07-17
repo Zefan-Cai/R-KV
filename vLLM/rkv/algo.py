@@ -49,6 +49,11 @@ def compute_attention_scores(query_states, key_states, pooling="max"):
     """
     batch_size, q_heads, q_len, head_dim = query_states.shape
     kv_heads = key_states.shape[1]
+    if q_heads % kv_heads != 0:
+        raise ValueError(
+            f"q_heads ({q_heads}) must be a multiple of kv_heads ({kv_heads}) "
+            "for grouped-query attention pooling."
+        )
     query_group_size = q_heads // kv_heads
 
     if query_group_size == 1:
@@ -96,20 +101,37 @@ def cal_similarity(
 
     similarity_mask = similarity_cos > threshold
     k = max(1, int(seq_len * retain_ratio))
-    indices = torch.where(
-        similarity_mask,
-        torch.arange(seq_len, device=similarity_mask.device).view(1, 1, 1, seq_len),
-        torch.zeros_like(similarity_mask, dtype=torch.long),
-    )
+    positions = torch.arange(
+        seq_len, device=similarity_mask.device
+    ).view(1, 1, 1, seq_len)
 
-    if retain_direction == "last":
-        similarity_retain = torch.max(indices, dim=-1)[0]
-    elif retain_direction == "first":
-        similarity_retain = torch.min(indices, dim=-1)[0]
-    elif retain_direction == "last_percent":
-        similarity_retain = torch.topk(indices, k=k, dim=-1)[0][:, :, 0]
-    elif retain_direction == "first_percent":
-        similarity_retain = torch.topk(indices, k=k, dim=-1, largest=False)[0][:, :, -1]
+    if retain_direction in ("last", "last_percent"):
+        # Non-matching entries -> 0 so the largest-index reductions ignore them.
+        indices = torch.where(
+            similarity_mask,
+            positions,
+            torch.zeros_like(similarity_mask, dtype=torch.long),
+        )
+        if retain_direction == "last":
+            similarity_retain = torch.max(indices, dim=-1)[0]
+        else:
+            similarity_retain = torch.topk(indices, k=k, dim=-1)[0][:, :, 0]
+    elif retain_direction in ("first", "first_percent"):
+        # Non-matching entries -> ``seq_len`` sentinel so the smallest-index
+        # reductions skip them. (Using 0 like the reference makes every row pick
+        # position 0, because masking the diagonal leaves a 0 in almost every
+        # row -- the bug this fixes.)
+        sentinel = torch.full_like(similarity_mask, seq_len, dtype=torch.long)
+        indices = torch.where(similarity_mask, positions, sentinel)
+        if retain_direction == "first":
+            similarity_retain = torch.min(indices, dim=-1)[0]
+        else:
+            similarity_retain = torch.topk(
+                indices, k=k, dim=-1, largest=False
+            )[0][:, :, -1]
+        # Rows with no match hold the out-of-range sentinel; clamp so the
+        # scatter below targets a valid (harmless) slot, not out of bounds.
+        similarity_retain = similarity_retain.clamp(max=seq_len - 1)
     else:
         raise ValueError("retain_direction not supported")
 
