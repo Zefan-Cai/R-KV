@@ -126,6 +126,18 @@ def main():
         default=0,
         help="skip the first OFFSET questions (used to shard across DP replicas)",
     )
+    ap.add_argument(
+        "--ignore-eos",
+        action="store_true",
+        help="generate exactly --max-tokens per request (stress test: fixed-length "
+        "sequences to load the KV cache regardless of the model's natural stop)",
+    )
+    ap.add_argument(
+        "--stats",
+        action="store_true",
+        help="enable vLLM engine stat logging (so peak 'Running: N reqs' -- the "
+        "achieved concurrency -- is printed)",
+    )
     ap.add_argument("--out", default="")
     args = ap.parse_args()
 
@@ -151,14 +163,21 @@ def main():
         enforce_eager=args.eager,
         gpu_memory_utilization=args.mem_frac,
         max_model_len=args.max_model_len,
-        disable_log_stats=True,
+        disable_log_stats=not args.stats,
         seed=0,
         block_size=16,
         **kw,
     )
     tok = llm.get_tokenizer()
     in_toks = sum(len(tok(p).input_ids) for p in prompts)
-    sp = SamplingParams(temperature=0.0, max_tokens=args.max_tokens, stop=["\nProblem"])
+    sp = SamplingParams(
+        temperature=0.0,
+        max_tokens=args.max_tokens,
+        # ignore_eos forces fixed-length generation (stress test); otherwise stop
+        # at the next few-shot problem boundary for accurate GSM8K judging.
+        ignore_eos=args.ignore_eos,
+        stop=None if args.ignore_eos else ["\nProblem"],
+    )
 
     t0 = time.time()
     outs = llm.generate(prompts, sp)
