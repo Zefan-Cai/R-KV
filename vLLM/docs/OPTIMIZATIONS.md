@@ -54,11 +54,11 @@ budgets: too small a buffer compacts too aggressively and too often. Larger
 buffers are also **faster** (fewer compactions). Recommended: `buffer ≈ budget`.
 
 > This table predates the two-phase cross-layer refactor and uses a different
-> (higher-scoring) harness than the 对拍 below. The apples-to-apples,
+> (higher-scoring) harness than the difference check below. The apples-to-apples,
 > post-refactor numbers on SGLang's own few-shot harness are in the
 > **Differential test** table.
 
-### Differential test (对拍) vs SGLang — same harness, model, config
+### Differential test (difference check) vs SGLang — same harness, model, config
 
 Using SGLang's own few-shot GSM8K harness (`data/gsm8k_fewshot.jsonl`, prompt
 ≈ 700 tokens > budget), Qwen2.5-Math-7B-Instruct, 200 questions, greedy,
@@ -310,7 +310,7 @@ on Full-KV. See Known limitations #2.
    the decode phase (`num_computed_tokens > num_prompt_tokens`).
 6. **Prefix caching corrupted R-KV** (shared prefix blocks mutated in place →
    cross-request KV bleed → ~1.5% accuracy on shared-prefix workloads). Found
-   via the SGLang 对拍. Fixed: force-disable prefix caching when R-KV is on.
+   via the SGLang difference check. Fixed: force-disable prefix caching when R-KV is on.
 7. **Per-layer / per-head eviction diverged from the R-KV reference** — each
    layer independently ran top-k *inside its own forward*, compounding scoring
    noise across all layers. Fixed: **two-phase cross-layer compaction** —
@@ -452,22 +452,39 @@ the principled default). **Use `buffer ≥ 64`** (`buffer=128` is lossless).
    - quantized / FP8 KV cache (scoring runs in the KV storage dtype);
    - more than one KV cache group, or a non-`FullAttentionSpec` group
      (hybrid / Mamba / sliding-window models);
+   - cross-layer KV cache **sharing** (two layers aliasing one storage would be
+     relocated twice and corrupt the kept set);
    - any non-FlashAttention cache layer.
 
    `RKVConfig` also validates its own knobs (`budget > window`, `buffer ≥
-   window`, positive odd `kernel_size`, parameter ranges) and raises on bad
-   values. **Supported:** tensor & data parallelism, PIECEWISE cudagraph,
-   opt-in async scheduling (`VLLM_V1_R_KV_ASYNC`); prefix caching is
-   auto-disabled. Speculative decoding, PP/DCP and hybrid models stay
-   **roadmap** items (compaction after acceptance; a cross-PP score reduction;
-   per-group slot mappings).
+   window`, positive odd `kernel_size`, positive `SCORE_CHUNK_MB`, parameter
+   ranges) and raises on bad values; malformed env vars raise (naming the
+   variable) instead of silently reverting to a default. **Supported:** tensor
+   & data parallelism, PIECEWISE cudagraph, opt-in async scheduling
+   (`VLLM_V1_R_KV_ASYNC`); prefix caching is auto-disabled. Speculative
+   decoding, PP/DCP and hybrid models stay **roadmap** items (compaction after
+   acceptance; a cross-PP score reduction; per-group slot mappings).
 
-7. **Batched-scoring memory is not a hard cap.** `compact_step` batches
-   same-length requests into one cross-layer GEMM, chunked over *layers* by
-   `VLLM_V1_R_KV_SCORE_CHUNK_MB` (default 512 MB) but **not** over requests, so
-   a very large simultaneous compaction (`num_requests × kv_heads × seq_len²`)
-   can still exceed it on small-VRAM GPUs. Validated at batch 256 on H100.
-   **Roadmap** — chunk the request dimension too.
+7. **Compaction is transactional.** Once a request reaches the threshold its
+   compaction *must* complete this step — a request that has already dropped KV
+   cannot fall back to Full-KV (its old KV is gone and the block manager has
+   capped its allocation). Missing state, an incompletely registered layer set,
+   or a missing observation window therefore **raise** (fatal to the worker)
+   rather than silently skipping and letting the physical length drift past the
+   capped allocation into freed/null blocks. Under tensor parallelism a
+   readiness handshake makes divergent ranks fail together instead of
+   deadlocking, and the score all-reduce fails closed if the TP group is
+   missing/mismatched.
+
+8. **Long-sequence scoring is memory-guarded, not yet tiled.** The redundancy
+   matrix is `~kv_heads × seq_len²`; scoring tiles over **both** the layer and
+   request dimensions to keep each batch under `VLLM_V1_R_KV_SCORE_CHUNK_MB`
+   (default 512 MB). A single request whose *first* compaction still exceeds
+   the cap (a very long prompt) is left Full-KV (`num_dropped` stays 0, so it is
+   never capped — safe) rather than risking an OOM; an already-compacted
+   request that no longer fits raises. This trades R-KV's benefit on very long
+   prompts for safety until sequence-dimension **tiling** (blockwise reduction
+   without materializing the full `seq_len²` matrix) lands. **Roadmap.**
 
 ## Roadmap
 

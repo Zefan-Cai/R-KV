@@ -226,6 +226,7 @@ class TestConfigValidation(unittest.TestCase):
             dict(budget=64, buffer_size=64, mix_lambda=1.5),  # out of [0,1]
             dict(budget=64, buffer_size=64, retain_ratio=0.0),  # out of (0,1]
             dict(budget=64, buffer_size=64, score_mode="bogus"),
+            dict(budget=64, buffer_size=64, score_chunk_bytes=0),  # non-positive cap
         ]
         for kwargs in bad:
             with self.assertRaises(ValueError, msg=str(kwargs)):
@@ -234,6 +235,122 @@ class TestConfigValidation(unittest.TestCase):
     def test_valid_enabled_config_ok(self):
         cfg = RKVConfig(budget=256, buffer_size=64, window_size=8, kernel_size=7)
         self.assertTrue(cfg.enabled)
+
+
+class TestCompactionSafety(unittest.TestCase):
+    """Transactional / fail-closed guarantees of compact_step."""
+
+    def _ref_setup(self, num_blocks=8, kv_heads=1, head_dim=2, block_size=4):
+        cfg = RKVConfig(budget=6, buffer_size=2, window_size=2, score_mode="reference")
+        comp = RKVCompressor(cfg)
+        occupied = torch.arange(10, dtype=torch.long)
+        k = make_paged_cache(num_blocks, block_size, kv_heads, head_dim)
+        v = make_paged_cache(num_blocks, block_size, kv_heads, head_dim, sign=-1.0)
+        score = torch.tensor([10.0, 1, 9, 1, 8, 1, 7, 1])  # kept past = 0,2,4,6
+        return cfg, comp, occupied, k, v, score
+
+    def test_partial_layer_registration_raises(self):
+        """Expecting N layers but seeing N-1 must raise; dropped stays 0."""
+        _, comp, occupied, k, v, score = self._ref_setup()
+        nd = [0]
+        with self.assertRaises(RuntimeError):
+            comp.compact_step(
+                1, torch.tensor([10]), occupied, (True,), [score],
+                [(k, v, {})], nd, expected_layer_count=2,  # only 1 registered
+            )
+        self.assertEqual(nd[0], 0)  # not committed
+
+    def test_missing_state_when_required_raises(self):
+        """A required compaction with no occupied mapping / layer caches raises
+        rather than silently skipping (the request may already be capped)."""
+        _, comp, occupied, k, v, score = self._ref_setup()
+        with self.assertRaises(RuntimeError):
+            comp.compact_step(
+                1, torch.tensor([10]), None, (True,), [score], [(k, v, {})],
+                [0], expected_layer_count=1,
+            )
+        with self.assertRaises(RuntimeError):
+            comp.compact_step(
+                1, torch.tensor([10]), occupied, (True,), [score], [],
+                [0], expected_layer_count=0,
+            )
+
+    def test_missing_window_batched_required_raises(self):
+        """Batched mode: an armed required request whose observation window was
+        never recorded must raise (not silently skip)."""
+        cfg = RKVConfig(budget=4, buffer_size=2, window_size=2, kernel_size=1,
+                        score_mode="batched")
+        comp = RKVCompressor(cfg)
+        occupied = torch.tensor([12, 13, 14, 15, 4, 5], dtype=torch.long)
+        k = make_paged_cache(4, 4, 2, 4)
+        v = make_paged_cache(4, 4, 2, 4, sign=-1.0)
+        nd = [0]
+        with self.assertRaises(RuntimeError):
+            comp.compact_step(
+                1, torch.tensor([6]), occupied, (True,), [None],
+                [(k, v, {})], nd, expected_layer_count=1,  # empty window dict
+            )
+        self.assertEqual(nd[0], 0)
+
+    def test_shared_storage_relocated_once(self):
+        """The same KV storage registered as two layers is relocated once, not
+        twice (a second in-place gather would read already-moved data)."""
+        _, comp, occupied, k, v, score = self._ref_setup()
+        nd = [0]
+        comp.compact_step(
+            1, torch.tensor([10]), occupied, (True,), [score],
+            [(k, v, {}), (k, v, {})], nd, expected_layer_count=2,  # shared tensors
+        )
+        # kept=[0,2,4,6,8,9] -> src=[0,2,4,6,8,9], dst=[0,1,2,3,4,5].
+        # Relocated ONCE: k[1]==2, k[2]==4. Relocated twice it would be 4, 8.
+        self.assertEqual(slot_val(k, 1), 2.0)
+        self.assertEqual(slot_val(k, 2), 4.0)
+        self.assertEqual(nd[0], 4)
+
+    def test_memory_guard_skips_first_but_raises_after_drop(self):
+        """A first-compaction request over the score-memory cap is left Full-KV
+        (dropped stays 0, no relocation); an already-compacted one raises."""
+        cfg = RKVConfig(budget=6, buffer_size=2, window_size=2,
+                        score_mode="reference", score_chunk_bytes=1)  # 1-byte cap
+        comp = RKVCompressor(cfg)
+        occupied = torch.arange(10, dtype=torch.long)
+        k = make_paged_cache(8, 4, 1, 2)
+        v = make_paged_cache(8, 4, 1, 2, sign=-1.0)
+        score = torch.tensor([10.0, 1, 9, 1, 8, 1, 7, 1])
+
+        nd = [0]
+        comp.compact_step(
+            1, torch.tensor([10]), occupied, (True,), [score], [(k, v, {})],
+            nd, expected_layer_count=1, prev_dropped=[0],  # never compacted
+        )
+        self.assertEqual(nd[0], 0)          # skipped -> Full-KV
+        self.assertEqual(slot_val(k, 1), 1.0)  # untouched (no relocation)
+
+        with self.assertRaises(RuntimeError):
+            comp.compact_step(
+                1, torch.tensor([10]), occupied, (True,), [score], [(k, v, {})],
+                [0], expected_layer_count=1, prev_dropped=[3],  # already dropped
+            )
+
+    def test_tp_group_mismatch_fails_closed(self):
+        """With an expected TP world size > 1, a missing/mismatched group must
+        raise rather than degrade to a per-rank-local decision."""
+        cfg = RKVConfig(budget=6, buffer_size=2, window_size=2, score_mode="reference")
+        comp = RKVCompressor(cfg)
+        comp.set_parallel_context(2)  # expect a 2-way TP group
+
+        fake_ps = types.ModuleType("vllm.distributed.parallel_state")
+        fake_ps.get_tp_group = lambda: types.SimpleNamespace(world_size=1)
+        fake_dist = types.ModuleType("vllm.distributed")
+        fake_dist.__path__ = []
+        sys.modules["vllm.distributed"] = fake_dist
+        sys.modules["vllm.distributed.parallel_state"] = fake_ps
+        try:
+            with self.assertRaises(RuntimeError):
+                comp._tp_group()
+        finally:
+            del sys.modules["vllm.distributed.parallel_state"]
+            del sys.modules["vllm.distributed"]
 
 
 if __name__ == "__main__":

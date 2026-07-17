@@ -606,10 +606,10 @@ index 28d1a04..b0310b6 100644
  
              self.request_lora_mapping[empty_index] = self.request_lora_mapping[
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index e9b23f1..8cdddc0 100644
+index e9b23f1..fe298d7 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
-@@ -769,6 +769,45 @@ class GPUModelRunner(
+@@ -769,6 +769,49 @@ class GPUModelRunner(
              self.max_num_reqs, dtype=torch.int32
          )
  
@@ -648,6 +648,10 @@ index e9b23f1..8cdddc0 100644
 +            # eviction runs after the forward via ``rkv_compactor.compact_step``.
 +            self._rkv_score_acc: list | None = None
 +            self._rkv_layer_caches: list | None = None
++            # Number of FlashAttention layers expected to register per compaction
++            # step (set in ``_rkv_validate_kv_cache`` once the attention backends
++            # are built); compact_step fails if a partial set registers.
++            self._rkv_expected_layers: int | None = None
 +            from vllm.rkv.integration import RKVCompressor
 +
 +            self.rkv_compactor = RKVCompressor()
@@ -655,7 +659,7 @@ index e9b23f1..8cdddc0 100644
          self.encoder_seq_lens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
          if self.dcp_world_size > 1:
              self.dcp_local_seq_lens = self._make_buffer(
-@@ -1312,6 +1351,8 @@ class GPUModelRunner(
+@@ -1312,6 +1355,8 @@ class GPUModelRunner(
              new_block_ids = req_data.new_block_ids[i]
              resumed_from_preemption = req_id in req_data.resumed_req_ids
              num_output_tokens = req_data.num_output_tokens[i]
@@ -664,7 +668,7 @@ index e9b23f1..8cdddc0 100644
              req_index = self.input_batch.req_id_to_index.get(req_id)
  
              if req_state.prev_num_draft_len and self.use_async_scheduling:
-@@ -1358,7 +1399,7 @@ class GPUModelRunner(
+@@ -1358,7 +1403,7 @@ class GPUModelRunner(
  
              # Update the cached states.
              req_state.num_computed_tokens = num_computed_tokens
@@ -673,7 +677,7 @@ index e9b23f1..8cdddc0 100644
              if not is_last_rank:
                  if not req_data.new_token_ids:
                      # Async scheduled PP: Sampled tokens propagated via GPU broadcast.
-@@ -1424,6 +1465,12 @@ class GPUModelRunner(
+@@ -1424,6 +1469,12 @@ class GPUModelRunner(
  
              # Update the persistent batch.
              self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
@@ -686,7 +690,7 @@ index e9b23f1..8cdddc0 100644
              if new_block_ids is not None:
                  self.input_batch.block_table.append_row(new_block_ids, req_index)
  
-@@ -1911,6 +1958,111 @@ class GPUModelRunner(
+@@ -1911,6 +1962,111 @@ class GPUModelRunner(
  
          return encoder_seq_lens, encoder_seq_lens_cpu
  
@@ -798,7 +802,7 @@ index e9b23f1..8cdddc0 100644
      def _prepare_inputs(
          self,
          scheduler_output: "SchedulerOutput",
-@@ -2143,16 +2295,29 @@ class GPUModelRunner(
+@@ -2143,16 +2299,29 @@ class GPUModelRunner(
              self.num_computed_tokens[req_indices_gpu].to(torch.int64)
              + self.query_pos.gpu[:total_num_scheduled_tokens]
          )
@@ -837,7 +841,7 @@ index e9b23f1..8cdddc0 100644
  
          # Copy the tensors to the GPU.
          self._prepare_input_ids(
-@@ -2395,6 +2560,29 @@ class GPUModelRunner(
+@@ -2395,6 +2564,29 @@ class GPUModelRunner(
              rswa_prefix_lens=rswa_prefix_lens,
          )
  
@@ -867,7 +871,7 @@ index e9b23f1..8cdddc0 100644
          if self.dcp_world_size > 1:
              self.dcp_local_seq_lens.cpu[:num_reqs] = get_dcp_local_seq_lens(
                  self.optimistic_seq_lens_cpu[:num_reqs],
-@@ -4358,6 +4546,33 @@ class GPUModelRunner(
+@@ -4358,6 +4550,35 @@ class GPUModelRunner(
                  **model_kwargs,
              )
  
@@ -885,6 +889,8 @@ index e9b23f1..8cdddc0 100644
 +                self._rkv_score_acc,
 +                self._rkv_layer_caches,
 +                self._rkv_num_dropped_tokens_list,
++                self._rkv_expected_layers,
++                self.input_batch.num_dropped_tokens_cpu[:num_rkv_reqs],
 +            )
 +            if self.rkv_async:
 +                # Runner-authoritative num_dropped: fold this step's evictions
@@ -901,7 +907,7 @@ index e9b23f1..8cdddc0 100644
          with record_function_or_nullcontext("gpu_model_runner: postprocess"):
              if self.use_aux_hidden_state_outputs:
                  # True when EAGLE 3 is used.
-@@ -4682,6 +4897,11 @@ class GPUModelRunner(
+@@ -4682,6 +4903,11 @@ class GPUModelRunner(
                  routed_experts=None,
              )
  
@@ -913,7 +919,7 @@ index e9b23f1..8cdddc0 100644
          if not self.use_async_scheduling:
              if self.routed_experts_initialized:
                  # Sync path: D2H was issued in ``_bookkeeping_sync`` and
-@@ -7419,6 +7639,8 @@ class GPUModelRunner(
+@@ -7419,6 +7645,8 @@ class GPUModelRunner(
          self.may_add_encoder_only_layers_to_kv_cache_config()
          self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
          self.initialize_attn_backend(kv_cache_config, is_profiling=is_profiling)
@@ -922,7 +928,7 @@ index e9b23f1..8cdddc0 100644
          initialize_mamba_ssu_backend(
              self.vllm_config.mamba_config, self.kv_cache_config
          )
-@@ -7461,6 +7683,50 @@ class GPUModelRunner(
+@@ -7461,6 +7689,71 @@ class GPUModelRunner(
                  kv_transfer_group.register_kv_caches(kv_caches)
              kv_transfer_group.set_host_xfer_buffer_ops(copy_kv_blocks)
  
@@ -969,6 +975,27 @@ index e9b23f1..8cdddc0 100644
 +                    "R-KV's scoring/eviction hooks run inside FlashAttention's "
 +                    "forward only; other backends would silently run Full-KV."
 +                )
++        # Cross-layer KV cache sharing aliases two attention layers to one
++        # storage; R-KV would relocate that storage twice and corrupt the kept
++        # set. Reject it (a future version could relocate each distinct storage
++        # once while still letting every layer contribute a score).
++        if self.shared_kv_cache_layers:
++            raise ValueError(
++                "R-KV does not support cross-layer KV cache sharing "
++                f"({len(self.shared_kv_cache_layers)} shared layer(s)); the "
++                "shared storage would be relocated more than once."
++            )
++        # Number of FlashAttention layers that must each register their KV on a
++        # compaction step; compact_step verifies the full set contributed, so a
++        # partially-registered forward fails instead of compacting a subset.
++        self._rkv_expected_layers = sum(
++            len(g.layer_names) for g in self.attn_groups[0]
++        )
++        # Tell the compactor the model's TP world size so its cross-rank score
++        # reduction fails closed if the group is unavailable/inconsistent.
++        self.rkv_compactor.set_parallel_context(
++            self.parallel_config.tensor_parallel_size
++        )
 +
      def _get_attention_kv_cache_gid(self) -> int:
          """Find the KV cache group index for attention layers.
