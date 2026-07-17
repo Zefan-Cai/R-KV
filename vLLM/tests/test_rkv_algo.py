@@ -186,20 +186,18 @@ class TestR1KVParity(unittest.TestCase):
             compute_attention_scores(q, k)
 
     def test_retain_first_finite_and_directional(self):
-        # The fixed "first"/"first_percent" retain uses a seq_len sentinel so it
-        # picks the smallest MATCHED index (the old bug collapsed to position 0),
-        # so it must differ from "last" on a mutually-similar key set.
+        # The fixed "first" retain uses a seq_len sentinel so it picks the
+        # smallest MATCHED index (the old bug collapsed to position 0), so it
+        # must differ from "last" on a mutually-similar key set. (The "*_percent"
+        # modes are disabled at the config layer; only "last"/"first" are valid.)
         torch.manual_seed(0)
         seq = 6
         base = torch.randn(1, 1, 1, 16)
         key = base.expand(1, 1, seq, 16) + 0.02 * torch.randn(1, 1, seq, 16)
         last = cal_similarity(key.clone(), threshold=0.0, retain_direction="last")
-        for direction in ("first", "first_percent"):
-            out = cal_similarity(
-                key.clone(), threshold=0.0, retain_direction=direction
-            )
-            self.assertTrue(torch.isfinite(out).all())
-            self.assertFalse(torch.allclose(out, last))
+        out = cal_similarity(key.clone(), threshold=0.0, retain_direction="first")
+        self.assertTrue(torch.isfinite(out).all())
+        self.assertFalse(torch.allclose(out, last))
 
     def test_retain_first_no_match_rows_do_not_crash(self):
         # Orthogonal keys + high threshold -> no matches -> every row holds the

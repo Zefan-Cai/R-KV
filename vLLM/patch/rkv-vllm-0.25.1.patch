@@ -162,7 +162,7 @@ index e8796a3..bfb1b80 100644
              logger.info_once("Performance mode set to '%s'.", self.performance_mode)
  
 diff --git a/vllm/envs.py b/vllm/envs.py
-index 13a19b8..0c3448a 100755
+index 13a19b8..ad173e3 100755
 --- a/vllm/envs.py
 +++ b/vllm/envs.py
 @@ -150,6 +150,15 @@ if TYPE_CHECKING:
@@ -176,12 +176,12 @@ index 13a19b8..0c3448a 100755
 +    VLLM_V1_R_KV_BUFFER: int = 0
 +    VLLM_V1_R_KV_WINDOW: int = 8
 +    VLLM_V1_R_KV_KERNEL: int = 7
-+    VLLM_V1_R_KV_FREE_BLOCKS: bool = True
++    VLLM_V1_R_KV_FREE_BLOCKS: bool = False
 +    VLLM_V1_R_KV_ASYNC: bool = False
      VLLM_MLA_DISABLE: bool = False
      VLLM_RAY_PER_WORKER_GPUS: float = 1.0
      VLLM_RAY_BUNDLE_INDICES: str = ""
-@@ -1323,6 +1332,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
+@@ -1323,6 +1332,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
      "VLLM_V1_OUTPUT_PROC_CHUNK_SIZE": lambda: int(
          os.getenv("VLLM_V1_OUTPUT_PROC_CHUNK_SIZE", "128")
      ),
@@ -192,10 +192,13 @@ index 13a19b8..0c3448a 100755
 +    "VLLM_V1_R_KV_WINDOW": lambda: int(os.getenv("VLLM_V1_R_KV_WINDOW", "8")),
 +    "VLLM_V1_R_KV_KERNEL": lambda: int(os.getenv("VLLM_V1_R_KV_KERNEL", "7")),
 +    # Free the KV blocks R-KV evicts (bounded footprint) instead of only
-+    # flagging them; set 0 to keep the pre-fix behavior (blocks held per logical
-+    # token). On by default.
++    # flagging them. **Opt-in (default 0)**: the scheduler frees the request's
++    # high blocks but there is not yet a scheduler->worker protocol to truncate
++    # the worker's cached block-table row, so a future stale-state regression
++    # could let a physical index reach a freed-and-reused block. Enable only
++    # when the memory benefit is needed and the deployment is validated.
 +    "VLLM_V1_R_KV_FREE_BLOCKS": lambda: bool(
-+        int(os.getenv("VLLM_V1_R_KV_FREE_BLOCKS", "1"))
++        int(os.getenv("VLLM_V1_R_KV_FREE_BLOCKS", "0"))
 +    ),
 +    # Allow R-KV to run under async scheduling (the runner then applies its
 +    # evicted-token count itself, right after compaction, instead of waiting for
@@ -248,7 +251,7 @@ index bfecb3c..641aa56 100644
      _seq_lens_cpu: torch.Tensor | None = None
      _num_computed_tokens_cpu: torch.Tensor | None = None
 diff --git a/vllm/v1/attention/backends/flash_attn.py b/vllm/v1/attention/backends/flash_attn.py
-index db5b0dd..af6352f 100755
+index db5b0dd..b7c4e82 100755
 --- a/vllm/v1/attention/backends/flash_attn.py
 +++ b/vllm/v1/attention/backends/flash_attn.py
 @@ -268,6 +268,17 @@ class FlashAttentionMetadata:
@@ -284,7 +287,7 @@ index db5b0dd..af6352f 100755
          )
  
          # Compute mm_prefix range tensor if the batch contains
-@@ -746,6 +765,12 @@ class FlashAttentionImpl(AttentionImpl):
+@@ -746,6 +765,21 @@ class FlashAttentionImpl(AttentionImpl):
          if vllm_config is not None and self.dcp_world_size > 1:
              self._dcp_dtype = vllm_config.model_config.dtype
  
@@ -293,11 +296,20 @@ index db5b0dd..af6352f 100755
 +        from vllm.rkv.integration import RKVCompressor
 +
 +        self.rkv_compressor = RKVCompressor()
++        if self.rkv_compressor.enabled and self.alibi_slopes is not None:
++            raise ValueError(
++                "R-KV does not support ALiBi: FlashAttention derives the ALiBi "
++                "distance from the current (physical) KV index, but R-KV "
++                "relocates KV in place so the physical index no longer equals a "
++                "token's logical position -- the bias would silently change "
++                "after the first compaction. (RoPE is unaffected: it is baked "
++                "into K at write time.)"
++            )
 +
      def forward(
          self,
          layer: torch.nn.Module,
-@@ -975,6 +1000,24 @@ class FlashAttentionImpl(AttentionImpl):
+@@ -975,9 +1009,38 @@ class FlashAttentionImpl(AttentionImpl):
                      mask_mod=rswa_mask_mod_fn or mm_mask_mod,
                      aux_tensors=rswa_aux or mm_aux,
                  )
@@ -322,6 +334,20 @@ index db5b0dd..af6352f 100755
                  return output
  
          # Cascade attention (rare case).
++        if self.rkv_compressor.enabled:
++            # R-KV's record_query/observe_layer hooks live only on the
++            # non-cascade path above, so a cascade step would silently skip
++            # compaction and leave an inconsistent observation window. R-KV
++            # disables prefix caching so cascade should not trigger -- fail
++            # closed rather than run Full-KV for this step.
++            raise RuntimeError(
++                "R-KV: cascade attention is not supported (its path bypasses "
++                "R-KV's in-forward hooks). This should not occur with prefix "
++                "caching disabled; disable cascade attention."
++            )
+         cascade_attention(
+             output[:num_actual_tokens],
+             query[:num_actual_tokens],
 diff --git a/vllm/v1/core/kv_cache_coordinator.py b/vllm/v1/core/kv_cache_coordinator.py
 index a759d7a..568c6db 100644
 --- a/vllm/v1/core/kv_cache_coordinator.py
@@ -424,7 +450,7 @@ index 291e73b..0cb1151 100644
  
  
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index 8e01035..0876b00 100644
+index 8e01035..d88cb76 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
 @@ -7,6 +7,7 @@ from collections.abc import Iterable
@@ -448,9 +474,17 @@ index 8e01035..0876b00 100644
          if request.spec_token_ids:
              request.spec_token_ids = []
          request.num_preemptions += 1
-@@ -1175,12 +1182,37 @@ class Scheduler(SchedulerInterface):
+@@ -1174,13 +1181,46 @@ class Scheduler(SchedulerInterface):
+         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
          for req_id, num_scheduled_token in num_scheduled_tokens.items():
              request = self.requests[req_id]
++            # R-KV: capture recompute state BEFORE advancing num_computed_tokens.
++            # A preempted request re-processes its whole sequence; the step that
++            # *catches up* (num_computed reaches num_tokens) would look like a
++            # genuine decode step (is_prefill_chunk False) even though it is
++            # still replaying already-generated tokens, so remember here whether
++            # we were behind and suppress arming on that step too.
++            rkv_was_recomputing = request.num_computed_tokens < request.num_tokens
              request.num_computed_tokens += num_scheduled_token
 -            if self.defer_block_free:
 -                # Record the in-flight step, to fence deferred block freeing.
@@ -465,12 +499,12 @@ index 8e01035..0876b00 100644
 +            # multiple of ``buffer_size``, fires only a few tokens in and evicts
 +            # most of the prompt off a nearly-cold window (permanent damage).
 +            # ``is_prefill_chunk`` is True while a request is (re)processing
-+            # already-materialised tokens; gating on ``not is_prefill_chunk``
-+            # keeps compaction off a chunked prefill AND off a preempted
-+            # request's recompute (it re-runs its whole sequence from scratch, so
-+            # arming on those recompute-chunk queries would evict against a
-+            # stale/rebuilt window and desync the dropped-token accounting:
-+            # num_dropped > num_computed).
++            # already-materialised tokens; gating on ``not is_prefill_chunk`` and
++            # ``not rkv_was_recomputing`` keeps compaction off a chunked prefill
++            # AND off every step of a preempted request's recompute (including
++            # the catch-up step), since arming on recompute-chunk queries would
++            # evict against a stale/rebuilt window and desync the dropped-token
++            # accounting (num_dropped > num_computed).
 +            compress_every = envs.VLLM_V1_R_KV_BUFFER
 +            num_decoded = request.num_computed_tokens - request.num_prompt_tokens
              request.is_prefill_chunk = request.num_computed_tokens < (
@@ -479,6 +513,7 @@ index 8e01035..0876b00 100644
 +            request.should_compress = (
 +                compress_every > 0
 +                and not request.is_prefill_chunk
++                and not rkv_was_recomputing
 +                and num_decoded > 0
 +                and num_decoded // compress_every
 +                > (num_decoded - num_scheduled_token) // compress_every
@@ -489,7 +524,7 @@ index 8e01035..0876b00 100644
              scheduler_output.has_structured_output_requests |= (
                  request.use_structured_output and not request.is_prefill_chunk
              )
-@@ -1267,6 +1299,8 @@ class Scheduler(SchedulerInterface):
+@@ -1267,6 +1307,8 @@ class Scheduler(SchedulerInterface):
          all_token_ids: dict[str, list[int]] = {}
          num_computed_tokens: list[int] = []
          num_output_tokens: list[int] = []
@@ -498,7 +533,7 @@ index 8e01035..0876b00 100644
          resumed_req_ids = set()
  
          num_running_reqs = len(running_reqs)
-@@ -1301,6 +1335,8 @@ class Scheduler(SchedulerInterface):
+@@ -1301,6 +1343,8 @@ class Scheduler(SchedulerInterface):
              num_output_tokens.append(
                  req.num_output_tokens + req.num_output_placeholders
              )
@@ -507,7 +542,7 @@ index 8e01035..0876b00 100644
  
          return CachedRequestData(
              req_ids=req_ids,
-@@ -1310,6 +1346,8 @@ class Scheduler(SchedulerInterface):
+@@ -1310,6 +1354,8 @@ class Scheduler(SchedulerInterface):
              new_block_ids=new_block_ids,
              num_computed_tokens=num_computed_tokens,
              num_output_tokens=num_output_tokens,
@@ -516,7 +551,7 @@ index 8e01035..0876b00 100644
          )
  
      def _try_schedule_encoder_inputs(
-@@ -1576,6 +1614,12 @@ class Scheduler(SchedulerInterface):
+@@ -1576,6 +1622,12 @@ class Scheduler(SchedulerInterface):
                  continue
  
              req_index = model_runner_output.req_id_to_index[req_id]
@@ -639,7 +674,7 @@ index 28d1a04..b0310b6 100644
  
              self.request_lora_mapping[empty_index] = self.request_lora_mapping[
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index e9b23f1..2e3a100 100644
+index e9b23f1..50c054a 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
 @@ -769,6 +769,49 @@ class GPUModelRunner(
@@ -741,7 +776,7 @@ index e9b23f1..2e3a100 100644
              if new_block_ids is not None:
                  self.input_batch.block_table.append_row(new_block_ids, req_index)
  
-@@ -1911,6 +1973,128 @@ class GPUModelRunner(
+@@ -1911,6 +1973,158 @@ class GPUModelRunner(
  
          return encoder_seq_lens, encoder_seq_lens_cpu
  
@@ -767,6 +802,36 @@ index e9b23f1..2e3a100 100644
 +        read and overwrite each request's full KV in place.
 +        """
 +        dropped_np = self.input_batch.num_dropped_tokens_cpu[:num_reqs]
++        # Bounds invariants (cheap, every step): a corrupt dropped count or a
++        # physical length past the request's block-table row would index the
++        # wrong block -- possibly another request's row -- so fail closed here
++        # before building any slot mapping (the null-block guard below only
++        # catches a *freed* block, not a stale non-null cross-row index).
++        computed_np = self.input_batch.num_computed_tokens_cpu[:num_reqs]
++        if np.any(dropped_np < 0) or np.any(dropped_np > computed_np):
++            b = int(np.argmax((dropped_np < 0) | (dropped_np > computed_np)))
++            raise RuntimeError(
++                f"R-KV: invalid dropped count at batch row {b}: "
++                f"dropped={int(dropped_np[b])}, computed={int(computed_np[b])}."
++            )
++        physical_live_np = computed_np - dropped_np + num_scheduled_tokens
++        if np.any(physical_live_np < 0):
++            b = int(np.argmax(physical_live_np < 0))
++            raise RuntimeError(
++                f"R-KV: negative physical live length at batch row {b}: "
++                f"{int(physical_live_np[b])} "
++                f"(computed={int(computed_np[b])}, dropped={int(dropped_np[b])})."
++            )
++        _bt0 = self.input_batch.block_table[0]
++        _row_blocks = _bt0.block_table.np.shape[1]
++        _req_blocks = (physical_live_np + _bt0.block_size - 1) // _bt0.block_size
++        if np.any(_req_blocks > _row_blocks):
++            b = int(np.argmax(_req_blocks > _row_blocks))
++            raise RuntimeError(
++                f"R-KV: batch row {b} needs {int(_req_blocks[b])} blocks > "
++                f"block-table row width {_row_blocks} (physical_live="
++                f"{int(physical_live_np[b])})."
++            )
 +        # Physical position of each scheduled token = logical - dropped.
 +        self.rkv_physical_positions.np[:total_num_scheduled_tokens] = (
 +            positions_np - dropped_np[req_indices]
@@ -870,7 +935,7 @@ index e9b23f1..2e3a100 100644
      def _prepare_inputs(
          self,
          scheduler_output: "SchedulerOutput",
-@@ -2143,16 +2327,29 @@ class GPUModelRunner(
+@@ -2143,16 +2357,29 @@ class GPUModelRunner(
              self.num_computed_tokens[req_indices_gpu].to(torch.int64)
              + self.query_pos.gpu[:total_num_scheduled_tokens]
          )
@@ -909,7 +974,7 @@ index e9b23f1..2e3a100 100644
  
          # Copy the tensors to the GPU.
          self._prepare_input_ids(
-@@ -2395,6 +2592,29 @@ class GPUModelRunner(
+@@ -2395,6 +2622,29 @@ class GPUModelRunner(
              rswa_prefix_lens=rswa_prefix_lens,
          )
  
@@ -939,7 +1004,7 @@ index e9b23f1..2e3a100 100644
          if self.dcp_world_size > 1:
              self.dcp_local_seq_lens.cpu[:num_reqs] = get_dcp_local_seq_lens(
                  self.optimistic_seq_lens_cpu[:num_reqs],
-@@ -4358,6 +4578,39 @@ class GPUModelRunner(
+@@ -4358,6 +4608,39 @@ class GPUModelRunner(
                  **model_kwargs,
              )
  
@@ -979,7 +1044,7 @@ index e9b23f1..2e3a100 100644
          with record_function_or_nullcontext("gpu_model_runner: postprocess"):
              if self.use_aux_hidden_state_outputs:
                  # True when EAGLE 3 is used.
-@@ -4682,6 +4935,11 @@ class GPUModelRunner(
+@@ -4682,6 +4965,11 @@ class GPUModelRunner(
                  routed_experts=None,
              )
  
@@ -991,7 +1056,7 @@ index e9b23f1..2e3a100 100644
          if not self.use_async_scheduling:
              if self.routed_experts_initialized:
                  # Sync path: D2H was issued in ``_bookkeeping_sync`` and
-@@ -7419,6 +7677,8 @@ class GPUModelRunner(
+@@ -7419,6 +7707,8 @@ class GPUModelRunner(
          self.may_add_encoder_only_layers_to_kv_cache_config()
          self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
          self.initialize_attn_backend(kv_cache_config, is_profiling=is_profiling)
@@ -1000,7 +1065,7 @@ index e9b23f1..2e3a100 100644
          initialize_mamba_ssu_backend(
              self.vllm_config.mamba_config, self.kv_cache_config
          )
-@@ -7461,6 +7721,71 @@ class GPUModelRunner(
+@@ -7461,6 +7751,95 @@ class GPUModelRunner(
                  kv_transfer_group.register_kv_caches(kv_caches)
              kv_transfer_group.set_host_xfer_buffer_ops(copy_kv_blocks)
  
@@ -1026,18 +1091,42 @@ index e9b23f1..2e3a100 100644
 +                "not supported). Disable R-KV for this model."
 +            )
 +        spec = groups[0].kv_cache_spec
-+        if not isinstance(spec, FullAttentionSpec):
++        # Exact type (not isinstance): FullAttentionSpec subclasses (MLA, sink,
++        # etc.) change the KV layout or attention semantics R-KV relies on.
++        if type(spec) is not FullAttentionSpec:
 +            raise ValueError(
-+                "R-KV requires a FullAttentionSpec KV cache group, found "
-+                f"{type(spec).__name__} (sliding-window / Mamba / other cache "
-+                "specs are not supported)."
++                "R-KV requires a plain FullAttentionSpec KV cache group, found "
++                f"{type(spec).__name__} (sliding-window / Mamba / MLA / other "
++                "cache specs are not supported)."
 +            )
++        # Reject the FullAttentionSpec variants whose attention is not plain
++        # causal full-attention over contiguous physical KV. R-KV relocates KV
++        # in place, so anything that derives masking/bias/geometry from the
++        # physical KV index (chunked or non-causal attention, a mismatched value
++        # head size) would silently change semantics after compaction. (KV that
++        # is indexed by block stride is the normal FlashAttention paged layout
++        # R-KV already gathers from, so it is fine.)
 +        if getattr(spec, "sliding_window", None):
 +            raise ValueError(
 +                "R-KV does not support sliding-window attention: vLLM may free "
 +                "out-of-window blocks that R-KV still lists in its occupied slot "
 +                "mapping, so it could read from or write survivors into a freed "
 +                "block."
++            )
++        if getattr(spec, "attention_chunk_size", None):
++            raise ValueError(
++                "R-KV does not support chunked attention "
++                f"(attention_chunk_size={spec.attention_chunk_size})."
++            )
++        if getattr(spec, "non_causal", False):
++            raise ValueError(
++                "R-KV requires causal attention (non_causal is set); prefix-LM / "
++                "encoder / non-causal masks are not supported."
++            )
++        if getattr(spec, "head_size_v", spec.head_size) != spec.head_size:
++            raise ValueError(
++                "R-KV requires head_size_v == head_size "
++                f"({spec.head_size_v} != {spec.head_size})."
 +            )
 +        for attn_group in self.attn_groups[0]:
 +            name = attn_group.backend.get_name()

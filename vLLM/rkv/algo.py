@@ -94,13 +94,16 @@ def cal_similarity(
     """
     _, _, seq_len, _ = key_states.shape
 
-    # A dtype-aware epsilon avoids a divide-by-(near-)zero on a tiny key norm.
-    # ``1e-8`` is fine for fp32/bf16 (8-bit exponent) but rounds to 0 in fp16
-    # (5-bit exponent, min subnormal ~6e-8), which would produce NaN/Inf; use a
-    # representable floor there. fp32/bf16 keep 1e-8, so their results (and the
-    # CPU parity tests) are unchanged.
-    eps = 1e-3 if key_states.dtype == torch.float16 else 1e-8
-    k_norm = key_states / (key_states.norm(dim=-1, keepdim=True) + eps)
+    # fp16 key norms can underflow (5-bit exponent), so a fixed in-dtype epsilon
+    # either rounds to 0 (-> NaN) or, if made large enough to be representable,
+    # biases small-norm vectors. Accumulate the fp16 norm in fp32 and clamp it
+    # instead. fp32/bf16 keep the reference form (`norm + 1e-8`), so their
+    # results -- and the CPU parity tests -- are exactly unchanged.
+    if key_states.dtype == torch.float16:
+        norm = key_states.float().norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        k_norm = key_states / norm.to(key_states.dtype)
+    else:
+        k_norm = key_states / (key_states.norm(dim=-1, keepdim=True) + 1e-8)
     similarity_cos = torch.matmul(k_norm, k_norm.transpose(-1, -2))
     diag = torch.eye(seq_len, dtype=torch.bool, device=key_states.device)
     similarity_cos.masked_fill_(diag.view(1, 1, seq_len, seq_len), 0.0)

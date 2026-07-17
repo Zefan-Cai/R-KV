@@ -230,6 +230,8 @@ class TestConfigValidation(unittest.TestCase):
             dict(budget=64, buffer_size=0),  # partial enable (buffer off)
             dict(budget=0, buffer_size=64),  # partial enable (budget off)
             dict(budget=64, buffer_size=64, retain_direction="middle"),  # bad enum
+            dict(budget=64, buffer_size=64, retain_direction="last_percent"),  # disabled
+            dict(budget=64, buffer_size=64, retain_direction="first_percent"),  # disabled
         ]
         for kwargs in bad:
             with self.assertRaises(ValueError, msg=str(kwargs)):
@@ -263,6 +265,17 @@ class TestCompactionSafety(unittest.TestCase):
             )
         self.assertEqual(nd[0], 0)  # not committed
 
+    def test_duplicate_and_missing_layer_raises(self):
+        """A layer registered twice while another is missing keeps the total
+        count == expected, but the distinct-storage count is short, so it must
+        still raise (else a subset would relocate and desync the block table)."""
+        _, comp, occupied, k, v, score = self._ref_setup()
+        with self.assertRaises(RuntimeError):
+            comp.compact_step(
+                1, torch.tensor([10]), occupied, (True,), [score],
+                [(k, v, {}), (k, v, {})], [0], expected_layer_count=2,  # 1 distinct
+            )
+
     def test_missing_state_when_required_raises(self):
         """A required compaction with no occupied mapping / layer caches raises
         rather than silently skipping (the request may already be capped)."""
@@ -294,21 +307,6 @@ class TestCompactionSafety(unittest.TestCase):
                 [(k, v, {})], nd, expected_layer_count=1,  # empty window dict
             )
         self.assertEqual(nd[0], 0)
-
-    def test_shared_storage_relocated_once(self):
-        """The same KV storage registered as two layers is relocated once, not
-        twice (a second in-place gather would read already-moved data)."""
-        _, comp, occupied, k, v, score = self._ref_setup()
-        nd = [0]
-        comp.compact_step(
-            1, torch.tensor([10]), occupied, (True,), [score],
-            [(k, v, {}), (k, v, {})], nd, expected_layer_count=2,  # shared tensors
-        )
-        # kept=[0,2,4,6,8,9] -> src=[0,2,4,6,8,9], dst=[0,1,2,3,4,5].
-        # Relocated ONCE: k[1]==2, k[2]==4. Relocated twice it would be 4, 8.
-        self.assertEqual(slot_val(k, 1), 2.0)
-        self.assertEqual(slot_val(k, 2), 4.0)
-        self.assertEqual(nd[0], 4)
 
     def test_memory_guard_skips_first_but_raises_after_drop(self):
         """A first-compaction request over the score-memory cap is left Full-KV
@@ -364,11 +362,15 @@ class TestCompactionSafety(unittest.TestCase):
         self.assertEqual(set(comp._slot), {"a"})
         self.assertNotIn("b", comp._qcount)
         self.assertEqual(len(comp._free), 2)
-        # preemption resets a's window but keeps its column (KV is rebuilt).
-        a_slot = comp._slot["a"]
+        # preemption releases a's column (its window is rebuilt on resume) so the
+        # ring cannot leak columns across preemption churn.
         comp.reset_request_windows(["a"])
-        self.assertEqual(comp._slot["a"], a_slot)
-        self.assertEqual(comp._qcount["a"], 0)
+        self.assertNotIn("a", comp._slot)
+        self.assertNotIn("a", comp._qcount)
+        # on resume, a gets a fresh column with a fresh (1-query) window.
+        comp.plan_qwrite(["a"], dev)
+        self.assertIn("a", comp._slot)
+        self.assertEqual(comp._qcount["a"], 1)
 
     def test_insufficient_window_skips_first_but_raises_after_drop(self):
         """A required request whose observation window hasn't refilled (e.g. it

@@ -171,15 +171,11 @@ class RKVConfig:
                 "R-KV score_chunk_bytes (VLLM_V1_R_KV_SCORE_CHUNK_MB) must be "
                 f"positive, got {self.score_chunk_bytes} bytes."
             )
-        if self.retain_direction not in (
-            "last",
-            "first",
-            "last_percent",
-            "first_percent",
-        ):
+        if self.retain_direction not in ("last", "first"):
             raise ValueError(
-                f"R-KV retain_direction ({self.retain_direction!r}) must be one "
-                "of 'last', 'first', 'last_percent', 'first_percent'."
+                f"R-KV retain_direction ({self.retain_direction!r}) must be "
+                "'last' or 'first'; the '*_percent' modes have a known indexing "
+                "bug and are disabled."
             )
 
     @classmethod
@@ -375,9 +371,17 @@ class RKVCompressor:
             sig = (sig * MUL + int(sl) + 1) % MOD
             for m in sorted(groups[sl], key=lambda x: x[0]):
                 sig = (sig * MUL + int(m[0]) + 1) % MOD
-        t = torch.tensor([sig], dtype=torch.int64, device=device)
-        dist.all_reduce(t, group=tp.device_group)
-        if int(t.item()) != sig * tp.world_size:
+        lo = torch.tensor([sig], dtype=torch.int64, device=device)
+        hi = lo.clone()
+        # Compare via MIN and MAX, not sum == local*world_size: a sum check
+        # passes on a rank whose signature happens to equal the group average,
+        # so that rank would proceed into the per-group score collective while
+        # the others raise -> NCCL hang. With min/max, ANY disagreement makes
+        # min != max, so every rank sees its own sig differ from one of them and
+        # they all raise together.
+        dist.all_reduce(lo, op=dist.ReduceOp.MIN, group=tp.device_group)
+        dist.all_reduce(hi, op=dist.ReduceOp.MAX, group=tp.device_group)
+        if int(lo.item()) != sig or int(hi.item()) != sig:
             raise RuntimeError(
                 "R-KV: tensor-parallel ranks disagree on the compaction plan; "
                 "refusing to make divergent eviction decisions."
@@ -398,17 +402,21 @@ class RKVCompressor:
             self._qcount.pop(rid, None)
 
     def reset_request_windows(self, request_ids) -> None:
-        """Restart the observation window of **preempted** requests.
+        """Release the ring column of **preempted** requests.
 
         Called with ``scheduler_output.preempted_req_ids``. A preempted request
         recomputes its whole sequence from scratch (physical KV rebuilt,
-        ``num_dropped`` reset to 0), so its recorded queries are stale: reset the
-        step counter so the window re-warms and :meth:`compact_step` refuses to
+        ``num_dropped`` reset to 0), so its recorded queries are useless. Free
+        its column (like a finish) so it re-warms from a fresh column on resume
+        and the ring cannot leak columns across preemption churn; the
+        insufficient-window check in :meth:`compact_step` then refuses to
         compact it until ``window_size`` fresh queries have been recorded.
         """
         for rid in request_ids:
-            if rid in self._qcount:
-                self._qcount[rid] = 0
+            s = self._slot.pop(rid, None)
+            if s is not None:
+                self._free.append(s)
+            self._qcount.pop(rid, None)
 
     def plan_qwrite(self, req_ids, device) -> tuple | None:
         """Compute this step's shared ring write-plan (runner-owned, once/step).
@@ -798,15 +806,19 @@ class RKVCompressor:
                 "occupied_slot_mapping/layer_caches are missing -- refusing to "
                 "continue with inconsistent KV state."
             )
-        if (
-            expected_layer_count is not None
-            and len(layer_caches) != expected_layer_count
-        ):
-            raise RuntimeError(
-                f"R-KV: only {len(layer_caches)}/{expected_layer_count} attention "
-                "layers registered for compaction; compacting a subset would "
-                "desync the block table across layers."
-            )
+        if expected_layer_count is not None:
+            distinct = {self._storage_id(lc[0]) for lc in layer_caches}
+            if (
+                len(layer_caches) != expected_layer_count
+                or len(distinct) != expected_layer_count
+            ):
+                raise RuntimeError(
+                    f"R-KV: {len(layer_caches)} layer registrations "
+                    f"({len(distinct)} distinct KV storages) != "
+                    f"{expected_layer_count} expected attention layers; a missing "
+                    "or duplicated layer would relocate only a subset and desync "
+                    "the block table across layers."
+                )
 
         block_size = layer_caches[0][0].size(1)
         elt = layer_caches[0][0].element_size()

@@ -34,7 +34,7 @@ same *patch-not-fork* layout as the [SGLang port](../SGLang/README.md).
 ## Why a patch, not a fork?
 
 R-KV touches vLLM in a **small, purely additive** way: one self-contained
-package (`rkv/`) plus ~718 lines of wiring across **13** existing files. Instead
+package (`rkv/`) plus ~803 lines of wiring across **13** existing files. Instead
 of vendoring the entire vLLM tree, this directory ships:
 
 - `rkv/` — the R-KV code (browsable, the source of truth);
@@ -98,7 +98,7 @@ VLLM_V1_R_KV_BUDGET=256 VLLM_V1_R_KV_BUFFER=64 VLLM_V1_R_KV_ASYNC=1 \
 | `VLLM_V1_R_KV_WINDOW` | `8` | trailing observation window (always retained) |
 | `VLLM_V1_R_KV_KERNEL` | `7` | max-pool kernel size for the importance term |
 | `VLLM_V1_R_KV_ASYNC` | `0` (off) | allow async scheduling for best throughput (+16.7%); the runner applies its evicted-token count itself so async stays correct |
-| `VLLM_V1_R_KV_FREE_BLOCKS` | `1` (on) | free the KV blocks R-KV evicts so the footprint is bounded at `budget+buffer`; set `0` for the pre-fix behavior |
+| `VLLM_V1_R_KV_FREE_BLOCKS` | `0` (off) | **opt-in.** Free the KV blocks R-KV evicts so the footprint is bounded at `budget+buffer` (accuracy is bit-identical either way). Off by default because the block manager frees below the runner's cap without a two-way version handshake; enable it for the memory/throughput win under KV pressure. |
 
 When `BUDGET` or `BUFFER` is `0`, **every** R-KV code path is inert and vLLM
 behaves exactly as upstream.

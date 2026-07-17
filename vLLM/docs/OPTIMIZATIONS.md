@@ -24,9 +24,9 @@ default PIECEWISE cudagraph + async scheduling; also cross-checked under
   only a shard of the KV heads, so `compact_step` all-reduces the per-token
   scores across the TP group before the top-k; every rank then evicts the
   identical set and the sharded KV stays consistent. Validated: TP=2 few-shot
-  GSM8K `b256/buf64` = **88/100, bit-matching TP=1's 88/100** (the all-reduce
-  reconstructs TP=1's global cross-head score), plus coherent 700-token forced
-  generations. Data parallelism (DP) needs no coordination — each replica owns
+  GSM8K `b256/buf64` = **90/100 vs TP=1's 91/100** (the all-reduce reconstructs
+  TP=1's global cross-head score; the ±1 is float summation-order noise near the
+  top-k cutoff), plus coherent 700-token forced generations. Data parallelism (DP) needs no coordination — each replica owns
   an independent KV cache + compactor — and DP+TP is correct because the
   reduction targets the per-replica TP **sub-group** (`get_tp_group()`), not the
   world; validated on a DP=2×TP=2 server with 8 concurrent forced-long
@@ -374,9 +374,15 @@ on Full-KV. See Known limitations #2.
     `ceil((budget+buffer)/block_size)+1` and free the high blocks holding only
     evicted KV (reusing the sliding-window `_remove_blocks_in_range` null-fill).
     The worker never indexes past the cap, so no block-table change is needed.
-    Gated by `VLLM_V1_R_KV_FREE_BLOCKS` (default on). Validated: accuracy
-    **bit-identical** (b256/buf64 = 89.0%); a 1500-token gen holds **21 blocks
-    vs 95**; under tight KV, 200×1024-token requests run at **8215 vs 4656 tok/s
+    Gated by `VLLM_V1_R_KV_FREE_BLOCKS`, now **opt-in (default off)**: the block
+    manager frees blocks *below* the runner's reservation cap without a two-way
+    version handshake between the scheduler's block table and the worker's
+    physical slot mapping, so it is kept off by default and enabled explicitly
+    for the memory/throughput win (a full block-table version protocol is
+    roadmap). Validated: accuracy **bit-identical** whether on or off
+    (b256/buf64 = 89.0%; re-confirmed round 5 at 91/100 on the few-shot harness,
+    FREE=0 and FREE=1 identical); a 1500-token gen holds **21 blocks vs 95**;
+    under tight KV, 200×1024-token requests run at **8215 vs 4656 tok/s
     (+76%)** because the bounded footprint lets far more run concurrently.
 
 ## Tight-buffer (`buffer=16`) gap — root-caused to `mix_lambda`, residual numerics
@@ -450,8 +456,20 @@ the principled default). **Use `buffer ≥ 64`** (`buffer=128` is lossless).
      whose logical local seq-lengths are not reconciled with R-KV's physical
      ones);
    - quantized / FP8 KV cache (scoring runs in the KV storage dtype);
-   - more than one KV cache group, or a non-`FullAttentionSpec` group
-     (hybrid / Mamba / sliding-window models);
+   - more than one KV cache group, or a group whose spec is not **exactly**
+     `FullAttentionSpec` (hybrid / Mamba / sliding-window models, and
+     `FullAttentionSpec` *subclasses* such as MLA / attention-sink specs, which
+     carry extra geometry R-KV does not relocate);
+   - a `FullAttentionSpec` that is not plain causal full attention over a
+     contiguous value cache — **sliding-window**, **chunked attention**
+     (`attention_chunk_size`), **non-causal** masks, or a **`head_size_v`
+     mismatch** — since those derive masking/bias/geometry from the physical KV
+     index that compaction rewrites;
+   - **ALiBi** attention (`alibi_slopes`): the per-token linear bias is a
+     function of the *physical* KV position, which R-KV renumbers on eviction;
+   - **cascade attention**: R-KV's per-layer hooks are wired only into the
+     non-cascade FlashAttention path, so a cascade step would silently run
+     Full-KV — it now raises instead;
    - cross-layer KV cache **sharing** (two layers aliasing one storage would be
      relocated twice and corrupt the kept set);
    - dual-batch overlap / microbatching (`enable_dbo` / `ubatch_size > 1`):
@@ -462,10 +480,12 @@ the principled default). **Use `buffer ≥ 64`** (`buffer=128` is lossless).
    - any non-FlashAttention cache layer.
 
    `RKVConfig` also validates its own knobs (`budget > window`, `buffer ≥
-   window`, positive odd `kernel_size`, positive `SCORE_CHUNK_MB`, valid
-   `retain_direction`, budget & buffer both-zero-or-both-positive, parameter
-   ranges) and raises on bad values; malformed env vars raise (naming the
-   variable) instead of silently reverting to a default. **Supported:** tensor
+   window`, positive odd `kernel_size`, positive `SCORE_CHUNK_MB`, budget &
+   buffer both-zero-or-both-positive, parameter ranges) and raises on bad
+   values; `retain_direction` accepts only `last`/`first` (the `*_percent`
+   variants are rejected — their reference indexing collapses the wrong tensor
+   dimension); malformed env vars raise (naming the variable) instead of
+   silently reverting to a default. **Supported:** tensor
    & data parallelism, PIECEWISE cudagraph, opt-in async scheduling
    (`VLLM_V1_R_KV_ASYNC`); prefix caching is auto-disabled. Speculative
    decoding, PP/DCP and hybrid models stay **roadmap** items (compaction after
@@ -482,15 +502,21 @@ the principled default). **Use `buffer ≥ 64`** (`buffer=128` is lossless).
    therefore **raise** rather than silently skip. Two last-line invariants back
    this up: the occupied slot mapping is checked for the reserved **null block**
    (id 0) before any KV is read/written, and the per-token scores are checked
-   **finite** before the top-k (fp16 similarity underflow). The query-ring
+   **finite** before the top-k (fp16 similarity underflow — the fp16 key norm is
+   now accumulated in fp32 so a zero norm cannot NaN the cosine). The query-ring
    lifecycle is driven **explicitly** by the runner (free on `finished_req_ids`,
-   reset window on `preempted_req_ids`) rather than inferred from per-step batch
-   membership — a merely-unscheduled request keeps its window. A **preempted**
-   request does not arm compaction while it recomputes (`is_prefill_chunk`), and
-   if it crosses a boundary before its reset window refills it is left Full-KV
-   that step (safe: it has not dropped anything). Under tensor parallelism a
-   readiness handshake over a **collision-resistant ordered-plan fingerprint**
-   makes divergent ranks fail together instead of deadlocking, and the score
+   reset **and release the ring slot** on `preempted_req_ids`) rather than
+   inferred from per-step batch membership — a merely-unscheduled request keeps
+   its window, while a preempted one hands its fixed-address slot back to the
+   free list so a long preemption cannot leak ring slots. A **preempted**
+   request does not arm compaction while it recomputes (the scheduler skips
+   arming for any request whose `num_computed_tokens` is still catching up, on
+   top of the `is_prefill_chunk` gate), and if it crosses a boundary before its
+   reset window refills it is left Full-KV that step (safe: it has not dropped
+   anything). Under tensor parallelism a readiness handshake compares the
+   **minimum and maximum** of a collision-resistant ordered-plan fingerprint
+   across the TP group (not a sum, which an average collision could mask), so
+   divergent ranks fail together instead of deadlocking, and the score
    all-reduce fails closed if the TP group is missing/mismatched.
 
 8. **Long-sequence scoring is memory-guarded, not yet tiled.** The redundancy
