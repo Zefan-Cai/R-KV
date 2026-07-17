@@ -470,6 +470,10 @@ the principled default). **Use `buffer ≥ 64`** (`buffer=128` is lossless).
    - **cascade attention**: R-KV's per-layer hooks are wired only into the
      non-cascade FlashAttention path, so a cascade step would silently run
      Full-KV — it now raises instead;
+   - **multimodal prefix-LM** models (`model_config.is_mm_prefix_lm`): the
+     attention builder derives a bidirectional prefix mask from the *logical*
+     KV positions, which no longer match the cache after R-KV renumbers KV to
+     physical positions;
    - cross-layer KV cache **sharing** (two layers aliasing one storage would be
      relocated twice and corrupt the kept set);
    - dual-batch overlap / microbatching (`enable_dbo` / `ubatch_size > 1`):
@@ -477,6 +481,12 @@ the principled default). **Use `buffer ≥ 64`** (`buffer=128` is lossless).
      silently skipped for a microbatched request;
    - KV connectors / disaggregated prefill (`kv_transfer_config`): the connector
      transfers the original logical KV layout with no notion of dropped tokens;
+   - **reference scoring** on the serving path (`SCORE_MODE=reference`): the
+     runner accepts only `batched` scoring, because the reference scorer
+     materializes its `O(seq_len²)` matrix *inside* the forward, before
+     `compact_step`'s pre-forward memory admission — so a long sequence could
+     OOM before the guard runs. (Reference mode stays available to the CPU
+     parity tests, which drive the compactor directly, not the runner.)
    - any non-FlashAttention cache layer.
 
    `RKVConfig` also validates its own knobs (`budget > window`, `buffer ≥
@@ -486,10 +496,11 @@ the principled default). **Use `buffer ≥ 64`** (`buffer=128` is lossless).
    variants are rejected — their reference indexing collapses the wrong tensor
    dimension); malformed env vars raise (naming the variable) instead of
    silently reverting to a default. **Supported:** tensor
-   & data parallelism, PIECEWISE cudagraph, opt-in async scheduling
-   (`VLLM_V1_R_KV_ASYNC`); prefix caching is auto-disabled. Speculative
-   decoding, PP/DCP and hybrid models stay **roadmap** items (compaction after
-   acceptance; a cross-PP score reduction; per-group slot mappings).
+   & data parallelism, PIECEWISE cudagraph, batched scoring, opt-in async
+   scheduling (`VLLM_V1_R_KV_ASYNC`); prefix caching is auto-disabled.
+   Speculative decoding, PP/DCP and hybrid models stay **roadmap** items
+   (compaction after acceptance; a cross-PP score reduction; per-group slot
+   mappings).
 
 7. **Compaction is transactional.** Once a request reaches the threshold its
    compaction *must* complete this step — a request that has already dropped KV
@@ -513,10 +524,17 @@ the principled default). **Use `buffer ≥ 64`** (`buffer=128` is lossless).
    arming for any request whose `num_computed_tokens` is still catching up, on
    top of the `is_prefill_chunk` gate), and if it crosses a boundary before its
    reset window refills it is left Full-KV that step (safe: it has not dropped
-   anything). Under tensor parallelism a readiness handshake compares the
+   anything). The observation window advances **only on a genuine single-token
+   decode step**: a chunked-prefill or post-preemption recompute step writes its
+   chunk-tail query but does not advance the ring cursor/count, so a compaction
+   right after a resume is scored against real decode queries, never the
+   recompute tail. Under tensor parallelism a readiness handshake compares the
    **minimum and maximum** of a collision-resistant ordered-plan fingerprint
-   across the TP group (not a sum, which an average collision could mask), so
-   divergent ranks fail together instead of deadlocking, and the score
+   across the TP group (not a sum, which an average collision could mask); the
+   fingerprint folds each row's **request-id digest** (a stable cross-process
+   hash, not Python's salted `hash`) alongside its batch index and seq-len, so
+   ranks whose rows line up by length but hold different requests also fail
+   closed. Divergent ranks fail together instead of deadlocking, and the score
    all-reduce fails closed if the TP group is missing/mismatched.
 
 8. **Long-sequence scoring is memory-guarded, not yet tiled.** The redundancy

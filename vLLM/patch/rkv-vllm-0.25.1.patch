@@ -1,5 +1,5 @@
 diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
-index e8796a3..bfb1b80 100644
+index e8796a3..5f359b7 100644
 --- a/vllm/config/vllm.py
 +++ b/vllm/config/vllm.py
 @@ -517,6 +517,11 @@ class VllmConfig:
@@ -14,7 +14,7 @@ index e8796a3..bfb1b80 100644
          use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
          if use_v2_model_runner is not None:
              return use_v2_model_runner
-@@ -872,6 +877,146 @@ class VllmConfig:
+@@ -872,6 +877,157 @@ class VllmConfig:
          # To give each torch profile run a unique instance name.
          self.instance_id = f"{time.time_ns()}"
  
@@ -89,6 +89,17 @@ index e8796a3..bfb1b80 100644
 +                    "which is unreliable or unsupported for "
 +                    f"cache_dtype={self.cache_config.cache_dtype!r}. Use "
 +                    "--kv-cache-dtype auto."
++                )
++            if self.model_config is not None and getattr(
++                self.model_config, "is_mm_prefix_lm", False
++            ):
++                raise ValueError(
++                    "R-KV does not support multimodal prefix-LM attention "
++                    "(is_mm_prefix_lm): the bidirectional prefix mask the "
++                    "attention builder derives from the original *logical* KV "
++                    "positions no longer matches the cache after R-KV evicts and "
++                    "renumbers KV to physical positions, so the prefix tokens "
++                    "would attend over the wrong range."
 +                )
 +
 +        # R-KV (redundancy-aware KV compression) physically evicts and relocates
@@ -674,7 +685,7 @@ index 28d1a04..b0310b6 100644
  
              self.request_lora_mapping[empty_index] = self.request_lora_mapping[
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index e9b23f1..50c054a 100644
+index e9b23f1..04b90a7 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
 @@ -769,6 +769,49 @@ class GPUModelRunner(
@@ -974,7 +985,7 @@ index e9b23f1..50c054a 100644
  
          # Copy the tensors to the GPU.
          self._prepare_input_ids(
-@@ -2395,6 +2622,29 @@ class GPUModelRunner(
+@@ -2395,6 +2622,30 @@ class GPUModelRunner(
              rswa_prefix_lens=rswa_prefix_lens,
          )
  
@@ -998,13 +1009,14 @@ index e9b23f1..50c054a 100644
 +            # layer's record_query/observe_layer reuses it via rkv_qplan instead
 +            # of repeating the Python loop + host->device copy 28x.
 +            cm_base.rkv_qplan = self.rkv_compactor.plan_qwrite(
-+                cm_base.rkv_req_ids, self.device
++                cm_base.rkv_req_ids, self.device,
++                self.num_scheduled_tokens.np[:num_reqs],
 +            )
 +
          if self.dcp_world_size > 1:
              self.dcp_local_seq_lens.cpu[:num_reqs] = get_dcp_local_seq_lens(
                  self.optimistic_seq_lens_cpu[:num_reqs],
-@@ -4358,6 +4608,39 @@ class GPUModelRunner(
+@@ -4358,6 +4609,39 @@ class GPUModelRunner(
                  **model_kwargs,
              )
  
@@ -1044,7 +1056,7 @@ index e9b23f1..50c054a 100644
          with record_function_or_nullcontext("gpu_model_runner: postprocess"):
              if self.use_aux_hidden_state_outputs:
                  # True when EAGLE 3 is used.
-@@ -4682,6 +4965,11 @@ class GPUModelRunner(
+@@ -4682,6 +4966,11 @@ class GPUModelRunner(
                  routed_experts=None,
              )
  
@@ -1056,7 +1068,7 @@ index e9b23f1..50c054a 100644
          if not self.use_async_scheduling:
              if self.routed_experts_initialized:
                  # Sync path: D2H was issued in ``_bookkeeping_sync`` and
-@@ -7419,6 +7707,8 @@ class GPUModelRunner(
+@@ -7419,6 +7708,8 @@ class GPUModelRunner(
          self.may_add_encoder_only_layers_to_kv_cache_config()
          self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
          self.initialize_attn_backend(kv_cache_config, is_profiling=is_profiling)
@@ -1065,7 +1077,7 @@ index e9b23f1..50c054a 100644
          initialize_mamba_ssu_backend(
              self.vllm_config.mamba_config, self.kv_cache_config
          )
-@@ -7461,6 +7751,95 @@ class GPUModelRunner(
+@@ -7461,6 +7752,110 @@ class GPUModelRunner(
                  kv_transfer_group.register_kv_caches(kv_caches)
              kv_transfer_group.set_host_xfer_buffer_ops(copy_kv_blocks)
  
@@ -1127,6 +1139,21 @@ index e9b23f1..50c054a 100644
 +            raise ValueError(
 +                "R-KV requires head_size_v == head_size "
 +                f"({spec.head_size_v} != {spec.head_size})."
++            )
++        # Production (GPU) serving is batched-scoring only. The reference scorer
++        # gathers K and materializes the O(seq_len^2) similarity matrix *inside*
++        # each layer's forward -- before compact_step's pre-forward memory
++        # admission runs -- so a long sequence can OOM before the guard can skip
++        # it. Reference mode stays available for the CPU parity tests (which
++        # drive the compactor directly, not this runner).
++        if self.rkv_compactor.config.score_mode != "batched":
++            raise ValueError(
++                "R-KV serving supports only batched scoring "
++                f"(VLLM_V1_R_KV_SCORE_MODE="
++                f"{self.rkv_compactor.config.score_mode!r}); the reference "
++                "scorer materializes its score matrix before the pre-forward "
++                "memory guard and can OOM on long sequences. Use "
++                "score_mode=batched."
 +            )
 +        for attn_group in self.attn_groups[0]:
 +            name = attn_group.backend.get_name()

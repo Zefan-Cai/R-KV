@@ -1,7 +1,7 @@
 # R-KV Integration — Implementation Notes (vLLM v0.25.1)
 
 This document maps the R-KV runtime wiring onto vLLM v1. The patch is
-**small and additive** — 13 files, ~803 inserted lines — and every hook is gated
+**small and additive** — 13 files, ~830 inserted lines — and every hook is gated
 so that when `VLLM_V1_R_KV_BUDGET`/`BUFFER` are unset the code is fully inert.
 R-KV is wired into vLLM's **V1 GPU model runner**
 (`vllm/v1/worker/gpu_model_runner.py`); because v0.25.1 defaults to a newer V2
@@ -49,13 +49,13 @@ Scheduler.update_from_output
 | File | Change |
 | --- | --- |
 | `vllm/envs.py` | `VLLM_V1_R_KV_{BUDGET,BUFFER,WINDOW,KERNEL,MIX_LAMBDA,RETAIN_RATIO,SCORE_MODE,ASYNC,FREE_BLOCKS}` env vars (default 0/off). |
-| `vllm/config/vllm.py` | select the V1 runner; disable prefix caching; force PIECEWISE cudagraph; gate async scheduling; **fail closed** on unsupported combos (speculative decoding, PP>1, DCP>1, DBO/microbatching, KV connectors, quantized KV). |
+| `vllm/config/vllm.py` | select the V1 runner; disable prefix caching; force PIECEWISE cudagraph; gate async scheduling; **fail closed** on unsupported combos (speculative decoding, PP>1, DCP>1, DBO/microbatching, KV connectors, quantized KV, multimodal prefix-LM). |
 | `vllm/v1/request.py` | `Request.{num_dropped_tokens, should_compress}`. |
 | `vllm/v1/core/sched/output.py` | `CachedRequestData.{num_dropped_tokens, should_compress}` lists. |
 | `vllm/v1/core/sched/scheduler.py` | arm `should_compress` on buffer-boundary crossings (**never while a preempted request is recomputing**); carry the lists; accumulate `num_dropped_tokens`; reset it on preemption. |
 | `vllm/v1/outputs.py` | `ModelRunnerOutput.num_dropped_tokens_list`. |
 | `vllm/v1/worker/gpu_input_batch.py` | `CachedRequestState.num_dropped_tokens`; `InputBatch.{num_dropped_tokens_cpu, should_compress_list}` + `add_request`/`condense` handling. |
-| `vllm/v1/worker/gpu_model_runner.py` | `rkv_enabled`/`rkv_async` + buffers; `_rkv_prepare_physical` (with dropped/physical bounds invariants); `_rkv_validate_kv_cache` (exactly one `FullAttentionSpec` group of exact type on FlashAttention — rejects sliding-window / chunked / non-causal / `head_size_v` mismatch / MLA-or-sink subclasses); two-phase `compact_step` after the forward with a layer-identity (count + distinct-storage) check; feed `num_dropped_tokens_list` back into `ModelRunnerOutput`. |
+| `vllm/v1/worker/gpu_model_runner.py` | `rkv_enabled`/`rkv_async` + buffers; `_rkv_prepare_physical` (with dropped/physical bounds invariants); `_rkv_validate_kv_cache` (exactly one `FullAttentionSpec` group of exact type on FlashAttention — rejects sliding-window / chunked / non-causal / `head_size_v` mismatch / MLA-or-sink subclasses, and non-`batched` scoring on the serving path); two-phase `compact_step` after the forward with a layer-identity (count + distinct-storage) check; feed `num_dropped_tokens_list` back into `ModelRunnerOutput`. |
 | `vllm/v1/attention/backend.py` | optional R-KV fields on `CommonAttentionMetadata` (incl. `rkv_qplan`, `rkv_req_ids`). |
 | `vllm/v1/attention/backends/flash_attn.py` | R-KV fields on `FlashAttentionMetadata`; construct `RKVCompressor`; **reject ALiBi and cascade attention** when R-KV is on; call `record_query` + `observe_layer` after `flash_attn_varlen_func`. |
 | `vllm/v1/core/kv_cache_manager.py` | cap block reservation at `budget+buffer` and free R-KV-evicted blocks (`VLLM_V1_R_KV_FREE_BLOCKS`, **opt-in / default off**). |

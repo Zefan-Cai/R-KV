@@ -372,6 +372,29 @@ class TestCompactionSafety(unittest.TestCase):
         self.assertIn("a", comp._slot)
         self.assertEqual(comp._qcount["a"], 1)
 
+    def test_only_single_token_decode_advances_window(self):
+        """A multi-token step (chunked prefill, or post-preemption recompute of
+        the prompt+prior output) writes its chunk-tail query but must NOT advance
+        the observation-window count; only a genuine single-token decode does.
+        This keeps a post-preemption compaction from being scored against stale
+        recompute queries."""
+        comp = RKVCompressor(RKVConfig(budget=64, buffer_size=64, window_size=8))
+        dev = torch.device("cpu")
+        # Recompute-style chunk (4 tokens this step): column assigned, no advance.
+        comp.plan_qwrite(["a"], dev, num_scheduled=[4])
+        self.assertIn("a", comp._slot)
+        self.assertEqual(comp._qcount["a"], 0)
+        # A second chunk still does not advance the window.
+        comp.plan_qwrite(["a"], dev, num_scheduled=[2])
+        self.assertEqual(comp._qcount["a"], 0)
+        # Genuine single-token decode advances it.
+        comp.plan_qwrite(["a"], dev, num_scheduled=[1])
+        self.assertEqual(comp._qcount["a"], 1)
+        # Mixed batch: only the 1-token request advances.
+        comp.plan_qwrite(["a", "b"], dev, num_scheduled=[1, 3])
+        self.assertEqual(comp._qcount["a"], 2)
+        self.assertEqual(comp._qcount["b"], 0)
+
     def test_insufficient_window_skips_first_but_raises_after_drop(self):
         """A required request whose observation window hasn't refilled (e.g. it
         just resumed from preemption) is left Full-KV if it never dropped, but

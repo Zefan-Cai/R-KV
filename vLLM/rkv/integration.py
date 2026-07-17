@@ -344,14 +344,33 @@ class RKVCompressor:
             out.append((kc, vc, wq))
         return out
 
-    def _tp_readiness_check(self, tp, groups, seq_lens_cpu, device) -> None:
+    @staticmethod
+    def _stable_id_digest(rid, mod: int, mul: int) -> int:
+        """Deterministic cross-process hash of a request id.
+
+        Python's built-in ``hash`` is salted per process (``PYTHONHASHSEED``),
+        so it differs across TP ranks and cannot be compared. Fold the id's
+        UTF-8 bytes with the same polynomial used for the plan fingerprint so
+        every rank derives the identical digest for the same request id.
+        """
+        h = 1469598103934665603 % mod
+        for b in str(rid).encode("utf-8"):
+            h = (h * mul + b + 1) % mod
+        return h
+
+    def _tp_readiness_check(self, tp, groups, seq_lens_cpu, device, req_ids=None) -> None:
         """One fixed collective so divergent ranks fail together, not deadlock.
 
-        Each rank all-reduces a signature of its compaction plan (group count,
-        total requests, seq-len signature). If any rank disagrees the sum will
-        not equal ``local * world_size`` on every rank, so they all raise --
-        rather than some ranks entering the per-group score all-reduce while
-        others ``continue``/return and leave the collective hanging.
+        Each rank all-reduces a collision-resistant fingerprint of its full
+        ordered compaction plan -- per group (sorted by seq_len) the sorted
+        member batch indices *and* a stable digest of each member's request id.
+        Comparing via MIN and MAX (not a sum) means any disagreement makes
+        ``min != max`` on every rank, so they all raise -- rather than some
+        ranks entering the per-group score all-reduce while others
+        ``continue``/return and leave the collective hanging. Folding the
+        request id (not just the batch row + seq_len) means two ranks whose rows
+        line up by length but hold *different* requests also fail closed instead
+        of all-reducing mismatched scores.
         """
         if tp is None:
             return
@@ -371,6 +390,12 @@ class RKVCompressor:
             sig = (sig * MUL + int(sl) + 1) % MOD
             for m in sorted(groups[sl], key=lambda x: x[0]):
                 sig = (sig * MUL + int(m[0]) + 1) % MOD
+                # Fold a stable, cross-process digest of the request id so two
+                # ranks whose batch rows match by index + length but map to
+                # different requests still diverge (Python ``hash`` is salted
+                # per process, so it cannot be compared across ranks).
+                if req_ids is not None:
+                    sig = (sig * MUL + self._stable_id_digest(req_ids[m[0]], MOD, MUL)) % MOD
         lo = torch.tensor([sig], dtype=torch.int64, device=device)
         hi = lo.clone()
         # Compare via MIN and MAX, not sum == local*world_size: a sum check
@@ -418,7 +443,7 @@ class RKVCompressor:
                 self._free.append(s)
             self._qcount.pop(rid, None)
 
-    def plan_qwrite(self, req_ids, device) -> tuple | None:
+    def plan_qwrite(self, req_ids, device, num_scheduled=None) -> tuple | None:
         """Compute this step's shared ring write-plan (runner-owned, once/step).
 
         Called ONCE per decode step by the model runner on its compactor, then
@@ -427,6 +452,11 @@ class RKVCompressor:
         scatter index are the same for all 28 layers (only the query *data*
         differs), so doing this here removes the 28x-per-step Python slot loop
         and host->device index copy that :meth:`record_query` used to repeat.
+
+        ``num_scheduled`` is the per-request scheduled-token count this step;
+        only a genuine single-token decode step advances the observation window
+        (see the loop below). It is ``None`` only in the CPU unit tests, which
+        drive the ring one decode at a time.
 
         Returns ``(flat_index, slots, max_slots)`` -- or ``None`` when R-KV is
         disabled:
@@ -465,7 +495,17 @@ class RKVCompressor:
             cnt = self._qcount[rid]
             slots[i] = s
             curs[i] = cnt % window
-            self._qcount[rid] = cnt + 1
+            # Only a genuine single-token decode step advances the observation
+            # window. Multi-token steps -- the initial chunked prefill and, after
+            # a preemption, the recompute of the prompt + prior output -- still
+            # write their chunk-tail query into the current ring cell (harmless:
+            # the next genuine decode overwrites it), but must NOT advance the
+            # cursor/count, so the window stays "the last window_size real decode
+            # queries" and a post-preemption compaction is never scored against
+            # stale recompute queries. (num_scheduled is None only in the CPU
+            # unit tests, which drive the ring one decode at a time.)
+            if num_scheduled is None or num_scheduled[i] == 1:
+                self._qcount[rid] = cnt + 1
 
         # Ring width grows monotonically (doubling) with the concurrency peak,
         # so it is stable after the first prefill wave and identical for every
@@ -890,7 +930,7 @@ class RKVCompressor:
         # Fail together (not deadlock) if TP ranks disagree on the plan.
         dev = occupied_slot_mapping.device
         tp = self._tp_group()
-        self._tp_readiness_check(tp, groups, seq_lens_cpu, dev)
+        self._tp_readiness_check(tp, groups, seq_lens_cpu, dev, req_ids)
 
         src_slots: list[torch.Tensor] = []
         dst_slots: list[torch.Tensor] = []
