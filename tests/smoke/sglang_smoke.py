@@ -1,7 +1,9 @@
-"""SGLang (v0.5.14 port) R-KV smoke: Qwen2.5-0.5B-Instruct, FlashInfer
-backend, eager decode. R-KV requires radix cache / cuda graph / overlap off and
-page_size=1 (enforced at startup). Toggle with RKV_ON=0/1; BATCH=1/2.
-Needs a __main__ guard: sglang launches subprocesses via mp spawn."""
+"""SGLang (v0.5.14 port) R-KV smoke: Qwen2.5-0.5B-Instruct, FlashInfer backend.
+R-KV requires radix cache / overlap off and page_size=1 (enforced at startup),
+but CUDA-graph decode is now SUPPORTED and on by default — the port gathers the
+observation queries *inside* the captured decode graph — so this smoke runs the
+default graphed path. Toggle with RKV_ON=0/1; BATCH=1/2. Needs a __main__ guard:
+sglang launches subprocesses via mp spawn."""
 import os
 import sys
 import time
@@ -25,9 +27,10 @@ def main():
         dtype="bfloat16",
         attention_backend="flashinfer",
         mem_fraction_static=0.25,
-        disable_cuda_graph=True,
-        # R-KV frees KV slots mid-generation; these are required (enforced by
-        # the port's ServerArgs validation) and eager-only.
+        # R-KV frees KV slots mid-generation; these are required (enforced by the
+        # port's ServerArgs validation). CUDA-graph decode is now supported and on
+        # by default — the port gathers observation queries inside the captured
+        # graph, so we no longer disable it.
         disable_radix_cache=True,
         disable_overlap_schedule=True,
         page_size=1,
