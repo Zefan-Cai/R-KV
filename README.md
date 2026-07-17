@@ -14,12 +14,14 @@
 - Apply R-KV in GPT-OSS
 - Integrate R-KV with VeRL
 - ~~Harden R-KV benchmark coverage in vLLM, Nano-vLLM and SGLang~~ (GPU smokes in `tests/smoke/`, throughput bench + raw artifacts in `results/`, CPU tests in CI)
+- ~~Performance-harden the production serving ports (vLLM + SGLang)~~ (in-graph decode, async scheduling, batched cross-layer scoring, bounded-footprint eviction, TP + DP; memory-bound throughput win — see `vLLM/benchmark/` and `SGLang/benchmark/`)
 - Extend dataset to GPQA, liveCodeBench
 - Apply R-KV in QwQ
 - Expand Qwen-3 evaluation coverage
 
 ## 🔥 News
 
+- 🚀 [26/07/17] **vLLM R-KV port — major performance optimization, now on `main`.** The vLLM (v0.25.1) port is performance-hardened end-to-end: **in-graph PIECEWISE cudagraph decode** (no `--enforce-eager`), **async scheduling**, **batched cross-layer redundancy scoring**, and **bounded-footprint block freeing** (`FREE_BLOCKS`, returns evicted KV to the allocator). This turns the concurrency benefit into a real **memory-bound throughput win** — R-KV holds far more requests in flight than Full-KV as the KV pool shrinks (**+17 % to +32 %** tok/s at `gpu_mem 0.40–0.25`) while staying **lossless at `budget=512`** on GSM8K — plus **tensor + data parallelism** (DP scales **7.6× on 8× H100**; every TP rank evicts the identical set). Shipped as a clean *patch-not-fork* layout (`vLLM/scripts/apply_rkv.sh`). Resolves the long-standing community request in [#3](https://github.com/Zefan-Cai/R-KV/issues/3). See `vLLM/benchmark/` (`RESULTS.md`, `RESULTS_stress.md`, `RESULTS_tp.md`, `RESULTS_dp.md`) and `vLLM/docs/OPTIMIZATIONS.md`.
 - 🚀 [26/07/13] **SGLang R-KV port — faster, still lossless.** The decode-time port is now performance-hardened: a **fused Triton redundancy kernel**, **in-graph CUDA-graph decode**, **batched cross-layer scoring**, **two-phase compaction**, and **compression-aware admission** — plus **tensor + data parallelism** (DP scales **5.1×**, TP validated on 8× H100 via a cross-rank eviction-score all-reduce). Accuracy stays **lossless at `budget=512`** on GSM8K (on par with Full-KV) while throughput sits within a few percent of the fair Full-KV baseline. See `SGLang/benchmark/` (`RESULTS.md`, `RESULTS_dp.md`, `RESULTS_tp.md`) and `SGLang/docs/OPTIMIZATIONS.md`.
 - 🚀 [26/07/02] **The SGLang (v0.5.14) R-KV port is complete.** Decoding-time KV-cache compression with true physical eviction on the FlashInfer decode path, validated on Qwen2.5-Math-7B (H100): accuracy on par with the baseline (95% GSM8K), server-side batching (`eval.py --concurrency N`), and **plain data parallelism** (`DP=N ./launch_server.sh rkv 512`, throughput scales up to 5.2× on 8× H100). Code in `SGLang/rkv/` (`algo.py`, `integration.py`) plus the wiring patch `SGLang/patch/rkv-sglang-0.5.14.patch`; design/implementation notes in `SGLang/docs/DESIGN.md` and `SGLang/docs/IMPLEMENTATION.md`; benchmarks + reproduce steps in `SGLang/benchmark/` (`RESULTS_math7b.md`, `RESULTS_dp.md`, `RESULTS_a100_n100.md`).
 - ⚠️ [26/07/02] **If you computed GSM8K numbers with this repo before commit `e9f54c45`, please rerun them.** The shipped `data/gsm8k.jsonl` carried a stale `generation` field from an old experiment and `eval_math.py` preferred it over the fresh run's `output`, freezing GSM8K scores at ~40% regardless of method or budget (issues #26/#23). MATH and AIME24 were unaffected. All four serving integrations (vLLM, SGLang, Nano-vLLM, Mini-SGLang) plus the HuggingFace path are now GPU-validated on A100 with R-KV on/off — see `tests/smoke/` and `results/validation-2026-07-02-a100/`.
@@ -34,22 +36,28 @@ Use the following command to install the minimal required dependencies for the H
 pip install -r requirements.txt
 ```
 
-For the SGLang implementation, use the pinned environment note in `SGLang/requirements-rkv.txt`.
+For the **SGLang** port (v0.5.14), apply R-KV to a pinned SGLang checkout, then install the verified stack:
+
+```bash
+cd SGLang
+bash scripts/apply_rkv.sh                  # clone pinned SGLang + drop in rkv/ + apply the wiring patch
+pip install -e "sglang-src/python" --extra-index-url https://docs.sglang.ai/whl/cu129/
+pip install -r requirements-rkv.txt        --extra-index-url https://docs.sglang.ai/whl/cu129/
+```
+
+See [`SGLang/README.md`](SGLang/README.md) for the pinned environment and the step-by-step reproduce.
 
 For lightweight reference ports, see `Nano-vLLM/` and `Mini-SGLang/`. `Nano-vLLM/` is a ~1.2k-line paged-KV inference engine with R-KV plugged into the attention path (`enforce_eager=True` required); `Mini-SGLang/` carries the R-KV algorithm and a paged-cache integration helper under `python/minisgl/compress/`, with the attention-layer wiring documented in `Mini-SGLang/docs/RKV.md`.
 
-For the vLLM implementation, use the checked-in `vLLM/` tree as one source tree. The R-KV changes touch coupled vLLM V1 files such as the scheduler, engine core, platform helpers, tokenizer utilities, model definitions, and FlashAttention backend, so do not copy only a few Python files onto an arbitrary PyPI `vllm` wheel. A typical source install is:
+For the **vLLM** port (v0.25.1), R-KV ships as a small wiring **patch** over a pinned upstream checkout — the same *patch-not-fork* layout as SGLang — not a vendored tree:
 
 ```bash
 cd vLLM
-SETUPTOOLS_SCM_PRETEND_VERSION=0.8.5 pip install -e . --no-build-isolation
-
-export VLLM_USE_V1=1
-export VLLM_V1_R_KV_BUDGET=64
-export VLLM_V1_R_KV_BUFFER=8
+scripts/apply_rkv.sh            # clone pinned vLLM v0.25.1 + drop in rkv/ + apply the wiring patch
+pip install -e vllm-src         # source build (needs CUDA + a GPU)
 ```
 
-If you must reuse a prebuilt `vllm==0.8.5` wheel for the compiled CUDA extensions, overlay the entire checked-in `vLLM/vllm/` Python package, not individual files.
+Compression activates automatically once `budget` and `buffer` are both > 0 (env vars `VLLM_V1_R_KV_BUDGET` / `VLLM_V1_R_KV_BUFFER`); do **not** pass `--enforce-eager` — R-KV auto-selects PIECEWISE cudagraph. See [`vLLM/README.md`](vLLM/README.md) and [`vLLM/docs/REPRODUCE.md`](vLLM/docs/REPRODUCE.md).
 
 ### Install FlashAttention
 If you're using Hugging Face, we default to flash attention to speed up attention computation:
@@ -119,6 +127,30 @@ To evaluate benchmark results, simply run:
 bash examples/eval.sh
 ```
 The results will be saved in the `outputs` directory.
+
+### Serving with the vLLM or SGLang ports
+
+The `vLLM/` and `SGLang/` directories are decode-time drop-ins with one-command
+launchers and matching eval harnesses; full reproduce steps live in each port's
+`README.md` and `benchmark/`.
+
+**vLLM** (v0.25.1) — after `scripts/apply_rkv.sh` + `pip install -e vllm-src`, from `vLLM/benchmark/`:
+```bash
+./prepare_data.sh
+# offline GSM8K: accuracy + throughput + physical compaction count
+VLLM_V1_R_KV_BUDGET=256 VLLM_V1_R_KV_BUFFER=128 python eval.py --n 200 --label rkv_b256
+# ...or serve an OpenAI-compatible endpoint with R-KV on:
+./launch_server.sh rkv 256
+```
+
+**SGLang** (v0.5.14) — after `scripts/apply_rkv.sh`, from `SGLang/`:
+```bash
+bash benchmark/prepare_data.sh
+MODEL=/path/to/Qwen2.5-Math-7B-Instruct bash benchmark/launch_server.sh rkv 512   # serve with R-KV
+python3 benchmark/eval.py --n 20 --concurrency 8 --label rkv_b512                 # drive the served eval
+```
+
+Memory-pressure throughput (where R-KV wins): [`vLLM/benchmark/RESULTS_stress.md`](vLLM/benchmark/RESULTS_stress.md) and [`SGLang/benchmark/RESULTS_stress.md`](SGLang/benchmark/RESULTS_stress.md).
 
 ## Tests
 
