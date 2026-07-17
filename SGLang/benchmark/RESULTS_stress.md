@@ -4,9 +4,11 @@ Companion to the vLLM port's
 [`vLLM/benchmark/RESULTS_stress.md`](../../vLLM/benchmark/RESULTS_stress.md).
 Same question: on a **single GPU with a tight KV pool**, does R-KV's bounded
 footprint (`budget + buffer` tokens/request) let **more requests run
-concurrently**, and does that raise throughput? The answer here is **nuanced**:
-the concurrency benefit is real, but this reference SGLang R-KV does **not** turn
-it into a throughput win (the vLLM port does — see the contrast at the bottom).
+concurrently**, and does that raise throughput? **Yes on both** — once the
+rolling observation-query buffer is sized to the pool (the **auto-cap**, now the
+default; see below). Under memory pressure R-KV sustains **+38–78 % concurrency**
+and **+19–33 % throughput** over constrained Full-KV, and it now starts at memory
+fractions where it previously could not allocate a single slot.
 
 ## Setup
 
@@ -22,38 +24,46 @@ it into a throughput win (the vLLM port does — see the contrast at the bottom)
   from the server log, plus end-to-end throughput from `eval.py`, plus the KV
   pool (`max_total_num_tokens`) the server allocated.
 
-## The dominant effect — SGLang R-KV's static memory overhead
+## R-KV under memory pressure — the concurrency-into-throughput win
 
-At the **same** `--mem-fraction-static`, the R-KV server allocates a KV pool that
-is a **fixed ~126K tokens (~7 GB) smaller** than Full-KV's — its per-layer
-observation-query rings and redundancy-score workspace are static allocations:
+As `--mem-fraction-static` shrinks the KV pool, Full-KV's ~1724-token/request
+footprint forces its running batch down fast, while R-KV's **bounded** footprint
+(prompt + `buffer`, compacted to `budget + buffer` = 384 tokens) keeps far more
+requests resident. At `N=256` (concurrency 256):
 
-| `mem-frac` | Full-KV pool | Full-KV peak conc. | R-KV pool | R-KV peak conc. |
-| ---: | ---: | ---: | ---: | ---: |
-| 0.50 | 466K | 256 | 340K | 256 |
-| 0.40 | 319K | 185 | 193K | **232** |
-| 0.30 | 172K | 100 | 45K | **54** |
-| 0.25 | 99K | 57 | *fails to start* | — |
+| `mem-frac` | Full-KV pool / conc / tok/s | R-KV pool / conc / tok/s | R-KV vs Full-KV |
+| ---: | ---: | ---: | ---: |
+| 0.50 | 466K / 256 / 13005 | 421K / 256 / 12335 | −5 % (both cap at offered 256) |
+| 0.40 | 319K / 185 / 9298 | 284K / **256** / 12286 | **+32 %** |
+| 0.30 | 172K / 100 / 7487 | 148K / **178** / 8906 | **+19 %** |
+| 0.25 | 99K / 57 / 5346 | 80K / **96** / 7095 | **+33 %** |
 
-(N=256, concurrency 256.) Because the ~7 GB overhead is **fixed**, R-KV's pool
-shrinks *faster* than Full-KV's as memory tightens: at `0.40` R-KV still fits
-**more** (232 vs 185), but by `0.30` its pool has collapsed to 45K and it fits
-**fewer** (54 vs 100), and at `0.25` it can't allocate a single running slot
-(`AssertionError: max_running_request is zero`). But most of this overhead is the
-rolling-query buffer sized for 4096 requests — the next section shrinks it to the
-pool.
+At `mem-frac 0.50` both fit the offered 256 requests, so only R-KV's residual
+overhead shows (−5 %). As memory tightens, Full-KV's concurrency collapses
+(185 → 100 → 57) while R-KV's holds up (256 → 178 → 96), and that concurrency gap
+converts **directly** into throughput: **+19 % to +33 %**. R-KV's peak is
+pool-limited at `pool / (prompt + buffer)` ≈ `pool / 828` (178 ≈ 148K/828,
+96 ≈ 80K/828); Full-KV's at `pool / ~1724`.
 
-## Shrinking the overhead — size the rolling buffer to the pool (auto-cap)
+This is the regime KV compression is *for*, and it is exactly where the reference
+implementation used to **lose** — until the rolling buffer was sized to the pool.
 
-Most of that "~7 GB fixed" cost is **not inherently fixed**. It is the per-layer
-**rolling observation-query buffer** (`rolling_q`), sized
+## Sizing the rolling buffer to the pool (the auto-cap)
+
+The win above is **not** what this reference implementation did by default. Most
+of R-KV's static overhead is the per-layer **rolling observation-query buffer**
+(`rolling_q`), sized
 
     rolling_q = layers × window × (max_running_requests + 1) × q_heads × head_dim
 
 i.e. **one row per possibly-concurrent request**. SGLang's generic estimate sets
 `max_running_requests = 4096`, so for Qwen2.5-Math-7B (28 layers, window 8, 28
 heads, dim 128, bf16) `rolling_q` = **6.13 GiB** — yet at `mem-frac 0.50` the pool
-only holds ~411 concurrent requests, so **~90 % of those rows can never be used**.
+only serves ~411 concurrent requests, so **~90 % of those rows can never be used**.
+That fixed 6.13 GiB is carved out of the *same* GPU budget as the KV pool, so it
+shrank the pool hardest exactly when memory was tight: R-KV *lost* at `mem-frac
+0.30` (45K pool, 54 vs 100 concurrent) and could not allocate a single slot at
+`0.25` (`AssertionError: max_running_request is zero`).
 
 R-KV holds each request's KV at a bounded ceiling of `budget + buffer` tokens, so
 the pool serves at most `ceil(pool / (budget + buffer))` concurrent requests.
@@ -63,80 +73,88 @@ This is now the **default** when neither `--rkv-max-active-requests` nor
 
 | `mem-frac 0.50` config | `max_running` | `rolling_q` | R-KV KV pool | vs Full-KV (466K) |
 | --- | ---: | ---: | ---: | ---: |
-| default (before) | 4096 | 6.13 GiB | 340K | −27 % |
+| pre-auto-cap default | 4096 | 6.13 GiB | 340K | −27 % |
 | **auto-cap (now default)** | 1096 | 1.82 GiB | **421K** | **−9.8 %** |
 | `--rkv-max-active-requests 512` | 512 | 0.77 GiB | **440K** | **−5.5 %** |
 
-The auto-cap (1096) stays **well above** the ~500 requests the pool can actually
-admit, so no achievable concurrency is lost — the reclaimed ~80–100K tokens go
-straight back to the KV pool, nearly closing the gap to Full-KV. Lower
-`--rkv-max-active-requests` reclaims even more when you are memory-bound. (Numbers
-are from the server startup log's `R-KV decode: reserving …` line.)
+The auto-cap (1096) stays **well above** the ~500 requests the `mem-frac 0.50` pool
+can actually admit, so no achievable concurrency is lost — the reclaimed ~80K
+tokens go straight back to the KV pool. The same mechanism scales the buffer down
+as memory tightens (1.82 → 1.25 → 0.67 → 0.39 GiB across the four fractions above),
+which is what lets R-KV **start and win** at `0.30` / `0.25` where it used to
+collapse. Lower `--rkv-max-active-requests` reclaims even more when you are
+memory-bound. (Numbers are from the server startup log's `R-KV decode:
+reserving …` line.)
 
-## Isolating the concurrency benefit — healthy pool, heavier load
+## At an ample pool — the benefit needs saturating load
 
-To test the *per-request footprint* effect without the static-overhead confound,
-give both a healthy pool (`mem-frac 0.50`) and raise the offered load. R-KV's
-concurrency advantage holds, and its throughput **improves from a loss to a wash**
-as the load saturates:
+With memory *not* tight (`mem-frac 0.50`, so both fit the offered load until it
+saturates), R-KV's residual overhead has to be amortized before its concurrency
+edge pays off. Raising the offered load at this fraction:
 
 | Load (N = concurrency) | Full-KV conc. / tok/s | R-KV conc. / tok/s | R-KV vs Full-KV |
 | --- | ---: | ---: | ---: |
-| 512  | 270 / 12550 | 410 / 11654 | −7 % |
-| 1319 | 271 / 12442 | **411** / 12597 | **+1 %** (break-even) |
+| 512  | 270 / 12533 | 507 / 11387 | −9 % |
+| 1319 | 271 / 12431 | **508** / 13107 | **+5 %** |
 
-At the higher load R-KV sustains **+52 % concurrency** (411 vs 271) and **matches
-Full-KV throughput** (the −7 % at N=512 was partly the shorter run's ramp-down;
-saturated, it evens out). So on SGLang, R-KV's bounded footprint buys **more
-concurrency at no throughput cost** — but still not the throughput *gain* the
-vLLM port shows.
+At `N=512` the pool is not yet the binding constraint, so R-KV runs 507 vs 270 but
+its per-step compaction cost leaves it −9 %. At the saturating `N=1319` the
+concurrency edge (**+87 %**, 508 vs 271) converts to **+5 %** throughput. So even
+where memory is ample, R-KV pulls ahead once the load fully saturates the pool —
+and the auto-cap raised that plateau from 411 (pre-auto-cap) to **508** by growing
+the pool 340K → 421K.
 
-**Why it doesn't go further (a scheduler limit, not a client one).** R-KV's peak
-plateaus at **~411** at *both* N=512 and N=1319, even though its 340K pool could
-hold ~885 compacted requests (384 tokens each). SGLang admits each request
-reserving its *pre-compaction* footprint (~828 tokens: prompt + buffer), fills the
-pool at 411, and then **does not re-admit new prefills into the headroom that R-KV
-frees on compaction** — so 411×384 = 158K of the 340K pool sits used while ~180K
-is idle. Raising client concurrency to 2048 would only deepen the queue, not the
-running batch (`max_running_requests` was already 4096, not the binding limit).
+**The plateau is a scheduler choice, not a client limit.** R-KV's peak is
+`pool / (prompt + buffer)` ≈ `421K / 828` = 508, even though the pool could hold
+~1096 *compacted* requests (384 tokens each). SGLang admits each request reserving
+its *pre-compaction* footprint (prompt + buffer ≈ 828 tokens) and **does not
+re-admit new prefills into the headroom R-KV frees on compaction**, so 508×384 =
+195K of the 421K pool is used while ~226K sits idle. Closing that gap (re-admitting
+into freed space) is the remaining lever on SGLang.
 
 ## Findings
 
-1. **The concurrency benefit is real** — R-KV's `budget+buffer` cap lets the
-   server keep 411 vs 271 requests resident on a smaller pool (and 232 vs 185 at
-   `mem-frac 0.40`). The bounded-footprint mechanism holds on SGLang too.
-2. **…but at best it breaks even on throughput — no win.** Two SGLang-specific
-   costs eat the concurrency advantage: (a) the **~7 GB static R-KV buffers**
-   shrink the KV pool (so the benefit only shows where the pool is still healthy,
-   and it *fails* under tight memory), and (b) each compaction forces the
-   surrounding decode steps **out of the CUDA graph into eager mode**, a
-   per-compaction cost that grows with the ~1800 compactions this workload
-   triggers. Under saturating load R-KV *ties* Full-KV (+1 %) while running 52 %
-   more requests, but never pulls ahead.
-3. **The scheduler leaves R-KV's headroom on the table.** Because SGLang reserves
-   the pre-compaction footprint at admission and does not re-admit into the space
-   R-KV frees, R-KV plateaus at ~411 concurrent instead of the ~885 its pool could
-   hold — so the biggest lever (running far more short-KV requests) never engages.
-   bottleneck Full-KV, R-KV's static overhead has already crippled its own pool.
+1. **The concurrency benefit is real and large.** R-KV's `budget + buffer` cap
+   keeps far more requests resident on a smaller pool — **+38–78 %** under memory
+   pressure (256 vs 185 at `0.40`, 178 vs 100 at `0.30`, 96 vs 57 at `0.25`) and
+   **+87 %** (508 vs 271) at a saturated ample pool.
+2. **Under memory pressure it converts to a throughput win.** Where the KV pool is
+   the binding constraint — the regime compression targets — R-KV delivers
+   **+19 % to +33 %** end-to-end throughput. This is new: it depends entirely on
+   the auto-cap. With the old fixed 6.13 GiB rolling buffer, R-KV *lost* at
+   `mem-frac 0.30` and failed to start at `0.25`.
+3. **At an ample pool the win is smaller and load-dependent.** At `mem-frac 0.50`
+   R-KV needs the load to fully saturate the pool (−9 % at N=512, **+5 %** at
+   N=1319); with light load and slack memory its per-compaction cost (each
+   compaction forces the surrounding decode steps out of the CUDA graph into eager
+   mode) shows as a small overhead.
+4. **A scheduler limit still caps the upside.** SGLang reserves each request's
+   pre-compaction footprint (prompt + buffer ≈ 828 tokens) at admission and does
+   not re-admit into the space R-KV frees on compaction, so R-KV plateaus at
+   `pool / 828` (508 at `mem-frac 0.50`) instead of the `pool / 384` ≈ 1096 its
+   compacted footprint could support. Re-admitting into freed headroom is the
+   remaining lever.
 
 ## Contrast with the vLLM port
 
-The vLLM port **does** convert the concurrency benefit into throughput — at
-`gpu_mem 0.30` it sustains **256 vs 100** concurrent and **+32 %** throughput
-(see [`vLLM/benchmark/RESULTS_stress.md`](../../vLLM/benchmark/RESULTS_stress.md)).
-Two implementation differences explain the gap, and motivate the port:
+Both ports now realize the memory-bound throughput win — SGLang at **+19–33 %**
+here, the vLLM port at **+17–32 %** (256 vs 100 concurrent at `gpu_mem 0.30`; see
+[`vLLM/benchmark/RESULTS_stress.md`](../../vLLM/benchmark/RESULTS_stress.md)). Two
+implementation differences still separate them:
 
-- **Lean footprint.** vLLM R-KV uses a small fixed-address query ring and
-  memory-guarded *tiled* scoring (no pre-materialized `L×L` matrix), so its pool
-  is only **~7 % smaller** than Full-KV's (124K vs 134K at `gpu_mem 0.30`), vs
-  SGLang's ~7 GB fixed overhead. It never fails under tight memory.
-- **No extra eager cost.** vLLM auto-selects **PIECEWISE cudagraph**, which keeps
-  attention eager on *every* step anyway, so compaction adds no CUDA-graph
-  break — SGLang graphs attention and pays an eager window per compaction.
+- **Footprint.** vLLM R-KV uses a small fixed-address query ring and
+  memory-guarded *tiled* scoring (no pre-materialized `L×L` matrix), so its pool is
+  only **~7 % smaller** than Full-KV's at `gpu_mem 0.30`. SGLang's auto-cap closes
+  most of its gap (−9.8 % at `mem-frac 0.50`) but the per-layer buffers still cost
+  more than vLLM's ring.
+- **Cudagraph.** vLLM auto-selects **PIECEWISE cudagraph**, which keeps attention
+  eager on *every* step anyway, so compaction adds no CUDA-graph break; SGLang
+  graphs attention and pays a short eager window per compaction, which is what
+  keeps its ample-pool win modest (+5 % at N=1319) relative to vLLM.
 
-So the memory-bound throughput win R-KV promises is realized by the vLLM port;
-the reference SGLang R-KV delivers the concurrency but not the throughput in this
-regime.
+The reference SGLang R-KV, once its rolling buffer is sized to the pool, delivers
+the same qualitative win as the port — larger under memory pressure, smaller when
+memory is slack.
 
 ## Reproduce
 
@@ -144,15 +162,20 @@ regime.
 # Prereq: scripts/apply_rkv.sh, then activate the sglang env (see ../README.md).
 cd SGLang/benchmark
 
-# Full-KV constrained server + R-KV server, on two GPUs:
-CUDA_VISIBLE_DEVICES=0 MEM_FRAC=0.5 PORT=30010 ./launch_server.sh constrained 256 &
-CUDA_VISIBLE_DEVICES=1 MEM_FRAC=0.5 BUFFER=128 PORT=30011 ./launch_server.sh rkv 256 &
-# wait for both /health, then drive a saturating load of fixed-length (1024-token)
-# requests (N is capped by the 1319-prompt dataset -> use it as the concurrency):
-python eval.py --port 30010 --n 1319 --concurrency 1319 --max-tokens 1024 --ignore-eos &
-python eval.py --port 30011 --n 1319 --concurrency 1319 --max-tokens 1024 --ignore-eos &
-wait
+# Memory-pressure sweep: for each fraction, a constrained Full-KV server and an
+# R-KV server (auto-cap is the default — no extra flag needed), on two GPUs.
+for MEM in 0.50 0.40 0.30 0.25; do
+  CUDA_VISIBLE_DEVICES=0 MEM_FRAC=$MEM PORT=30010 ./launch_server.sh constrained 256 &
+  CUDA_VISIBLE_DEVICES=1 MEM_FRAC=$MEM BUFFER=128 PORT=30011 ./launch_server.sh rkv 256 &
+  # wait for both /health, then drive N=256 at concurrency 256:
+  python eval.py --port 30010 --n 256 --concurrency 256 --max-tokens 1024 --ignore-eos &  c0=$!
+  python eval.py --port 30011 --n 256 --concurrency 256 --max-tokens 1024 --ignore-eos &  c1=$!
+  wait $c0 $c1          # wait ONLY on the clients, not the never-exiting servers
+  pkill -f sglang.launch_server
+done
 ```
 
 Peak concurrency is the max `#running-req: N` in each server log; `eval.py` prints
-end-to-end throughput; the startup log prints `max_total_num_tokens` (the pool).
+end-to-end throughput; the startup log prints `max_total_num_tokens` (the pool) and,
+for R-KV, the `auto-capping max_running_requests …` line. Override the auto-cap with
+`--rkv-max-active-requests N` or `--max-running-requests N`.
