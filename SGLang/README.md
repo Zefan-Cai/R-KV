@@ -34,7 +34,7 @@ that compression cheap:
 - **Compression-aware admission** — the scheduler reserves each request's
   *constant* compressed footprint, admitting many more concurrent requests under
   a fixed KV pool.
-- **Tensor & data parallel** (validated on 8× H100) — DP scales to **5.1×**; TP is
+- **Tensor & data parallel** (validated on 8× H100) — DP scales to **7.8×**; TP is
   supported via a cross-rank eviction-score all-reduce, so every rank evicts
   identical tokens.
 
@@ -58,7 +58,7 @@ physical KV compactions, at **within ~3–14 % of the fair Full-KV throughput**.
 sweep and the production-vs-constrained baseline discussion.
 
 **Data parallel** (`DP=N ./benchmark/launch_server.sh rkv 256`, plain DP with
-`tp=1`) scales throughput up to **5.1× on 8× H100** with unchanged accuracy
+`tp=1`) scales throughput up to **7.8× on 8× H100** with unchanged accuracy
 ([`benchmark/RESULTS_dp.md`](benchmark/RESULTS_dp.md)). **Tensor parallel** is
 supported too — the per-token eviction score is all-reduced across the attention-TP
 group so every rank evicts identical tokens — scaling to **1.56× at tp=4**
@@ -260,7 +260,7 @@ server configuration (all set for you by `launch_server.sh`):
 | `batch = 1`, `tp = 1`, `dp = 1` | ✅ validated |
 | `batch > 1` (`tp = 1`, `dp = 1`) | ✅ validated (per-request triggering) |
 | Tensor parallel (`tp ≥ 2`) | ✅ supported — the per-token eviction score is all-reduced across the attention-TP group before top-k, so every rank evicts the identical tokens (see [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §11.2); validated on 8× H100 |
-| Data parallel — plain (`dp ≥ 2`, `tp = 1`) | ✅ validated — each replica runs its own R-KV over a disjoint request set; throughput scales up to 5.1× on 8× H100 (see [`benchmark/RESULTS_dp.md`](benchmark/RESULTS_dp.md)) |
+| Data parallel — plain (`dp ≥ 2`, `tp = 1`) | ✅ validated — each replica runs its own R-KV over a disjoint request set; throughput scales up to 7.8× on 8× H100 (see [`benchmark/RESULTS_dp.md`](benchmark/RESULTS_dp.md)) |
 | DP attention (`--enable-dp-attention`) | ❌ unsupported — padded `forward_batch` layout unverified against the R-KV hooks |
 | CUDA-graph decode | ✅ supported (in-graph observation + hybrid eager compaction steps) |
 
@@ -276,7 +276,7 @@ server configuration (all set for you by `launch_server.sh`):
   production-hardening (CUDA graph, fused kernel, two-phase compaction, admission).
 - [`docs/REPRODUCE.md`](docs/REPRODUCE.md) — exact, validated reproduction & usage.
 - [`benchmark/RESULTS.md`](benchmark/RESULTS.md) — Math-7B GSM8K `budget × buffer_size` sweep (two baselines).
-- [`benchmark/RESULTS_dp.md`](benchmark/RESULTS_dp.md) — data-parallel scaling (up to 5.1× on 8× H100).
+- [`benchmark/RESULTS_dp.md`](benchmark/RESULTS_dp.md) — data-parallel scaling (up to 7.8× on 8× H100).
 - [`benchmark/RESULTS_tp.md`](benchmark/RESULTS_tp.md) — tensor-parallel scaling & cross-rank correctness.
 - [`benchmark/RESULTS_a100_n100.md`](benchmark/RESULTS_a100_n100.md) — independent A100 n=100 rerun.
 

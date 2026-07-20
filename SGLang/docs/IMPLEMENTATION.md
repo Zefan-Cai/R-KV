@@ -314,7 +314,7 @@ serves a **disjoint set of requests** with its own KV pool; requests never cross
 ranks. So each rank runs its own R-KV over its own requests — unlike TP there is
 **no cross-rank eviction-agreement problem**. Verified on
 Qwen2.5-Math-7B (8× H100): every rank compresses independently, accuracy matches
-single-GPU, no leaks/crashes, and throughput scales up to **5.1× on 8 GPUs**. See
+single-GPU, no leaks/crashes, and throughput scales up to **7.8× on 8 GPUs**. See
 [`../benchmark/RESULTS_dp.md`](../benchmark/RESULTS_dp.md).
 
 **DP attention (`--enable-dp-attention`) — still unsupported.** This mode makes
