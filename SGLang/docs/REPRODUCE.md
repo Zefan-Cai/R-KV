@@ -123,7 +123,7 @@ The full, refreshed results (Qwen2.5-Math-7B, 8× H100, `bench_sglang.py` / GSM8
   baseline at `buffer ≥ 128`; the server logs
   `R-KV fused-redundancy gate: OK -> fused adopted`.
 - [`../benchmark/RESULTS_dp.md`](../benchmark/RESULTS_dp.md) — data-parallel
-  scaling up to **5.1× on 8× H100**, accuracy flat.
+  scaling up to **7.8× on 8× H100**, accuracy flat.
 - [`../benchmark/RESULTS_tp.md`](../benchmark/RESULTS_tp.md) — tensor-parallel
   scaling (**1.56× at tp=4**) and the cross-rank lockstep-compaction correctness
   proof (every rank evicts identical tokens).

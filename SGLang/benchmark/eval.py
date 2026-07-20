@@ -97,14 +97,20 @@ def main():
         action="store_true",
         help="generate exactly --max-tokens per request (stress test)",
     )
+    ap.add_argument(
+        "--offset",
+        type=int,
+        default=0,
+        help="skip the first OFFSET questions (used to shard across DP replicas)",
+    )
+    ap.add_argument("--out", default="")
     args = ap.parse_args()
 
     data = []
     with open(args.data) as f:
         for line in f:
             data.append(json.loads(line))
-            if len(data) >= args.n:
-                break
+    data = data[args.offset : args.offset + args.n]
 
     n = len(data)
 
@@ -145,6 +151,23 @@ def main():
         f"wall_time  : {dt:.1f}s\n"
         f"throughput : {tot_tokens/dt:.1f} tok/s (end-to-end, {mode})"
     )
+    if args.out:
+        with open(args.out, "w") as f:
+            json.dump(
+                {
+                    "label": args.label,
+                    "n": n,
+                    "offset": args.offset,
+                    "accuracy": round(correct / n, 4),
+                    "correct": correct,
+                    "wall_s": round(dt, 1),
+                    "out_tokens": tot_tokens,
+                    "decode_tok_s": round(tot_tokens / dt, 1),
+                    "avg_gen_len": round(tot_tokens / n, 1),
+                },
+                f,
+            )
+        print(f"-> {args.out}")
 
 
 if __name__ == "__main__":

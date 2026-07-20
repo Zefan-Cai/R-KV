@@ -229,7 +229,7 @@ adaptor), the lifecycle hook names (`on_request_begin/end`,
   **DONE**: wired in `batch_result_processor` beside `hisparse.request_finished`
   at the two real-finished points; verified per-request state clears to 0.)
   Plain data parallelism (`--dp-size N --tp-size 1`) is also validated — each
-  rank runs its own R-KV; throughput scales up to 5.1× on 8× H100 (see
+  rank runs its own R-KV; throughput scales up to 7.8× on 8× H100 (see
   benchmark/RESULTS_dp.md). Tensor parallelism is supported too (cross-rank
   score all-reduce, §11.2; see benchmark/RESULTS_tp.md); only dp-attention
   remains untested.
