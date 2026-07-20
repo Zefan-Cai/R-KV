@@ -75,18 +75,28 @@ cd SGLang/benchmark
 
 # 8 independent R-KV replicas (budget 256, buffer 128), 125 questions each,
 # one GPU per replica (offset shards the stream); each replica is its own server:
+srv=()
 for i in $(seq 0 7); do
   CUDA_VISIBLE_DEVICES=$i PORT=$((30000+i)) BUFFER=128 \
     MODEL=/data/model/Qwen2.5-Math-7B-Instruct ./launch_server.sh rkv 256 \
     >/tmp/sgl_dp8_srv$i.log 2>&1 &
+  srv+=($!)
 done
-# once all 8 answer /health_generate, drive each with its own 125-question slice:
+# wait until every replica answers /health_generate:
+for i in $(seq 0 7); do
+  until curl -sf http://127.0.0.1:$((30000+i))/health_generate >/dev/null; do sleep 2; done
+done
+# drive each replica with its own 125-question slice:
+ev=()
 for i in $(seq 0 7); do
   PYTHONPATH=../sglang-src/python python3 eval.py \
     --n 125 --offset $((i*125)) --port $((30000+i)) --concurrency 125 \
     --label dp8_r$i --out /tmp/sgl_dp8_r$i.json &
+  ev+=($!)
 done
-wait   # aggregate throughput = sum(out_tokens) / max(wall_s) across the 8 JSONs
+wait "${ev[@]}"   # wait for the 8 evals only -- a bare `wait` would hang on the servers
+kill "${srv[@]}"  # stop the replicas
+# aggregate throughput = sum(out_tokens) / max(wall_s) across the 8 JSONs
 
 # Or a single N-way data-parallel server (SGLang router) with identical knobs:
 DP=8 BUFFER=128 ./launch_server.sh rkv 256
