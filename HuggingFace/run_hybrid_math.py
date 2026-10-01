@@ -180,6 +180,9 @@ def main(args):
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     torch.set_num_threads(8)
+    # cuDNN SDPA rebuilds an execution plan for each growing decode length on
+    # Torch 2.11. Keep native Flash/Efficient/Math SDPA backends for all arms.
+    torch.backends.cuda.enable_cudnn_sdp(False)
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     tokenizer = AutoTokenizer.from_pretrained(args.model)
@@ -207,6 +210,12 @@ def main(args):
             ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
         "config": text_config.to_dict(),
         "loading_info": loading_info,
+        "sdpa_backends": {
+            "cudnn": torch.backends.cuda.cudnn_sdp_enabled(),
+            "flash": torch.backends.cuda.flash_sdp_enabled(),
+            "efficient": torch.backends.cuda.mem_efficient_sdp_enabled(),
+            "math": torch.backends.cuda.math_sdp_enabled(),
+        },
         "protocol": "BF16; native SDPA; batch=1; greedy; identical seeded sample IDs; "
                     f"full-attention-only decode compression every {args.compression_interval} steps; "
                     "native SWA/linear state and absolute positions preserved",

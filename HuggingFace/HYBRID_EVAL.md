@@ -8,6 +8,9 @@ Absolute RoPE positions and head-specific attention masks remain correct.
 
 This is a batch-one correctness and accuracy evaluation using BF16, native SDPA,
 greedy decoding, each checkpoint's chat template, and an explicit thinking flag.
+cuDNN SDPA is disabled for every arm to avoid per-length execution-plan building
+overhead observed on Torch 2.11; native Flash/Efficient/Math SDPA remain enabled.
+The selected backend flags are saved in metadata.
 It is not a production throughput benchmark. FullKV and compressed arms share
 the same prompts and seeded sample IDs. Prefill remains uncompressed. The default
 compression interval is 128 decoding steps; storage grows between compactions,
