@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import random
+import re
 import subprocess
 import sys
 import time
@@ -26,7 +27,8 @@ PROMPT = (
 
 
 def write_json(path, data):
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False,
+                               default=lambda value: sorted(value) if isinstance(value, set) else str(value)) + "\n")
 
 
 def final_response(output, model_type, thinking):
@@ -74,18 +76,20 @@ def score(records, dataset, model_type=None):
             record["output"], model_type or record.get("model_type") or record.get("model"),
             record.get("thinking", False),
         )
+        parse_text = re.sub(r"(?i)final\s+answer\s*(?::|is)\s*", "final answer is ", final)
+        parse_text = re.sub(r"boxed\s+\{", "boxed{", parse_text)
         # The generic parser can return numbers from incomplete \boxed{... or
         # ordinary reasoning. Require a complete box or explicit answer phrase.
         closed_box = True
-        if "boxed{" in final:
-            tail = final.rsplit("boxed{", 1)[1]
+        if "boxed{" in parse_text:
+            tail = parse_text.rsplit("boxed{", 1)[1]
             depth = 1
             for char in tail:
                 depth += (char == "{") - (char == "}")
                 if depth == 0:
                     break
             closed_box = depth == 0
-        pred = extract_answer(final, dataset, use_last_number=False) if complete and closed_box else ""
+        pred = extract_answer(parse_text, dataset, use_last_number=False) if complete and closed_box else ""
         samples.append({**record, "final_response": final, "reasoning_complete": complete,
                         "pred": [pred]})
     if dataset == "gsm8k":
@@ -175,7 +179,7 @@ def main(args):
         output_loading_info=True, **loading_kwargs,
     )
     if loading_info.get("missing_keys") or loading_info.get("mismatched_keys") or loading_info.get("error_msgs"):
-        raise RuntimeError("Incomplete text weights: " + json.dumps(loading_info))
+        raise RuntimeError("Incomplete text weights: " + str(loading_info))
     model.eval()
     metadata = {
         "args": vars(args), "torch": torch.__version__,

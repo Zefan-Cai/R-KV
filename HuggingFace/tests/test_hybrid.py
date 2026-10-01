@@ -2,6 +2,7 @@
 
 import sys
 import weakref
+import math
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -18,6 +19,7 @@ from transformers import (
 from transformers.cache_utils import DynamicCache
 
 from rkv.hybrid import HybridRKVAdapter, _LayerState
+from rkv.utils import compute_attention_scores
 
 
 torch.set_num_threads(1)
@@ -171,7 +173,8 @@ def test_selector_is_original_rkv_and_keeps_head_specific_positions():
     cache = DynamicCache(config=model.config)
     cache.update(key, value, 1)
     cache._rkv_hybrid_states = {1: state}
-    expected_key, expected_value = adapter.selector.update_kv(key, query, value)
+    scoring_query = query * adapter._modules[1].scaling * math.sqrt(query.shape[-1])
+    expected_key, expected_value = adapter.selector.update_kv(key, scoring_query, value)
     actual_key, actual_value = adapter._compress(cache, 1, state, key, value)
     assert torch.equal(actual_key, expected_key)
     assert torch.equal(actual_value, expected_value)
@@ -226,3 +229,34 @@ def test_native_cache_reset_reuses_absolute_length_state():
         output = model(torch.tensor([[7]]), past_key_values=cache, use_cache=True)
         assert cache.get_seq_length(1) == 5
     assert adapter._calls == {}
+
+
+@pytest.mark.parametrize("kind", ["qwen3_5", "gemma3", "gemma4"])
+def test_selector_attention_logits_match_native_model_scaling(kind, monkeypatch):
+    model = tiny_model(kind)
+    adapter = HybridRKVAdapter(
+        model, budget=6, window_size=2, kernel_size=3,
+        compression_interval=2,
+    )
+    torch.manual_seed(13)
+    key = torch.randn(1, 2, 12, 8)
+    value = torch.randn_like(key)
+    query = torch.randn(1, 4, 2, 8)
+    state = _LayerState(12, torch.arange(12).view(1, 1, 12).expand(1, 2, 12), query)
+    cache = DynamicCache(config=model.config)
+    cache.update(key, value, 1)
+    cache._rkv_hybrid_states = {1: state}
+    original_selector = adapter.selector.update_kv
+    captured = {}
+
+    def capture_scores(key_states, query_states, value_states):
+        captured["scores"] = compute_attention_scores(query_states, key_states)
+        return original_selector(key_states, query_states, value_states)
+
+    monkeypatch.setattr(adapter.selector, "update_kv", capture_scores)
+    adapter._compress(cache, 1, state, key, value)
+    grouped_query = query.reshape(1, 2, 2, 2, 8)
+    expected = (grouped_query @ key.unsqueeze(2).transpose(-1, -2))
+    expected = (expected * adapter._modules[1].scaling).max(dim=2).values
+    torch.testing.assert_close(captured["scores"], expected)
+    assert torch.equal(state.queries, query)

@@ -10,6 +10,7 @@ compressed every ``compression_interval`` single-token calls, as in the original
 
 import copy
 import inspect
+import math
 import weakref
 from dataclasses import dataclass
 
@@ -210,7 +211,12 @@ class HybridRKVAdapter:
         # enabling the selector's expensive CPU visualization recording.
         slots = torch.arange(before, device=key.device).view(1, 1, -1, 1)
         slots = slots.expand(*key.shape)
-        key, selected_slots = self.selector.update_kv(key, state.queries, slots)
+        # The original selector normalizes logits by sqrt(head_dim). Gemma uses
+        # a model-specific scalar (Gemma4 uses 1.0), so scale only the scoring
+        # queries to recover native attention logits; model queries stay intact.
+        scoring_scale = self._modules[index].scaling * math.sqrt(state.queries.shape[-1])
+        scoring_queries = state.queries * scoring_scale
+        key, selected_slots = self.selector.update_kv(key, scoring_queries, slots)
         selected = selected_slots[..., 0]
         value = value.gather(-2, selected.unsqueeze(-1).expand(*selected.shape, value.shape[-1]))
         state.positions = state.positions.gather(-1, selected)
