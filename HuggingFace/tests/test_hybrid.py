@@ -3,6 +3,7 @@
 import sys
 import weakref
 import math
+import inspect
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -23,6 +24,21 @@ from rkv.utils import compute_attention_scores
 
 
 torch.set_num_threads(1)
+
+
+@pytest.fixture(autouse=True)
+def native_qwen_cpu_fallback(monkeypatch):
+    # Transformers selects an installed FLA/causal-conv package at import time,
+    # even if a tiny test model uses CPU tensors. Exercise its original PyTorch
+    # linear-attention references on CPU; full attention and R-KV stay untouched.
+    from transformers.models.qwen3_5 import modeling_qwen3_5
+
+    for name in (
+        "torch_chunk_gated_delta_rule", "torch_recurrent_gated_delta_rule",
+        "causal_conv1d_fn", "causal_conv1d_update",
+    ):
+        function = getattr(modeling_qwen3_5, name)
+        monkeypatch.setattr(modeling_qwen3_5, name, inspect.unwrap(function))
 
 
 def tiny_model(kind, backend="sdpa"):
