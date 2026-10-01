@@ -59,9 +59,12 @@ def gsm8k_exact_match(prediction, reference):
     """Exact normalized numeric equality, without tolerance or percent scaling."""
     def number(text):
         text = text.replace(",", "").strip()
-        clock = re.fullmatch(r"(\d{1,2})(?::00)?\s*(?:AM|PM)", text, flags=re.IGNORECASE)
-        if clock and 1 <= int(clock.group(1)) <= 12:
-            text = clock.group(1)
+        clock = re.fullmatch(r"(\d{1,2})(:00)?\s*(AM|PM)?", text, flags=re.IGNORECASE)
+        if clock and (clock.group(2) or clock.group(3)):
+            hour = int(clock.group(1))
+            lower, upper = (1, 12) if clock.group(3) else (0, 23)
+            if lower <= hour <= upper:
+                text = clock.group(1)
         numeric = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
         latex_fraction = re.fullmatch(
             rf"([+-]?)\\(?:d|t)?frac\s*\{{\s*({numeric})\s*\}}\s*\{{\s*({numeric})\s*\}}", text
@@ -95,8 +98,8 @@ def score(records, dataset, model_type=None):
         )
         parse_text = re.sub(r"(?i)final\s+answer\s*(?::|is)\s*", "final answer is ", final)
         parse_text = re.sub(r"boxed\s+\{", "boxed{", parse_text)
-        # The generic parser can return numbers from incomplete \boxed{... or
-        # ordinary reasoning. Require a complete box or explicit answer phrase.
+        # An unfinished answer block must not fall through to last-number
+        # extraction. Completed responses can use the repository fallback below.
         closed_box = True
         if "boxed{" in parse_text:
             tail = parse_text.rsplit("boxed{", 1)[1]
@@ -106,9 +109,18 @@ def score(records, dataset, model_type=None):
                 if depth == 0:
                     break
             closed_box = depth == 0
-        pred = extract_answer(parse_text, dataset, use_last_number=False) if complete and closed_box else ""
+        format_pred = extract_answer(parse_text, dataset, use_last_number=False) if complete and closed_box else ""
+        pred = format_pred
+        fallback = complete and closed_box and not record.get("truncated", False) and not format_pred
+        if fallback:
+            # Standard repository extraction accepts an unboxed final number.
+            # Only completed responses can use it; an intermediate number from
+            # capped generation or an open reasoning/answer block receives no credit.
+            pred = extract_answer(parse_text, dataset, use_last_number=True)
         samples.append({**record, "final_response": final, "reasoning_complete": complete,
-                        "pred": [pred]})
+                        "format_pred": format_pred, "answer_format_compliant": bool(format_pred),
+                        "answer_extraction": "last_number_finished_response" if fallback and pred
+                        else "explicit_answer" if format_pred else "none", "pred": [pred]})
     if dataset == "gsm8k":
         for sample in samples:
             sample["gt_cot"], sample["gt"] = parse_ground_truth(sample, dataset)
@@ -122,10 +134,13 @@ def score(records, dataset, model_type=None):
     else:
         scored, result = evaluate(data_name=dataset, prompt_type="cot", samples=samples)
     result["scoring_protocol"] = (
-        "final channel; complete box or explicit answer phrase; no last-number fallback; "
+        "final channel; explicit answer or repository last-number extraction for completed, "
+        "non-truncated responses only; open reasoning/answer blocks rejected; "
         + ("exact numeric equality" if dataset == "gsm8k" else "repository symbolic equivalence")
     )
     result["unfinished_reasoning"] = sum(not s["reasoning_complete"] for s in samples)
+    result["answer_format_failures"] = sum(not s["answer_format_compliant"] for s in samples)
+    result["fallback_answers"] = sum(s["answer_extraction"] == "last_number_finished_response" for s in samples)
     return scored, result
 
 
