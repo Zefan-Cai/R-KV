@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 from decimal import Decimal, InvalidOperation
+from fractions import Fraction
 from pathlib import Path
 
 import torch
@@ -56,12 +57,28 @@ def final_response(output, model_type, thinking):
 
 def gsm8k_exact_match(prediction, reference):
     """Exact normalized numeric equality, without tolerance or percent scaling."""
+    def number(text):
+        text = text.replace(",", "").strip()
+        clock = re.fullmatch(r"(\d{1,2})(?::00)?\s*(?:AM|PM)", text, flags=re.IGNORECASE)
+        if clock and 1 <= int(clock.group(1)) <= 12:
+            text = clock.group(1)
+        numeric = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
+        latex_fraction = re.fullmatch(
+            rf"([+-]?)\\(?:d|t)?frac\s*\{{\s*({numeric})\s*\}}\s*\{{\s*({numeric})\s*\}}", text
+        )
+        fraction = re.fullmatch(rf"({numeric})\s*/\s*({numeric})", text)
+        if latex_fraction:
+            sign, numerator, denominator = latex_fraction.groups()
+            return (-1 if sign == "-" else 1) * Fraction(Decimal(numerator)) / Fraction(Decimal(denominator))
+        if fraction:
+            numerator, denominator = fraction.groups()
+            return Fraction(Decimal(numerator)) / Fraction(Decimal(denominator))
+        return Fraction(Decimal(text))
     try:
-        pred = Decimal(prediction.replace(",", "").strip())
-        gold = Decimal(reference.replace(",", "").strip())
-    except (InvalidOperation, ValueError):
+        pred, gold = number(prediction), number(reference)
+    except (InvalidOperation, ValueError, ZeroDivisionError, OverflowError):
         return False
-    return pred.is_finite() and gold.is_finite() and pred == gold
+    return pred == gold
 
 
 def score(records, dataset, model_type=None):

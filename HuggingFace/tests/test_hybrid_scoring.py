@@ -4,6 +4,7 @@ import ast
 import re
 import sys
 from decimal import Decimal, InvalidOperation
+from fractions import Fraction
 from pathlib import Path
 from types import ModuleType
 from unittest.mock import patch
@@ -16,7 +17,7 @@ helpers = ast.Module(
           and node.name in {"final_response", "gsm8k_exact_match", "score"}],
     type_ignores=[],
 )
-namespace = {"Decimal": Decimal, "InvalidOperation": InvalidOperation,
+namespace = {"Decimal": Decimal, "InvalidOperation": InvalidOperation, "Fraction": Fraction,
              "re": re, "sys": sys, "ROOT": source.parent}
 exec(compile(helpers, str(source), "exec"), namespace)
 final_response = namespace["final_response"]
@@ -57,6 +58,26 @@ def test_gsm8k_numeric_equality_rejects_percent_scaling_and_tolerance():
     assert not gsm8k_exact_match("1000.01", "1000")
     assert not gsm8k_exact_match("", "0")
     assert not gsm8k_exact_match("NaN", "NaN")
+
+
+def test_gsm8k_exact_rationals_accept_equivalent_numeric_forms():
+    assert gsm8k_exact_match(r"\frac{1}{2}", "0.5")
+    assert gsm8k_exact_match(r"-\dfrac{1}{2}", "-0.5")
+    assert gsm8k_exact_match(r"\tfrac{-1}{2}", "-0.5")
+    assert gsm8k_exact_match("12 / 3", "4.0")
+    assert not gsm8k_exact_match("1 / 3", "0.3333")
+    assert not gsm8k_exact_match(r"\frac{1}{0}", "0")
+    assert not gsm8k_exact_match("Infinity", "Infinity")
+
+
+def test_gsm8k_whole_hour_clock_form_is_exact_without_rounding():
+    assert gsm8k_exact_match("2:00 PM", "2")
+    assert gsm8k_exact_match("02:00pm", "2")
+    assert gsm8k_exact_match("2 PM", "2")
+    assert gsm8k_exact_match("12:00 AM", "12")
+    assert not gsm8k_exact_match("2:30 PM", "2")
+    assert not gsm8k_exact_match("14:00 PM", "2")
+    assert not gsm8k_exact_match("2:00 PM", "14")
 
 
 def test_primary_scoring_rejects_unfinished_reasoning_and_incomplete_answers():
