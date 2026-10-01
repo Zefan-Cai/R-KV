@@ -166,10 +166,17 @@ def main(args):
         tokenizer.pad_token_id = tokenizer.eos_token_id
     config = AutoConfig.from_pretrained(args.model)
     text_config = config.get_text_config()
-    model = AutoModelForCausalLM.from_pretrained(
+    loading_kwargs = {}
+    if text_config.model_type == "gemma4_text":
+        loading_kwargs["key_mapping"] = {r"^model\.language_model\.": "model."}
+    model, loading_info = AutoModelForCausalLM.from_pretrained(
         args.model, config=text_config, dtype=torch.bfloat16,
         device_map={"": "cuda:0"}, attn_implementation="sdpa",
-    ).eval()
+        output_loading_info=True, **loading_kwargs,
+    )
+    if loading_info.get("missing_keys") or loading_info.get("mismatched_keys") or loading_info.get("error_msgs"):
+        raise RuntimeError("Incomplete text weights: " + json.dumps(loading_info))
+    model.eval()
     metadata = {
         "args": vars(args), "torch": torch.__version__,
         "transformers": transformers.__version__,
@@ -178,6 +185,7 @@ def main(args):
         "repo_commit": subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
         "config": text_config.to_dict(),
+        "loading_info": loading_info,
         "protocol": "BF16; native SDPA; batch=1; greedy; identical seeded sample IDs; "
                     f"full-attention-only decode compression every {args.compression_interval} steps; "
                     "native SWA/linear state and absolute positions preserved",
