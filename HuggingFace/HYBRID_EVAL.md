@@ -27,12 +27,18 @@ CUDA_VISIBLE_DEVICES=6 python HuggingFace/run_hybrid_math.py \
 
 CUDA_VISIBLE_DEVICES=6 python HuggingFace/run_hybrid_math.py \
   --model /path/to/Qwen3.5-0.8B --output-dir /path/to/results/qwen35-08b \
-  --datasets gsm8k math --modes fullkv 128 512 1024 --sample-limit 100 --thinking
+  --data-dir /path/to/full-test-data --require-full-benchmarks \
+  --datasets gsm8k math --modes fullkv 128 512 1024 --sample-limit 0 --thinking
 ```
 
-The repository datasets contain the full GSM8K test (1,319 examples) and
-MATH-500 (500 examples). `--sample-limit 0` uses the entire dataset. Independent
-GPU workers can use `--shard-index i --num-shards N`; IDs remain stable. The output
+The repository's bundled `math.jsonl` is MATH-500, not the complete MATH test.
+For formal experiments, pass a directory containing `gsm8k.jsonl` (1,319 test
+examples) and `math.jsonl` (all 5,000 test examples across seven subjects).
+`--require-full-benchmarks` rejects incorrect counts and any sampling;
+`--sample-limit 0` is the default. Each shard saves the input hashes, full dataset
+counts, and expected IDs in `experiment.json`. Completed summaries certify that
+every expected ID is present. Independent GPU workers can use
+`--shard-index i --num-shards N`; IDs remain stable. The output
 token caps default to 8,192 (GSM8K) and 16,384 (MATH). Always report truncation
 and actual eviction counts beside accuracy. Small checkpoints can enter thinking
 loops; increase caps or run a separately labeled non-thinking arm if needed.
@@ -44,7 +50,14 @@ and disabled-adapter tokens and forces evictions with a small budget. CPU tests
 also compare exact native logits, untouched non-full cache storage, shared KV,
 head-specific masks, new-generation reset, and immediate cache release.
 
+Resume the identical command in the same output directory. Data, generation
+settings, code, and Torch/Transformers versions must match its manifest. Each
+finished example is flushed to disk; only an incomplete final JSONL line can be
+recovered, and its bytes are preserved separately. Duplicate or foreign IDs are
+rejected. Scoring replaces raw checkpoints atomically. Older diagnostic outputs
+without the manifest must remain in separate directories.
+
 ```bash
 cd HuggingFace
-python -m pytest tests/test_hybrid.py -q
+python -m pytest tests/test_hybrid.py tests/test_hybrid_scoring.py tests/test_hybrid_resume.py -q
 ```

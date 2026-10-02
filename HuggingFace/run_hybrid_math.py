@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import os
 import random
 import re
 import subprocess
@@ -28,8 +29,72 @@ PROMPT = (
 
 
 def write_json(path, data):
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False,
-                               default=lambda value: sorted(value) if isinstance(value, set) else str(value)) + "\n")
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(data, indent=2, ensure_ascii=False,
+                                    default=lambda value: sorted(value) if isinstance(value, set) else str(value)) + "\n")
+    temporary.replace(path)
+
+
+def load_dataset(path, dataset, sample_limit, seed, shard_index, num_shards, require_full):
+    records = []
+    for idx, line in enumerate(path.read_text().splitlines()):
+        record = json.loads(line)
+        question = record["question" if dataset == "gsm8k" else "problem"]
+        if not question or not record.get("answer" if dataset == "gsm8k" else "solution"):
+            raise ValueError(f"Missing question/reference in {dataset} example {idx}")
+        fingerprint = hashlib.sha256(json.dumps(record, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        records.append({**record, "idx": idx, "example_sha256": fingerprint})
+    if require_full and (sample_limit != 0 or len(records) != {"gsm8k": 1319, "math": 5000}[dataset]):
+        raise ValueError(f"Full {dataset} requires all test examples and sample-limit=0; found {len(records)}")
+    if require_full and len({r["example_sha256"] for r in records}) != len(records):
+        raise ValueError(f"Duplicate source records in full {dataset}")
+    if not records:
+        raise ValueError(f"Empty dataset: {path}")
+    total = len(records)
+    if sample_limit and sample_limit < total:
+        ids = sorted(random.Random(seed).sample(range(total), sample_limit))
+        records = [records[i] for i in ids]
+    records = records[shard_index::num_shards]
+    if not records:
+        raise ValueError("Empty dataset shard")
+    manifest = {"dataset": dataset, "data_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "dataset_count": total, "expected_shard_count": len(records),
+                "sample_ids": [r["idx"] for r in records], "full_benchmark": require_full}
+    return records, manifest
+
+
+def resume_outputs(path, records, protocol):
+    if not path.exists():
+        return []
+    expected = {record["idx"]: record for record in records}
+    outputs, seen = [], set()
+    raw = path.read_bytes()
+    lines = raw.splitlines(keepends=True)
+    valid_bytes = 0
+    for position, line in enumerate(lines):
+        try:
+            record = json.loads(line)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            if position != len(lines) - 1 or line.endswith(b"\n"):
+                raise ValueError(f"Corrupt completed record in {path}")
+            path.with_suffix(path.suffix + ".partial").write_bytes(line)
+            with path.open("r+b") as stream:
+                stream.truncate(valid_bytes)
+            break
+        idx = record["idx"]
+        if idx in seen or idx not in expected or record.get("example_sha256") != expected[idx]["example_sha256"]:
+            raise ValueError(f"Duplicate, foreign, or changed example {idx} in {path}")
+        required = {"output", "prefill_tokens", "output_tokens", "generation_seconds", "tokens_per_second",
+                    "peak_allocated_gib", "baseline_allocated_gib", "incremental_peak_gib", "truncated", "adapter_stats"}
+        if not required <= record.keys() or any(record.get(key) != value for key, value in protocol.items()):
+            raise ValueError(f"Wrong generation protocol or incomplete example {idx} in {path}")
+        outputs.append(record)
+        seen.add(idx)
+        valid_bytes += len(line)
+    if outputs and lines and not lines[-1].endswith(b"\n") and valid_bytes == len(raw):
+        with path.open("ab") as stream:
+            stream.write(b"\n")
+    return outputs
 
 
 def final_response(output, model_type, thinking):
@@ -132,7 +197,12 @@ def score(records, dataset, model_type=None):
         }
         scored = samples
     else:
-        scored, result = evaluate(data_name=dataset, prompt_type="cot", samples=samples)
+        try:
+            scored, result = evaluate(data_name=dataset, prompt_type="cot", samples=samples)
+        except SystemExit as error:
+            # The legacy grader calls exit() on worker failures. A zero exit
+            # must never certify that a full experiment completed successfully.
+            raise RuntimeError("MATH grading exited before completion") from error
     result["scoring_protocol"] = (
         "final channel; explicit answer or repository last-number extraction for completed, "
         "non-truncated responses only; open reasoning/answer blocks rejected; "
@@ -194,6 +264,20 @@ def validation(model, tokenizer, record, args):
 def main(args):
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    data = {dataset: load_dataset(Path(args.data_dir) / (dataset + ".jsonl"), dataset,
+                                 args.sample_limit, args.seed, args.shard_index, args.num_shards,
+                                 args.require_full_benchmarks) for dataset in args.datasets}
+    generation_args = {key: value for key, value in vars(args).items()
+                       if key not in {"output_dir", "data_dir", "validate", "validation_only"}}
+    experiment = {"args": generation_args, "datasets": {key: value[1] for key, value in data.items()},
+                  "repo_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
+                  "torch": torch.__version__, "transformers": transformers.__version__}
+    experiment_path = out_dir / "experiment.json"
+    if experiment_path.exists() and json.loads(experiment_path.read_text()) != experiment:
+        raise ValueError("Resume experiment differs in data, generation settings, code, or environment")
+    if not experiment_path.exists() and list(out_dir.glob("*_shard*.jsonl")):
+        raise ValueError("Existing outputs lack the verified resume manifest; use a fresh output directory")
+    write_json(experiment_path, experiment)
     torch.set_num_threads(8)
     # cuDNN SDPA rebuilds an execution plan for each growing decode length on
     # Torch 2.11. Keep native Flash/Efficient/Math SDPA backends for all arms.
@@ -220,7 +304,7 @@ def main(args):
         "args": vars(args), "torch": torch.__version__,
         "transformers": transformers.__version__,
         "gpu": torch.cuda.get_device_name(0),
-        "cuda_visible_devices": __import__("os").environ.get("CUDA_VISIBLE_DEVICES"),
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "repo_commit": subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
         "config": text_config.to_dict(),
@@ -235,8 +319,9 @@ def main(args):
                     f"full-attention-only decode compression every {args.compression_interval} steps; "
                     "native SWA/linear state and absolute positions preserved",
     }
+    metadata["datasets"] = experiment["datasets"]
     write_json(out_dir / "metadata.json", metadata)
-    gsm_record = json.loads((ROOT / "data/gsm8k.jsonl").read_text().splitlines()[0])
+    gsm_record = json.loads((Path(args.data_dir) / "gsm8k.jsonl").read_text().splitlines()[0])
     if args.validate or args.validation_only:
         validation(model, tokenizer, gsm_record, args)
     if args.validation_only:
@@ -254,22 +339,13 @@ def main(args):
             with torch.inference_mode():
                 model.generate(**warmup, max_new_tokens=8, do_sample=False)
             for dataset in args.datasets:
-                path = ROOT / "data" / (dataset + ".jsonl")
-                records = [{"idx": i, **json.loads(line)}
-                           for i, line in enumerate(path.read_text().splitlines())]
-                if args.sample_limit and args.sample_limit < len(records):
-                    ids = sorted(random.Random(args.seed).sample(
-                        range(len(records)), args.sample_limit))
-                    records = [records[i] for i in ids]
-                records = records[args.shard_index::args.num_shards]
+                records, data_manifest = data[dataset]
                 max_tokens = args.max_new_tokens or (8192 if dataset == "gsm8k" else 16384)
                 tag = "fullkv" if mode == "fullkv" else "rkv" + mode
                 suffix = f"_shard{args.shard_index}of{args.num_shards}"
                 output_path = out_dir / (dataset + "_" + tag + suffix + ".jsonl")
-                if output_path.exists():
-                    outputs = [json.loads(line) for line in output_path.read_text().splitlines()]
-                else:
-                    outputs = []
+                outputs = resume_outputs(output_path, records,
+                                         {"model": args.model, "mode": tag, "thinking": args.thinking})
                 completed = {r["idx"] for r in outputs}
                 with output_path.open("a") as stream:
                     for record in records:
@@ -309,16 +385,24 @@ def main(args):
                         }
                         stream.write(json.dumps(result, ensure_ascii=False) + "\n")
                         stream.flush()
+                        os.fsync(stream.fileno())
                         outputs.append(result)
                         del generated, generated_ids, inputs
                         print(json.dumps({"dataset": dataset, "mode": tag,
                                           "completed": len(outputs), "total": len(records),
                                           "idx": result["idx"], "tokens": result["output_tokens"],
                                           "seconds": round(wall, 2)}), flush=True)
+                if {r["idx"] for r in outputs} != set(data_manifest["sample_ids"]):
+                    raise AssertionError("Dataset shard is incomplete")
+                outputs.sort(key=lambda record: record["idx"])
                 scored, accuracy = score(outputs, dataset, text_config.model_type)
-                with output_path.open("w") as stream:
+                scored_path = output_path.with_suffix(".scored.tmp")
+                with scored_path.open("w") as stream:
                     for record in scored:
                         stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                scored_path.replace(output_path)
                 summary = {
                     "model": args.model, "dataset": dataset, "mode": tag,
                     "thinking": args.thinking, "score": accuracy,
@@ -327,7 +411,7 @@ def main(args):
                     "generation_seconds": sum(r["generation_seconds"] for r in outputs),
                     "peak_allocated_gib": max(r["peak_allocated_gib"] for r in outputs),
                     "incremental_peak_gib": max(r["incremental_peak_gib"] for r in outputs),
-                    "data_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                    **data_manifest, "complete": True,
                     "sample_ids": [r["idx"] for r in outputs],
                 }
                 summary["tokens_per_second"] = summary["output_tokens"] / summary["generation_seconds"]
@@ -346,7 +430,10 @@ if __name__ == "__main__":
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--datasets", nargs="+", choices=["gsm8k", "math"], default=["gsm8k", "math"])
     parser.add_argument("--modes", nargs="+", default=["fullkv", "128", "512", "1024"])
-    parser.add_argument("--sample-limit", type=int, default=100, help="0 = full benchmark")
+    parser.add_argument("--data-dir", default=str(ROOT / "data"))
+    parser.add_argument("--require-full-benchmarks", action="store_true",
+                        help="Reject any dataset other than GSM8K test 1319 / MATH test 5000")
+    parser.add_argument("--sample-limit", type=int, default=0, help="0 = all examples in each input file")
     parser.add_argument("--max-new-tokens", type=int)
     parser.add_argument("--thinking", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--seed", type=int, default=42)

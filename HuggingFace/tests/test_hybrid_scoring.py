@@ -9,6 +9,8 @@ from pathlib import Path
 from types import ModuleType
 from unittest.mock import patch
 
+import pytest
+
 
 source = Path(__file__).resolve().parents[1] / "run_hybrid_math.py"
 tree = ast.parse(source.read_text())
@@ -169,3 +171,16 @@ def test_finished_unboxed_math_uses_repository_fallback_but_capped_math_does_not
         scored, result = score(records, "math")
     assert [r["score"][0] for r in scored] == [True, False]
     assert result["fallback_answers"] == 1
+
+
+def test_legacy_grader_zero_exit_cannot_certify_completed_math():
+    parser = ModuleType("parser")
+    parser.extract_answer = lambda *args, **kwargs: "7"
+    parser.parse_ground_truth = lambda *args: ("", "7")
+    evaluate = ModuleType("evaluate")
+    def failed_grader(**kwargs):
+        raise SystemExit()
+    evaluate.evaluate = failed_grader
+    with patch.dict(sys.modules, {"parser": parser, "evaluate": evaluate}):
+        with pytest.raises(RuntimeError, match="MATH grading exited"):
+            score([{"output": "7", "thinking": False}], "math")
