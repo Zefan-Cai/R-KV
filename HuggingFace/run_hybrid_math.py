@@ -406,6 +406,7 @@ def main(args):
                 summary = {
                     "model": args.model, "dataset": dataset, "mode": tag,
                     "thinking": args.thinking, "score": accuracy,
+                    "num_correct": sum(bool(r["score"][0]) for r in scored),
                     "num_truncated": sum(r["truncated"] for r in outputs),
                     "output_tokens": sum(r["output_tokens"] for r in outputs),
                     "generation_seconds": sum(r["generation_seconds"] for r in outputs),
