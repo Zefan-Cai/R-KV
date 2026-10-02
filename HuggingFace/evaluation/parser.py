@@ -210,6 +210,11 @@ unit_texts.extend([t + "s" for t in unit_texts])
 
 def strip_string(string, skip_unit=False):
     string = str(string).strip()
+    # A standalone text label is the answer, not a unit suffix. Unwrap it
+    # before unit removal so full MATH answers such as east/Saturday survive.
+    text_label = re.fullmatch(r"\\(?:text|mbox)\{([A-Za-z][A-Za-z\s-]*)\}", string)
+    if text_label:
+        string = text_label.group(1).strip()
     # linebreaks
     string = string.replace("\n", "")
 
