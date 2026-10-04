@@ -15,6 +15,7 @@ class R1KV:
         retain_ratio=0.1,
         retain_direction="last",
         record_kept_token_indices=False,
+        buffer=128,
         **kwargs,
     ):
         assert budget - window_size > 0, "budget must be greater than window_size"
@@ -24,6 +25,10 @@ class R1KV:
         self.mix_lambda = mix_lambda
         self.retain_ratio = retain_ratio
         self.retain_direction = retain_direction
+        self.buffer = buffer
+
+        if self.buffer < self.window_size:
+            raise ValueError("buffer must be >= window_size")
 
         # for recording kept token indices
         self.record_kept_token_indices = record_kept_token_indices
@@ -33,6 +38,59 @@ class R1KV:
             self.kept_attention_scores = []
             self.kept_similarity_scores = []
             self.kept_final_scores = []
+
+    def score_kv(
+        self,
+        key_states,
+        query_states,
+    ):
+        """Return R-KV scores for past KV tokens without selecting or gathering."""
+        attn_weights = compute_attention_scores(query_states, key_states)
+        attn_weights_sum = (
+            nn.functional.softmax(
+                attn_weights[:, :, -self.window_size :, : -self.window_size],
+                dim=-1,
+                dtype=torch.float32,
+            )
+            .mean(dim=-2)
+            .to(query_states.dtype)
+        )
+        attn_cache = F.max_pool1d(
+            attn_weights_sum,
+            kernel_size=self.kernel_size,
+            padding=self.kernel_size // 2,
+            stride=1,
+        )
+        similarity_cos = cal_similarity(
+            key_states,
+            retain_ratio=self.retain_ratio,
+            retain_direction=self.retain_direction,
+        )[:, :, : -self.window_size]
+        return attn_cache * self.mix_lambda - similarity_cos * (
+            1 - self.mix_lambda
+        )
+
+    def should_compact(
+        self,
+        *,
+        resident_len,
+        num_decoded_tokens,
+        num_new_tokens,
+        is_genuine_decode,
+        query_window_tokens,
+    ):
+        if not is_genuine_decode or num_new_tokens <= 0:
+            return False
+        if query_window_tokens < self.window_size:
+            return False
+        if resident_len < self.budget + self.buffer:
+            return False
+        prev_decoded_tokens = max(0, num_decoded_tokens - num_new_tokens)
+        return (
+            num_decoded_tokens > 0
+            and num_decoded_tokens // self.buffer
+            > prev_decoded_tokens // self.buffer
+        )
 
     def update_kv(
         self,
