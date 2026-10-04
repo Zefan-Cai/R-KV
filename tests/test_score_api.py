@@ -49,6 +49,45 @@ def test_score_kv_matches_reference_formula():
     assert actual.shape == (2, 2, 20)
 
 
+def test_update_kv_selection_matches_score_kv():
+    torch.manual_seed(1)
+    window = 4
+    budget = 12
+    policy = R1KV(
+        budget=budget,
+        window_size=window,
+        kernel_size=7,
+        mix_lambda=0.1,
+        retain_ratio=0.1,
+        retain_direction="last",
+    )
+    keys = torch.randn(1, 2, 24, 8)
+    queries = torch.randn(1, 4, window, 8)
+    values = torch.randn_like(keys)
+
+    scores = policy.score_kv(keys, queries)
+    kept = scores.topk(budget - window, dim=-1).indices
+    gather_idx = kept.unsqueeze(-1).expand(-1, -1, -1, keys.shape[-1])
+    expected_keys = torch.cat(
+        [
+            keys[:, :, :-window, :].gather(2, gather_idx),
+            keys[:, :, -window:, :],
+        ],
+        dim=2,
+    )
+    expected_values = torch.cat(
+        [
+            values[:, :, :-window, :].gather(2, gather_idx),
+            values[:, :, -window:, :],
+        ],
+        dim=2,
+    )
+
+    actual_keys, actual_values = policy.update_kv(keys, queries, values)
+    assert torch.equal(actual_keys, expected_keys)
+    assert torch.equal(actual_values, expected_values)
+
+
 def test_should_compact_owns_serving_trigger_policy():
     policy = R1KV(
         budget=256,
