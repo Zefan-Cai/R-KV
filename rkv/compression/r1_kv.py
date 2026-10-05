@@ -1,3 +1,5 @@
+from collections.abc import Mapping
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -38,6 +40,94 @@ class R1KV:
             self.kept_attention_scores = []
             self.kept_similarity_scores = []
             self.kept_final_scores = []
+
+    @classmethod
+    def from_serving_config(cls, config):
+        """Build R-KV from the vLLM-port algorithm config."""
+        if not isinstance(config, Mapping):
+            raise ValueError("R-KV serving config must be a mapping")
+
+        allowed = {
+            "budget",
+            "buffer",
+            "window_size",
+            "kernel_size",
+            "mix_lambda",
+            "retain_ratio",
+            "retain_direction",
+        }
+        unknown = set(config) - allowed
+        if unknown:
+            raise ValueError(
+                f"Unsupported R-KV serving config keys: {sorted(unknown)}"
+            )
+
+        missing = {"budget", "buffer"} - set(config)
+        if missing:
+            raise ValueError(
+                f"Missing required R-KV serving config keys: {sorted(missing)}"
+            )
+
+        values = {
+            "window_size": 8,
+            "kernel_size": 7,
+            "mix_lambda": 0.1,
+            "retain_ratio": 0.1,
+            "retain_direction": "last",
+        }
+        values.update(config)
+
+        budget = values["budget"]
+        buffer = values["buffer"]
+        window_size = values["window_size"]
+        kernel_size = values["kernel_size"]
+        mix_lambda = values["mix_lambda"]
+        retain_ratio = values["retain_ratio"]
+        retain_direction = values["retain_direction"]
+
+        if not isinstance(budget, int) or isinstance(budget, bool) or budget <= 0:
+            raise ValueError("budget must be a positive integer")
+        if not isinstance(buffer, int) or isinstance(buffer, bool) or buffer <= 0:
+            raise ValueError("buffer must be a positive integer")
+        if (
+            not isinstance(window_size, int)
+            or isinstance(window_size, bool)
+            or window_size <= 0
+        ):
+            raise ValueError("window_size must be a positive integer")
+        if budget <= window_size:
+            raise ValueError("budget must be greater than window_size")
+        if buffer < window_size:
+            raise ValueError("buffer must be >= window_size")
+        if (
+            not isinstance(kernel_size, int)
+            or isinstance(kernel_size, bool)
+            or kernel_size <= 0
+            or kernel_size % 2 == 0
+        ):
+            raise ValueError("kernel_size must be a positive odd integer")
+        if not isinstance(mix_lambda, (int, float)) or isinstance(mix_lambda, bool):
+            raise ValueError("mix_lambda must be numeric")
+        if not 0.0 <= float(mix_lambda) <= 1.0:
+            raise ValueError("mix_lambda must be in [0, 1]")
+        if not isinstance(retain_ratio, (int, float)) or isinstance(
+            retain_ratio, bool
+        ):
+            raise ValueError("retain_ratio must be numeric")
+        if not 0.0 < float(retain_ratio) <= 1.0:
+            raise ValueError("retain_ratio must be in (0, 1]")
+        if retain_direction not in ("last", "first"):
+            raise ValueError("retain_direction must be 'last' or 'first'")
+
+        return cls(
+            budget=budget,
+            buffer=buffer,
+            window_size=window_size,
+            kernel_size=kernel_size,
+            mix_lambda=float(mix_lambda),
+            retain_ratio=float(retain_ratio),
+            retain_direction=retain_direction,
+        )
 
     def _compute_scores(
         self,
