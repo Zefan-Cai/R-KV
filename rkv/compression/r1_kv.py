@@ -80,6 +80,35 @@ class R1KV:
         final_score, _ = self._compute_scores(key_states, query_states)
         return final_score
 
+    def _crosses_buffer_boundary(
+        self,
+        *,
+        num_decoded_tokens,
+        num_new_tokens,
+    ):
+        prev_decoded_tokens = max(0, num_decoded_tokens - num_new_tokens)
+        return (
+            num_decoded_tokens > 0
+            and num_decoded_tokens // self.buffer
+            > prev_decoded_tokens // self.buffer
+        )
+
+    def should_observe_query(
+        self,
+        *,
+        num_decoded_tokens,
+        num_new_tokens,
+        is_genuine_decode,
+    ):
+        """Return whether this decode step belongs to the next scoring window."""
+        if not is_genuine_decode or num_new_tokens <= 0:
+            return False
+
+        prev_decoded_tokens = max(0, num_decoded_tokens - num_new_tokens)
+        next_boundary = (prev_decoded_tokens // self.buffer + 1) * self.buffer
+        observation_start = next_boundary - self.window_size + 1
+        return num_decoded_tokens >= observation_start
+
     def should_compact(
         self,
         *,
@@ -95,11 +124,9 @@ class R1KV:
             return False
         if resident_len < self.budget + self.buffer:
             return False
-        prev_decoded_tokens = max(0, num_decoded_tokens - num_new_tokens)
-        return (
-            num_decoded_tokens > 0
-            and num_decoded_tokens // self.buffer
-            > prev_decoded_tokens // self.buffer
+        return self._crosses_buffer_boundary(
+            num_decoded_tokens=num_decoded_tokens,
+            num_new_tokens=num_new_tokens,
         )
 
     def update_kv(

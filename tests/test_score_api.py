@@ -88,6 +88,41 @@ def test_update_kv_selection_matches_score_kv():
     assert torch.equal(actual_values, expected_values)
 
 
+def test_should_observe_query_tracks_only_the_scoring_window():
+    policy = R1KV(
+        budget=256,
+        window_size=8,
+        kernel_size=7,
+        mix_lambda=0.1,
+        retain_ratio=0.1,
+        retain_direction="last",
+        buffer=128,
+    )
+
+    for decoded in range(1, 121):
+        assert not policy.should_observe_query(
+            num_decoded_tokens=decoded,
+            num_new_tokens=1,
+            is_genuine_decode=True,
+        )
+    for decoded in range(121, 129):
+        assert policy.should_observe_query(
+            num_decoded_tokens=decoded,
+            num_new_tokens=1,
+            is_genuine_decode=True,
+        )
+    assert not policy.should_observe_query(
+        num_decoded_tokens=129,
+        num_new_tokens=1,
+        is_genuine_decode=True,
+    )
+    assert not policy.should_observe_query(
+        num_decoded_tokens=128,
+        num_new_tokens=1,
+        is_genuine_decode=False,
+    )
+
+
 def test_should_compact_owns_serving_trigger_policy():
     policy = R1KV(
         budget=256,
@@ -99,12 +134,12 @@ def test_should_compact_owns_serving_trigger_policy():
         buffer=128,
     )
 
-    common = dict(
-        resident_len=384,
-        num_new_tokens=1,
-        is_genuine_decode=True,
-        query_window_tokens=8,
-    )
+    common = {
+        "resident_len": 384,
+        "num_new_tokens": 1,
+        "is_genuine_decode": True,
+        "query_window_tokens": 8,
+    }
     assert not policy.should_compact(num_decoded_tokens=127, **common)
     assert policy.should_compact(num_decoded_tokens=128, **common)
     assert not policy.should_compact(
