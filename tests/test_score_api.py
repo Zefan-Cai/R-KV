@@ -89,6 +89,82 @@ def test_update_kv_selection_matches_score_kv():
     assert torch.equal(actual_values, expected_values)
 
 
+def test_select_kept_positions_owns_global_serving_selection():
+    torch.manual_seed(2)
+    window = 4
+    budget = 12
+    policy = R1KV(
+        budget=budget,
+        window_size=window,
+        kernel_size=7,
+        mix_lambda=0.1,
+        retain_ratio=0.1,
+        retain_direction="last",
+    )
+    layer_keys = [torch.randn(1, 2, 24, 8) for _ in range(3)]
+    layer_queries = [torch.randn(1, 4, window, 8) for _ in range(3)]
+
+    shared_scores = None
+    for keys, queries in zip(layer_keys, layer_queries, strict=True):
+        layer_score = policy.score_kv(keys, queries).mean(dim=1)[0]
+        shared_scores = (
+            layer_score if shared_scores is None else shared_scores + layer_score
+        )
+
+    assert shared_scores is not None
+    past_idx = shared_scores.topk(budget - window, dim=-1).indices
+    window_idx = torch.arange(24 - window, 24)
+    expected = torch.sort(torch.cat([past_idx, window_idx], dim=-1)).values
+
+    actual = policy.select_kept_positions(layer_keys, layer_queries)
+    assert torch.equal(actual, expected)
+    assert actual.shape == (budget,)
+    assert policy.observation_window_tokens == window
+
+
+def test_select_kept_positions_matches_legacy_retained_set_single_head():
+    torch.manual_seed(3)
+    policy = R1KV(
+        budget=12,
+        window_size=4,
+        kernel_size=7,
+        mix_lambda=0.1,
+        retain_ratio=0.1,
+        retain_direction="last",
+    )
+    keys = torch.randn(1, 1, 24, 8)
+    queries = torch.randn(1, 1, 4, 8)
+    values = torch.randn_like(keys)
+
+    legacy_keys, _ = policy.update_kv(keys, queries, values)
+    legacy_positions = []
+    for token in legacy_keys[0, 0]:
+        matches = torch.all(keys[0, 0] == token, dim=-1).nonzero().flatten()
+        assert matches.numel() == 1
+        legacy_positions.append(int(matches.item()))
+
+    expected = torch.tensor(sorted(legacy_positions))
+    actual = policy.select_kept_positions([keys], [queries])
+    assert torch.equal(actual, expected)
+
+
+def test_select_kept_positions_rejects_non_finite_scores():
+    policy = R1KV(
+        budget=12,
+        window_size=4,
+        kernel_size=7,
+        mix_lambda=0.1,
+        retain_ratio=0.1,
+        retain_direction="last",
+    )
+    keys = torch.randn(1, 2, 24, 8)
+    queries = torch.randn(1, 4, 4, 8)
+
+    policy.score_kv = lambda *_: torch.full((1, 2, 20), float("nan"))
+    with pytest.raises(RuntimeError, match="non-finite"):
+        policy.select_kept_positions([keys], [queries])
+
+
 def test_should_observe_query_tracks_only_the_scoring_window():
     policy = R1KV(
         budget=256,

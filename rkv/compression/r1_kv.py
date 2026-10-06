@@ -1,4 +1,4 @@
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 
 import torch
 import torch.nn as nn
@@ -169,6 +169,60 @@ class R1KV:
         """Return R-KV scores for past KV tokens without selecting or gathering."""
         final_score, _ = self._compute_scores(key_states, query_states)
         return final_score
+
+    @property
+    def observation_window_tokens(self) -> int:
+        """Number of recent decode queries required for one R-KV decision."""
+        return self.window_size
+
+    def select_kept_positions(
+        self,
+        layer_key_states: Sequence[torch.Tensor],
+        layer_query_states: Sequence[torch.Tensor],
+    ) -> torch.Tensor:
+        """Return one ordered retained-position set shared by all KV layers.
+
+        Serving uses one physical token layout across layers, so R-KV owns the
+        cross-head reduction, cross-layer reduction, and final retention policy.
+        Inputs are per-layer tensors for one request.
+        """
+        if not layer_key_states or len(layer_key_states) != len(layer_query_states):
+            raise ValueError("R-KV selection requires matching non-empty layer inputs")
+
+        shared_scores = None
+        kv_cache_len = None
+        for key_states, query_states in zip(
+            layer_key_states, layer_query_states, strict=True
+        ):
+            if key_states.ndim != 4 or query_states.ndim != 4:
+                raise ValueError("R-KV selection expects batched K/Q tensors")
+            if key_states.shape[0] != 1 or query_states.shape[0] != 1:
+                raise ValueError("R-KV serving selection expects one request")
+            if kv_cache_len is None:
+                kv_cache_len = int(key_states.shape[-2])
+            elif int(key_states.shape[-2]) != kv_cache_len:
+                raise ValueError("R-KV selection requires one shared KV length")
+
+            layer_score = self.score_kv(key_states, query_states).mean(dim=1)[0]
+            shared_scores = (
+                layer_score if shared_scores is None else shared_scores + layer_score
+            )
+
+        assert shared_scores is not None
+        assert kv_cache_len is not None
+        if not torch.isfinite(shared_scores).all():
+            raise RuntimeError("R-KV computed non-finite scores; refusing to select")
+
+        past_idx = shared_scores.topk(
+            self.budget - self.window_size,
+            dim=-1,
+        ).indices
+        window_idx = torch.arange(
+            kv_cache_len - self.window_size,
+            kv_cache_len,
+            device=past_idx.device,
+        )
+        return torch.sort(torch.cat([past_idx, window_idx], dim=-1)).values
 
     def _crosses_buffer_boundary(
         self,
