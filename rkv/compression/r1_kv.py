@@ -1,3 +1,5 @@
+from collections.abc import Mapping
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,6 +17,7 @@ class R1KV:
         retain_ratio=0.1,
         retain_direction="last",
         record_kept_token_indices=False,
+        buffer=128,
         **kwargs,
     ):
         assert budget - window_size > 0, "budget must be greater than window_size"
@@ -24,6 +27,10 @@ class R1KV:
         self.mix_lambda = mix_lambda
         self.retain_ratio = retain_ratio
         self.retain_direction = retain_direction
+        self.buffer = buffer
+
+        if self.buffer < self.window_size:
+            raise ValueError("buffer must be >= window_size")
 
         # for recording kept token indices
         self.record_kept_token_indices = record_kept_token_indices
@@ -33,6 +40,184 @@ class R1KV:
             self.kept_attention_scores = []
             self.kept_similarity_scores = []
             self.kept_final_scores = []
+
+    @classmethod
+    def from_serving_config(cls, config):
+        """Build R-KV from the vLLM-port algorithm config."""
+        if not isinstance(config, Mapping):
+            raise ValueError("R-KV serving config must be a mapping")
+
+        allowed = {
+            "budget",
+            "buffer",
+            "window_size",
+            "kernel_size",
+            "mix_lambda",
+            "retain_ratio",
+            "retain_direction",
+        }
+        unknown = set(config) - allowed
+        if unknown:
+            raise ValueError(
+                f"Unsupported R-KV serving config keys: {sorted(unknown)}"
+            )
+
+        missing = {"budget", "buffer"} - set(config)
+        if missing:
+            raise ValueError(
+                f"Missing required R-KV serving config keys: {sorted(missing)}"
+            )
+
+        values = {
+            "window_size": 8,
+            "kernel_size": 7,
+            "mix_lambda": 0.1,
+            "retain_ratio": 0.1,
+            "retain_direction": "last",
+        }
+        values.update(config)
+
+        budget = values["budget"]
+        buffer = values["buffer"]
+        window_size = values["window_size"]
+        kernel_size = values["kernel_size"]
+        mix_lambda = values["mix_lambda"]
+        retain_ratio = values["retain_ratio"]
+        retain_direction = values["retain_direction"]
+
+        if not isinstance(budget, int) or isinstance(budget, bool) or budget <= 0:
+            raise ValueError("budget must be a positive integer")
+        if not isinstance(buffer, int) or isinstance(buffer, bool) or buffer <= 0:
+            raise ValueError("buffer must be a positive integer")
+        if (
+            not isinstance(window_size, int)
+            or isinstance(window_size, bool)
+            or window_size <= 0
+        ):
+            raise ValueError("window_size must be a positive integer")
+        if budget <= window_size:
+            raise ValueError("budget must be greater than window_size")
+        if buffer < window_size:
+            raise ValueError("buffer must be >= window_size")
+        if (
+            not isinstance(kernel_size, int)
+            or isinstance(kernel_size, bool)
+            or kernel_size <= 0
+            or kernel_size % 2 == 0
+        ):
+            raise ValueError("kernel_size must be a positive odd integer")
+        if not isinstance(mix_lambda, (int, float)) or isinstance(mix_lambda, bool):
+            raise ValueError("mix_lambda must be numeric")
+        if not 0.0 <= float(mix_lambda) <= 1.0:
+            raise ValueError("mix_lambda must be in [0, 1]")
+        if not isinstance(retain_ratio, (int, float)) or isinstance(
+            retain_ratio, bool
+        ):
+            raise ValueError("retain_ratio must be numeric")
+        if not 0.0 < float(retain_ratio) <= 1.0:
+            raise ValueError("retain_ratio must be in (0, 1]")
+        if retain_direction not in ("last", "first"):
+            raise ValueError("retain_direction must be 'last' or 'first'")
+
+        return cls(
+            budget=budget,
+            buffer=buffer,
+            window_size=window_size,
+            kernel_size=kernel_size,
+            mix_lambda=float(mix_lambda),
+            retain_ratio=float(retain_ratio),
+            retain_direction=retain_direction,
+        )
+
+    def _compute_scores(
+        self,
+        key_states,
+        query_states,
+    ):
+        """Compute the shared R-KV score used by all public APIs."""
+        attn_weights = compute_attention_scores(query_states, key_states)
+        attn_weights_sum = (
+            nn.functional.softmax(
+                attn_weights[:, :, -self.window_size :, : -self.window_size],
+                dim=-1,
+                dtype=torch.float32,
+            )
+            .mean(dim=-2)
+            .to(query_states.dtype)
+        )
+        attn_cache = F.max_pool1d(
+            attn_weights_sum,
+            kernel_size=self.kernel_size,
+            padding=self.kernel_size // 2,
+            stride=1,
+        )
+        similarity_cos = cal_similarity(
+            key_states,
+            retain_ratio=self.retain_ratio,
+            retain_direction=self.retain_direction,
+        )[:, :, : -self.window_size]
+        final_score = attn_cache * self.mix_lambda - similarity_cos * (
+            1 - self.mix_lambda
+        )
+        return final_score, attn_weights
+
+    def score_kv(
+        self,
+        key_states,
+        query_states,
+    ):
+        """Return R-KV scores for past KV tokens without selecting or gathering."""
+        final_score, _ = self._compute_scores(key_states, query_states)
+        return final_score
+
+    def _crosses_buffer_boundary(
+        self,
+        *,
+        num_decoded_tokens,
+        num_new_tokens,
+    ):
+        prev_decoded_tokens = max(0, num_decoded_tokens - num_new_tokens)
+        return (
+            num_decoded_tokens > 0
+            and num_decoded_tokens // self.buffer
+            > prev_decoded_tokens // self.buffer
+        )
+
+    def should_observe_query(
+        self,
+        *,
+        num_decoded_tokens,
+        num_new_tokens,
+        is_genuine_decode,
+    ):
+        """Return whether this decode step belongs to the next scoring window."""
+        if not is_genuine_decode or num_new_tokens <= 0:
+            return False
+
+        prev_decoded_tokens = max(0, num_decoded_tokens - num_new_tokens)
+        next_boundary = (prev_decoded_tokens // self.buffer + 1) * self.buffer
+        observation_start = next_boundary - self.window_size + 1
+        return num_decoded_tokens >= observation_start
+
+    def should_compact(
+        self,
+        *,
+        resident_len,
+        num_decoded_tokens,
+        num_new_tokens,
+        is_genuine_decode,
+        query_window_tokens,
+    ):
+        if not is_genuine_decode or num_new_tokens <= 0:
+            return False
+        if query_window_tokens < self.window_size:
+            return False
+        if resident_len < self.budget + self.buffer:
+            return False
+        return self._crosses_buffer_boundary(
+            num_decoded_tokens=num_decoded_tokens,
+            num_new_tokens=num_new_tokens,
+        )
 
     def update_kv(
         self,
@@ -46,37 +231,9 @@ class R1KV:
         if kv_cache_len < self.budget:
             return key_states, value_states
         else:
-            attn_weights = compute_attention_scores(query_states, key_states)
-
-            attn_weights_sum = (
-                nn.functional.softmax(
-                    attn_weights[:, :, -self.window_size :, : -self.window_size],
-                    dim=-1,
-                    dtype=torch.float32,
-                )
-                .mean(dim=-2)
-                .to(query_states.dtype)
+            final_score, attn_weights = self._compute_scores(
+                key_states, query_states
             )
-            # TODO: Softmax then reduce head
-
-            attn_cache = F.max_pool1d(
-                attn_weights_sum,
-                kernel_size=self.kernel_size,
-                padding=self.kernel_size // 2,
-                stride=1,
-            )
-
-            similarity_cos = cal_similarity(
-                key_states,
-                retain_ratio=self.retain_ratio,
-                retain_direction=self.retain_direction,
-            )[:, :, : -self.window_size]
-
-            final_score = attn_cache * self.mix_lambda - similarity_cos * (
-                1 - self.mix_lambda
-            )
-
-            
 
             # shape: (bsz, num_kv_heads, budget - window_size)
             indices = final_score.topk(self.budget - self.window_size, dim=-1).indices
