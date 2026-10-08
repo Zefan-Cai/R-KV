@@ -1,12 +1,19 @@
 from collections.abc import Mapping
+from typing import Any, Literal, Protocol
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..selection import aggregate_scores
-from ..selection import select_kept_positions as select_positions
 from . import cal_similarity, compute_attention_scores
+
+
+
+class KVView(Protocol):
+    """LMCache-supplied read-only GPU KV view, without an LMCache import."""
+
+    def get_keys(self) -> torch.Tensor: ...
+    def get_values(self) -> torch.Tensor: ...
 
 
 class R1KV:
@@ -32,7 +39,7 @@ class R1KV:
         self.buffer = buffer
         if self.buffer < self.window_size:
             raise ValueError("buffer must be >= window_size")
-        self._serving_query_history = []
+        self._serving_query_history = {}
         self._serving_layer_order = None
 
         # for recording kept token indices
@@ -81,144 +88,95 @@ class R1KV:
         scores, _ = self._compute_scores(query_states, key_states)
         return scores
 
-    def observe_query(self, layer_queries: Mapping[str, torch.Tensor]):
-        """Retain one request step of Q state for all serving layers."""
-        if not layer_queries:
-            raise ValueError("R-KV observation requires non-empty layer inputs")
+    def should_observe_token_queries(
+        self, phase: Literal["prefill", "decode"], decoded_tokens_before_step: int
+    ) -> int:
+        """Return how many Q rows to capture from this forward."""
+        if phase == "prefill":
+            return self.window_size
+        if phase != "decode":
+            raise ValueError(f"Unknown token-drop phase: {phase!r}")
+        if decoded_tokens_before_step < 0:
+            raise ValueError("decoded_tokens_before_step must be nonnegative")
+        return int(
+            decoded_tokens_before_step % self.buffer
+            >= self.buffer - self.window_size
+        )
 
-        layer_order = tuple(layer_queries)
+    def observe_token_queries(
+        self, queries_by_layer: Mapping[str, torch.Tensor]
+    ) -> None:
+        """Store the most recent post-RoPE Q rows for this request."""
+        if not queries_by_layer:
+            raise ValueError("R-KV observation requires non-empty layer inputs")
+        layer_order = tuple(queries_by_layer)
         if self._serving_layer_order is None:
             self._serving_layer_order = layer_order
         elif layer_order != self._serving_layer_order:
-            raise RuntimeError("R-KV serving layer order changed across observations")
+            raise RuntimeError("R-KV serving layer order changed")
 
-        step_queries = []
-        for query in layer_queries.values():
+        for layer_name, query in queries_by_layer.items():
             if query.ndim != 3 or query.shape[0] == 0:
                 raise ValueError(
                     "R-KV observation expects [tokens, q_heads, head_dim]"
                 )
-            # LMCache forwards materialized request-local observations. Retain
-            # the frontier view and materialize the scoring window only when
-            # compaction actually needs it.
-            step_queries.append(query[-1])
+            recent = query[-self.window_size:].detach()
+            previous = self._serving_query_history.get(layer_name)
+            if previous is not None:
+                recent = torch.cat([previous, recent], dim=0)[-self.window_size:]
+            self._serving_query_history[layer_name] = recent
 
-        self._serving_query_history.append(tuple(step_queries))
-        if len(self._serving_query_history) > self.window_size:
-            del self._serving_query_history[:-self.window_size]
-
-    def _serving_query_windows(self):
-        if len(self._serving_query_history) < self.window_size:
-            raise RuntimeError("R-KV does not have a full query window")
-        assert self._serving_layer_order is not None
-
-        num_layers = len(self._serving_layer_order)
-        flat_queries = [
-            step[layer_idx]
-            for layer_idx in range(num_layers)
-            for step in self._serving_query_history
-        ]
-        stacked = torch.stack(flat_queries, dim=0)
+    def should_compact_kv(
+        self,
+        phase: Literal["prefill", "decode"],
+        resident_kv_tokens: int,
+        decoded_tokens_before_step: int,
+    ) -> bool:
+        """Run end-of-prefill or buffer-boundary R-KV compaction."""
+        if phase == "prefill":
+            return resident_kv_tokens > self.budget
+        if phase != "decode":
+            raise ValueError(f"Unknown token-drop phase: {phase!r}")
         return (
-            stacked.view(num_layers, self.window_size, *stacked.shape[1:])
-            .permute(0, 2, 1, 3)
-            .contiguous()
-            .unsqueeze(1)
+            decoded_tokens_before_step >= 0
+            and (decoded_tokens_before_step + 1) % self.buffer == 0
+            and resident_kv_tokens >= self.budget + self.buffer
         )
 
-    def _crosses_buffer_boundary(
-        self,
-        *,
-        num_decoded_tokens,
-        num_new_tokens,
-    ):
-        prev_decoded_tokens = max(0, num_decoded_tokens - num_new_tokens)
-        return (
-            num_decoded_tokens > 0
-            and num_decoded_tokens // self.buffer
-            > prev_decoded_tokens // self.buffer
-        )
+    def select_kept_token_positions(
+        self, kv_by_layer: Mapping[str, KVView]
+    ) -> Mapping[str, torch.Tensor]:
+        """Return independent, algorithm-ordered positions per layer/KV head."""
+        if not kv_by_layer:
+            raise ValueError("R-KV selection requires non-empty KV views")
+        layer_order = tuple(kv_by_layer)
+        if layer_order != self._serving_layer_order:
+            raise RuntimeError("R-KV serving layer order changed")
 
-    def should_observe_query(
-        self,
-        *,
-        num_decoded_tokens,
-        num_new_tokens,
-        is_genuine_decode,
-    ):
-        """Return whether this decode step belongs to the next scoring window."""
-        if not is_genuine_decode or num_new_tokens <= 0:
-            return False
+        retained = {}
+        for layer_name, view in kv_by_layer.items():
+            queries = self._serving_query_history.get(layer_name)
+            if queries is None or queries.shape[0] < self.window_size:
+                raise RuntimeError("R-KV does not have a full query window")
+            keys = view.get_keys()
+            if keys.ndim != 4 or keys.shape[0] != 1:
+                raise ValueError("R-KV KVView keys must be [1, kv_heads, tokens, dim]")
+            if keys.shape[2] < self.budget:
+                raise ValueError("R-KV cannot compact fewer than budget tokens")
+            query_window = queries[-self.window_size:].permute(1, 0, 2).unsqueeze(0)
+            scores = self.score_kv(query_window, keys)
+            kept_past = scores.topk(self.budget - self.window_size, dim=-1).indices
+            recent = torch.arange(
+                keys.shape[2] - self.window_size, keys.shape[2],
+                device=keys.device, dtype=torch.long,
+            ).view(1, 1, -1).expand(1, keys.shape[1], -1)
+            retained[layer_name] = torch.cat([kept_past, recent], dim=-1)[0]
 
-        prev_decoded_tokens = max(0, num_decoded_tokens - num_new_tokens)
-        next_boundary = (prev_decoded_tokens // self.buffer + 1) * self.buffer
-        observation_start = next_boundary - self.window_size + 1
-        return num_decoded_tokens >= observation_start
-
-    def should_compact(
-        self,
-        *,
-        resident_len,
-        num_decoded_tokens,
-        num_new_tokens,
-        is_genuine_decode,
-    ):
-        if not is_genuine_decode or num_new_tokens <= 0:
-            return False
-
-        # Serving asks before the model forward. Count the observation that
-        # this step will contribute without exposing R-KV readiness to callers.
-        observed_after_step = len(self._serving_query_history) + int(
-            self.should_observe_query(
-                num_decoded_tokens=num_decoded_tokens,
-                num_new_tokens=num_new_tokens,
-                is_genuine_decode=is_genuine_decode,
-            )
-        )
-        if observed_after_step < self.window_size:
-            return False
-        if resident_len < self.budget + self.buffer:
-            return False
-        return self._crosses_buffer_boundary(
-            num_decoded_tokens=num_decoded_tokens,
-            num_new_tokens=num_new_tokens,
-        )
-
-    def select_kept_positions(
-        self,
-        layer_key_states: Mapping[str, torch.Tensor],
-    ) -> torch.Tensor:
-        """Return one ordered retained-position set shared by all KV layers."""
-        if not layer_key_states:
-            raise ValueError("R-KV selection requires non-empty layer inputs")
-
-        layer_order = tuple(layer_key_states)
-        if self._serving_layer_order is None:
-            self._serving_layer_order = layer_order
-        elif layer_order != self._serving_layer_order:
-            raise RuntimeError("R-KV serving layer order changed across compactions")
-
-        query_windows = self._serving_query_windows()
-        layer_scores = []
-        kv_cache_len = None
-        for layer_idx, key_states in enumerate(layer_key_states.values()):
-            if key_states.ndim != 4 or key_states.shape[0] != 1:
-                raise ValueError("R-KV serving selection expects one batched request")
-            if kv_cache_len is None:
-                kv_cache_len = int(key_states.shape[-2])
-            elif int(key_states.shape[-2]) != kv_cache_len:
-                raise ValueError("R-KV selection requires one shared KV length")
-            layer_scores.append(self.score_kv(query_windows[layer_idx], key_states))
-
-        shared_scores = aggregate_scores(layer_scores)
-        if not torch.isfinite(shared_scores).all():
-            raise RuntimeError("R-KV computed non-finite scores; refusing to select")
-        return select_positions(
-            shared_scores, self.budget - self.window_size, self.window_size
-        )
+        self._serving_query_history.clear()
+        return retained
 
     @classmethod
-    def from_serving_config(cls, config):
+    def from_serving_config(cls, config: Mapping[str, Any]) -> "R1KV":
         """Build R-KV from the vLLM-port algorithm config."""
         if not isinstance(config, Mapping):
             raise ValueError("R-KV serving config must be a mapping")
@@ -238,13 +196,9 @@ class R1KV:
                 f"Unsupported R-KV serving config keys: {sorted(unknown)}"
             )
 
-        missing = {"budget", "buffer"} - set(config)
-        if missing:
-            raise ValueError(
-                f"Missing required R-KV serving config keys: {sorted(missing)}"
-            )
-
         values = {
+            "budget": 128,
+            "buffer": 128,
             "window_size": 8,
             "kernel_size": 7,
             "mix_lambda": 0.1,
@@ -292,8 +246,8 @@ class R1KV:
             raise ValueError("retain_ratio must be numeric")
         if not 0.0 < float(retain_ratio) <= 1.0:
             raise ValueError("retain_ratio must be in (0, 1]")
-        if retain_direction not in ("last", "first"):
-            raise ValueError("retain_direction must be 'last' or 'first'")
+        if retain_direction not in ("last", "first", "last_percent", "first_percent"):
+            raise ValueError("Unsupported retain_direction")
 
         return cls(
             budget=budget,

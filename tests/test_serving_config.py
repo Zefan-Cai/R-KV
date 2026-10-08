@@ -46,8 +46,7 @@ def test_serving_config_overrides_match_vllm_port_algorithm_knobs():
     ("config", "match"),
     [
         ([], "mapping"),
-        ({"budget": 32}, "Missing required"),
-        ({"buffer": 16}, "Missing required"),
+        ({"budget": 32, "buffer": 16, "unused": 0}, "Unsupported"),
         ({"budget": 0, "buffer": 16}, "positive integer"),
         ({"budget": True, "buffer": 16}, "positive integer"),
         ({"budget": 8, "buffer": 16}, "greater than window_size"),
@@ -66,3 +65,10 @@ def test_serving_config_overrides_match_vllm_port_algorithm_knobs():
 def test_serving_config_validation(config, match):
     with pytest.raises(ValueError, match=match):
         R1KV.from_serving_config(config)
+
+
+def test_empty_serving_config_uses_rkv_owned_defaults():
+    policy = R1KV.from_serving_config({})
+    assert policy.budget == 128
+    assert policy.buffer == 128
+    assert policy.window_size == 8
