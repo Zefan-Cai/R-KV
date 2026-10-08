@@ -34,6 +34,43 @@ class R1KV:
             self.kept_similarity_scores = []
             self.kept_final_scores = []
 
+    def _compute_scores(self, query_states, key_states):
+        attn_weights = compute_attention_scores(query_states, key_states)
+
+        attn_weights_sum = (
+            nn.functional.softmax(
+                attn_weights[:, :, -self.window_size :, : -self.window_size],
+                dim=-1,
+                dtype=torch.float32,
+            )
+            .mean(dim=-2)
+            .to(query_states.dtype)
+        )
+        # TODO: Softmax then reduce head
+
+        attn_cache = F.max_pool1d(
+            attn_weights_sum,
+            kernel_size=self.kernel_size,
+            padding=self.kernel_size // 2,
+            stride=1,
+        )
+
+        similarity_cos = cal_similarity(
+            key_states,
+            retain_ratio=self.retain_ratio,
+            retain_direction=self.retain_direction,
+        )[:, :, : -self.window_size]
+
+        final_score = attn_cache * self.mix_lambda - similarity_cos * (
+            1 - self.mix_lambda
+        )
+        return final_score, attn_weights
+
+    def score_kv(self, query_states, key_states):
+        """Compute per-KV-head R-KV scores for tokens preceding the observation window, using Q and K without modifying either input."""
+        scores, _ = self._compute_scores(query_states, key_states)
+        return scores
+
     def update_kv(
         self,
         key_states,
@@ -46,37 +83,9 @@ class R1KV:
         if kv_cache_len < self.budget:
             return key_states, value_states
         else:
-            attn_weights = compute_attention_scores(query_states, key_states)
-
-            attn_weights_sum = (
-                nn.functional.softmax(
-                    attn_weights[:, :, -self.window_size :, : -self.window_size],
-                    dim=-1,
-                    dtype=torch.float32,
-                )
-                .mean(dim=-2)
-                .to(query_states.dtype)
+            final_score, attn_weights = self._compute_scores(
+                query_states, key_states
             )
-            # TODO: Softmax then reduce head
-
-            attn_cache = F.max_pool1d(
-                attn_weights_sum,
-                kernel_size=self.kernel_size,
-                padding=self.kernel_size // 2,
-                stride=1,
-            )
-
-            similarity_cos = cal_similarity(
-                key_states,
-                retain_ratio=self.retain_ratio,
-                retain_direction=self.retain_direction,
-            )[:, :, : -self.window_size]
-
-            final_score = attn_cache * self.mix_lambda - similarity_cos * (
-                1 - self.mix_lambda
-            )
-
-            
 
             # shape: (bsz, num_kv_heads, budget - window_size)
             indices = final_score.topk(self.budget - self.window_size, dim=-1).indices
