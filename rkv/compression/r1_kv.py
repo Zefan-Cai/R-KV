@@ -1,3 +1,5 @@
+from collections.abc import Mapping
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,6 +17,7 @@ class R1KV:
         retain_ratio=0.1,
         retain_direction="last",
         record_kept_token_indices=False,
+        buffer=128,
         **kwargs,
     ):
         assert budget - window_size > 0, "budget must be greater than window_size"
@@ -24,6 +27,11 @@ class R1KV:
         self.mix_lambda = mix_lambda
         self.retain_ratio = retain_ratio
         self.retain_direction = retain_direction
+        self.buffer = buffer
+        if self.buffer < self.window_size:
+            raise ValueError("buffer must be >= window_size")
+        self._serving_query_history = []
+        self._serving_layer_order = None
 
         # for recording kept token indices
         self.record_kept_token_indices = record_kept_token_indices
@@ -33,6 +41,109 @@ class R1KV:
             self.kept_attention_scores = []
             self.kept_similarity_scores = []
             self.kept_final_scores = []
+
+    def observe_query(self, layer_queries: Mapping[str, torch.Tensor]):
+        """Retain one request step of Q state for all serving layers."""
+        if not layer_queries:
+            raise ValueError("R-KV observation requires non-empty layer inputs")
+
+        layer_order = tuple(layer_queries)
+        if self._serving_layer_order is None:
+            self._serving_layer_order = layer_order
+        elif layer_order != self._serving_layer_order:
+            raise RuntimeError("R-KV serving layer order changed across observations")
+
+        step_queries = []
+        for query in layer_queries.values():
+            if query.ndim != 3 or query.shape[0] == 0:
+                raise ValueError(
+                    "R-KV observation expects [tokens, q_heads, head_dim]"
+                )
+            # LMCache forwards materialized request-local observations. Retain
+            # the frontier view and materialize the scoring window only when
+            # compaction actually needs it.
+            step_queries.append(query[-1])
+
+        self._serving_query_history.append(tuple(step_queries))
+        if len(self._serving_query_history) > self.window_size:
+            del self._serving_query_history[:-self.window_size]
+
+    def _serving_query_windows(self):
+        if len(self._serving_query_history) < self.window_size:
+            raise RuntimeError("R-KV does not have a full query window")
+        assert self._serving_layer_order is not None
+
+        num_layers = len(self._serving_layer_order)
+        flat_queries = [
+            step[layer_idx]
+            for layer_idx in range(num_layers)
+            for step in self._serving_query_history
+        ]
+        stacked = torch.stack(flat_queries, dim=0)
+        return (
+            stacked.view(num_layers, self.window_size, *stacked.shape[1:])
+            .permute(0, 2, 1, 3)
+            .contiguous()
+            .unsqueeze(1)
+        )
+
+    def _crosses_buffer_boundary(
+        self,
+        *,
+        num_decoded_tokens,
+        num_new_tokens,
+    ):
+        prev_decoded_tokens = max(0, num_decoded_tokens - num_new_tokens)
+        return (
+            num_decoded_tokens > 0
+            and num_decoded_tokens // self.buffer
+            > prev_decoded_tokens // self.buffer
+        )
+
+    def should_observe_query(
+        self,
+        *,
+        num_decoded_tokens,
+        num_new_tokens,
+        is_genuine_decode,
+    ):
+        """Return whether this decode step belongs to the next scoring window."""
+        if not is_genuine_decode or num_new_tokens <= 0:
+            return False
+
+        prev_decoded_tokens = max(0, num_decoded_tokens - num_new_tokens)
+        next_boundary = (prev_decoded_tokens // self.buffer + 1) * self.buffer
+        observation_start = next_boundary - self.window_size + 1
+        return num_decoded_tokens >= observation_start
+
+    def should_compact(
+        self,
+        *,
+        resident_len,
+        num_decoded_tokens,
+        num_new_tokens,
+        is_genuine_decode,
+    ):
+        if not is_genuine_decode or num_new_tokens <= 0:
+            return False
+
+        # Serving asks before the model forward. Count the observation that
+        # this step will contribute without exposing R-KV readiness to callers.
+        observed_after_step = len(self._serving_query_history) + int(
+            self.should_observe_query(
+                num_decoded_tokens=num_decoded_tokens,
+                num_new_tokens=num_new_tokens,
+                is_genuine_decode=is_genuine_decode,
+            )
+        )
+        if observed_after_step < self.window_size:
+            return False
+        if resident_len < self.budget + self.buffer:
+            return False
+        return self._crosses_buffer_boundary(
+            num_decoded_tokens=num_decoded_tokens,
+            num_new_tokens=num_new_tokens,
+        )
 
     def update_kv(
         self,
