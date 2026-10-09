@@ -6,7 +6,7 @@ setup(
     packages=find_packages(),
     entry_points={
         "lmcache.token_drop_algorithms": [
-            "rkv=rkv:R1KV.from_serving_config",
+            "rkv=rkv.serving:RKVServing.from_serving_config",
         ],
     },
 )
