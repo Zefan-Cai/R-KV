@@ -35,10 +35,6 @@ class R1KV:
             self.kept_final_scores = []
 
     def _compute_scores(self, query_states, key_states):
-        """Score tokens before the observation window per KV head, without modifying Q/K.
-
-        Returns (scores, attention_weights).
-        """
         attn_weights = compute_attention_scores(query_states, key_states)
 
         attn_weights_sum = (
