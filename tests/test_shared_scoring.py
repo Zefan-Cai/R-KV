@@ -33,7 +33,6 @@ def test_scoring_refactor_preserves_legacy_update_kv(record_indices):
         - redundancy * (1 - policy.mix_lambda)
     )
     actual_scores, actual_attention = policy._compute_scores(queries, keys)
-    assert torch.equal(policy.score_kv(queries, keys), expected_scores)
     assert torch.equal(actual_scores, expected_scores)
     assert torch.equal(actual_attention, attention)
 

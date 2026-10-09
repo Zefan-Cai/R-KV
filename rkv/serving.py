@@ -123,3 +123,23 @@ class RKVServing(R1KV):
 
         # How much: only after enough KV has accumulated.
         return resident_kv_tokens >= self.budget + self.buffer
+
+    def select_kept_token_positions(
+        self, kv_by_layer: Mapping[str, Any]
+    ) -> Mapping[str, torch.Tensor]:
+        """Select per-head positions from views exposing get_keys()."""
+        kept_by_layer = {}
+        for layer, view in kv_by_layer.items():
+            queries = self._serving_query_history[layer]
+            keys = view.get_keys()
+            query_window = queries.permute(1, 0, 2).unsqueeze(0)
+            # Score tokens before the observation window, per KV head.
+            scores, _ = self._compute_scores(query_window, keys)
+            past = scores.topk(self.budget - self.window_size, dim=-1).indices[0]
+            recent = torch.arange(
+                keys.shape[2] - self.window_size, keys.shape[2], device=keys.device
+            ).expand(keys.shape[1], -1)
+            kept_by_layer[layer] = torch.cat((past, recent), dim=-1)
+
+        self._serving_query_history.clear()
+        return kept_by_layer

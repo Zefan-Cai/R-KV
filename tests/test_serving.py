@@ -190,3 +190,71 @@ def test_compaction_follows_last_observation_step():
         )
         for step in range(8)
     ] == [(0, False)] * 4 + [(1, False)] * 3 + [(1, True)]
+
+
+class _ReadOnlyKVView:
+    def __init__(self, keys):
+        self.keys = keys
+
+    def get_keys(self):
+        return self.keys
+
+    def get_values(self):
+        raise AssertionError("R-KV selection must not read V")
+
+
+@pytest.mark.parametrize("resident_tokens", [20, 24])
+def test_select_kept_positions_matches_legacy_kv_order(resident_tokens):
+    torch.manual_seed(31 + resident_tokens)
+    policy = RKVServing.from_serving_config(
+        {"budget": 12, "buffer": 8, "window_size": 4}
+    )
+    keys_by_layer = {
+        layer: torch.randn(1, 2, resident_tokens, 8)
+        for layer in ("layer0", "layer1")
+    }
+    values_by_layer = {
+        layer: torch.randn_like(keys) for layer, keys in keys_by_layer.items()
+    }
+    queries_by_layer = {
+        layer: torch.randn(4, 4, 8) for layer in keys_by_layer
+    }
+    policy.observe_token_queries(queries_by_layer)
+    kept = policy.select_kept_token_positions(
+        {layer: _ReadOnlyKVView(keys) for layer, keys in keys_by_layer.items()}
+    )
+
+    assert set(kept) == set(keys_by_layer)
+    for layer, keys in keys_by_layer.items():
+        positions = kept[layer]
+        assert positions.shape == (2, 12)
+        assert positions.dtype == torch.long
+        assert torch.equal(
+            positions[:, -4:],
+            torch.arange(resident_tokens - 4, resident_tokens).expand(2, -1),
+        )
+
+        gather = positions[None, :, :, None].expand(1, 2, 12, 8)
+        selected_k = keys.gather(2, gather)
+        selected_v = values_by_layer[layer].gather(2, gather)
+        reference_k, reference_v = policy.update_kv(
+            keys, queries_by_layer[layer].permute(1, 0, 2).unsqueeze(0),
+            values_by_layer[layer],
+        )
+        assert torch.equal(selected_k, reference_k)
+        assert torch.equal(selected_v, reference_v)
+
+    assert not torch.equal(kept["layer0"], kept["layer1"])
+    assert policy._serving_query_history == {}
+
+
+def test_select_kept_positions_reuses_history_after_compaction():
+    policy = RKVServing.from_serving_config(
+        {"budget": 12, "buffer": 8, "window_size": 4}
+    )
+    view = {"layer0": _ReadOnlyKVView(torch.randn(1, 2, 20, 8))}
+    for _ in range(2):
+        policy.observe_token_queries({"layer0": torch.randn(4, 4, 8)})
+        positions = policy.select_kept_token_positions(view)["layer0"]
+        assert positions.shape == (2, 12)
+        assert policy._serving_query_history == {}

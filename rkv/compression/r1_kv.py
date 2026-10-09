@@ -66,11 +66,6 @@ class R1KV:
         )
         return final_score, attn_weights
 
-    def score_kv(self, query_states, key_states):
-        """Compute per-KV-head R-KV scores for tokens preceding the observation window, using Q and K without modifying either input."""
-        scores, _ = self._compute_scores(query_states, key_states)
-        return scores
-
     def update_kv(
         self,
         key_states,
