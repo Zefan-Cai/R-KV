@@ -3,6 +3,8 @@
 from collections.abc import Mapping
 from typing import Any, Literal
 
+import torch
+
 from .compression.r1_kv import R1KV
 
 
@@ -86,3 +88,21 @@ class RKVServing(R1KV):
         if step_index_in_buffer >= self.buffer - self.window_size:
             return 1
         return 0
+
+    def observe_token_queries(
+        self, queries_by_layer: Mapping[str, torch.Tensor]
+    ) -> None:
+        """Keep the last window of post-RoPE Q rows per layer."""
+        if self._serving_layer_order is None:
+            self._serving_layer_order = tuple(queries_by_layer)
+
+        for layer, queries in queries_by_layer.items():
+            recent_queries = queries[-self.window_size :].detach()
+            previous_queries = self._serving_query_history.get(layer)
+            if previous_queries is None:
+                recent_queries = recent_queries.clone()
+            else:
+                recent_queries = torch.cat(
+                    (previous_queries, recent_queries), dim=0
+                )[-self.window_size :]
+            self._serving_query_history[layer] = recent_queries
