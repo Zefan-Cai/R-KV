@@ -40,26 +40,17 @@ class RKVServing(R1KV):
         retain_ratio = resolved_config["retain_ratio"]
         retain_direction = resolved_config["retain_direction"]
 
-        if not isinstance(budget, int) or isinstance(budget, bool) or budget <= 0:
+        if type(budget) is not int or budget <= 0:
             raise ValueError("budget must be a positive integer")
-        if not isinstance(buffer, int) or isinstance(buffer, bool) or buffer <= 0:
+        if type(buffer) is not int or buffer <= 0:
             raise ValueError("buffer must be a positive integer")
-        if (
-            not isinstance(window_size, int)
-            or isinstance(window_size, bool)
-            or window_size <= 0
-        ):
+        if type(window_size) is not int or window_size <= 0:
             raise ValueError("window_size must be a positive integer")
         if budget <= window_size:
             raise ValueError("budget must be greater than window_size")
         if buffer < window_size:
             raise ValueError("buffer must be >= window_size")
-        if (
-            not isinstance(kernel_size, int)
-            or isinstance(kernel_size, bool)
-            or kernel_size <= 0
-            or kernel_size % 2 == 0
-        ):
+        if type(kernel_size) is not int or kernel_size <= 0 or kernel_size % 2 == 0:
             raise ValueError("kernel_size must be a positive odd integer")
         if not isinstance(mix_lambda, (int, float)) or isinstance(mix_lambda, bool):
             raise ValueError("mix_lambda must be numeric")

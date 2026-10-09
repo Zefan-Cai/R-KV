@@ -68,6 +68,7 @@ def test_serving_config_instances_have_independent_request_state():
         ({"budget": 8}, "budget must be greater than window_size"),
         ({"buffer": 4}, "buffer must be >= window_size"),
         ({"kernel_size": 4}, "kernel_size must be a positive odd integer"),
+        ({"kernel_size": True}, "kernel_size must be a positive odd integer"),
         ({"mix_lambda": True}, "mix_lambda must be numeric"),
         ({"mix_lambda": 2.0}, "mix_lambda must be in"),
         ({"retain_ratio": False}, "retain_ratio must be numeric"),
