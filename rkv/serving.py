@@ -106,3 +106,20 @@ class RKVServing(R1KV):
                     (previous_queries, recent_queries), dim=0
                 )[-self.window_size :]
             self._serving_query_history[layer] = recent_queries
+
+    def should_compact_kv(
+        self,
+        phase: Literal["prefill", "decode"],
+        resident_kv_tokens: int,
+        decoded_tokens_before_step: int,
+    ) -> bool:
+        """Compact after prefill or at a full decode buffer boundary."""
+        if phase == "prefill":
+            return resident_kv_tokens > self.budget
+
+        # When: only at the end of each decode buffer.
+        if (decoded_tokens_before_step + 1) % self.buffer != 0:
+            return False
+
+        # How much: only after enough KV has accumulated.
+        return resident_kv_tokens >= self.budget + self.buffer

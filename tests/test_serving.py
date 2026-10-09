@@ -147,3 +147,46 @@ def test_observe_token_queries_layer_mapping_order_does_not_matter():
     })
     assert policy._serving_query_history["layer0"][:, 0, 0].tolist() == [1, 3]
     assert policy._serving_query_history["layer1"][:, 0, 0].tolist() == [2, 4]
+
+
+def test_should_compact_kv_prefill_threshold():
+    policy = RKVServing.from_serving_config({"budget": 12, "buffer": 8})
+    assert not policy.should_compact_kv("prefill", 12, 0)
+    assert policy.should_compact_kv("prefill", 13, 0)
+    assert policy.should_compact_kv("prefill", 24, 0)
+
+
+@pytest.mark.parametrize(
+    ("decoded_before", "resident", "should_compact"),
+    [
+        (0, 20, False),
+        (6, 20, False),
+        (7, 19, False),
+        (7, 20, True),
+        (7, 21, True),
+        (8, 20, False),
+        (14, 20, False),
+        (15, 19, False),
+        (15, 20, True),
+    ],
+)
+def test_should_compact_kv_decode_boundary_and_residency(
+    decoded_before, resident, should_compact
+):
+    policy = RKVServing.from_serving_config({"budget": 12, "buffer": 8})
+    assert (
+        policy.should_compact_kv("decode", resident, decoded_before) is should_compact
+    )
+
+
+def test_compaction_follows_last_observation_step():
+    policy = RKVServing.from_serving_config(
+        {"budget": 12, "buffer": 8, "window_size": 4}
+    )
+    assert [
+        (
+            policy.should_observe_token_queries("decode", step),
+            policy.should_compact_kv("decode", 20, step),
+        )
+        for step in range(8)
+    ] == [(0, False)] * 4 + [(1, False)] * 3 + [(1, True)]
