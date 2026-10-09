@@ -82,7 +82,7 @@ class RKVServing(R1KV):
         """Capture the last prefill queries or the final steps of each decode buffer."""
         if phase == "prefill":
             return self.window_size
-        step_in_buffer = decoded_tokens_before_step % self.buffer
-        if step_in_buffer >= self.buffer - self.window_size:
+        step_index_in_buffer = decoded_tokens_before_step % self.buffer
+        if step_index_in_buffer >= self.buffer - self.window_size:
             return 1
         return 0
