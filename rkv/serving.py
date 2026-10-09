@@ -82,10 +82,6 @@ class RKVServing(R1KV):
         """Capture the last prefill queries or the final steps of each decode buffer."""
         if phase == "prefill":
             return self.window_size
-        if phase != "decode":
-            raise ValueError(f"Unknown token-drop phase: {phase!r}")
-        if decoded_tokens_before_step < 0:
-            raise ValueError("decoded_tokens_before_step must be nonnegative")
         return int(
             decoded_tokens_before_step % self.buffer >= self.buffer - self.window_size
         )
