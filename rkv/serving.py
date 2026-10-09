@@ -71,7 +71,7 @@ class RKVServing(R1KV):
             raise ValueError("retain_ratio must be numeric")
         if not 0.0 < float(retain_ratio) <= 1.0:
             raise ValueError("retain_ratio must be in (0, 1]")
-        if retain_direction not in ("last", "first", "last_percent", "first_percent"):
+        if retain_direction not in ("last", "first"):
             raise ValueError("Unsupported retain_direction")
 
         instance = cls(

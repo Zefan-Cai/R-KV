@@ -73,6 +73,8 @@ def test_serving_config_instances_have_independent_request_state():
         ({"retain_ratio": False}, "retain_ratio must be numeric"),
         ({"retain_ratio": 0}, "retain_ratio must be in"),
         ({"retain_direction": "middle"}, "Unsupported retain_direction"),
+        ({"retain_direction": "last_percent"}, "Unsupported retain_direction"),
+        ({"retain_direction": "first_percent"}, "Unsupported retain_direction"),
     ],
 )
 def test_serving_config_rejects_invalid_settings(config, message):
