@@ -54,11 +54,11 @@ class RKVServing(R1KV):
             raise ValueError("kernel_size must be a positive odd integer")
         if type(mix_lambda) not in (int, float):
             raise ValueError("mix_lambda must be numeric")
-        if not 0.0 <= float(mix_lambda) <= 1.0:
+        if not 0.0 <= mix_lambda <= 1.0:
             raise ValueError("mix_lambda must be in [0, 1]")
         if type(retain_ratio) not in (int, float):
             raise ValueError("retain_ratio must be numeric")
-        if not 0.0 < float(retain_ratio) <= 1.0:
+        if not 0.0 < retain_ratio <= 1.0:
             raise ValueError("retain_ratio must be in (0, 1]")
         if retain_direction not in ("last", "first"):
             raise ValueError("Unsupported retain_direction")
