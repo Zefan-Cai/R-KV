@@ -81,3 +81,39 @@ def test_serving_config_instances_have_independent_request_state():
 def test_serving_config_rejects_invalid_settings(config, message):
     with pytest.raises(ValueError, match=message):
         RKVServing.from_serving_config(config)
+
+
+def test_should_observe_token_queries_prefill():
+    policy = RKVServing.from_serving_config({"window_size": 4, "buffer": 8})
+    assert policy.should_observe_token_queries("prefill", 0) == 4
+
+
+@pytest.mark.parametrize(
+    ("buffer", "window_size", "expected"),
+    [
+        (8, 4, [0, 0, 0, 0, 1, 1, 1, 1]),
+        (8, 1, [0, 0, 0, 0, 0, 0, 0, 1]),
+        (4, 4, [1, 1, 1, 1]),
+    ],
+)
+def test_should_observe_token_queries_decode_cadence(buffer, window_size, expected):
+    policy = RKVServing.from_serving_config(
+        {"buffer": buffer, "window_size": window_size}
+    )
+    assert [
+        policy.should_observe_token_queries("decode", step)
+        for step in range(buffer * 2)
+    ] == expected * 2
+
+
+@pytest.mark.parametrize(
+    ("phase", "step", "message"),
+    [
+        ("unknown", 0, "Unknown token-drop phase"),
+        ("decode", -1, "decoded_tokens_before_step must be nonnegative"),
+    ],
+)
+def test_should_observe_token_queries_rejects_invalid_inputs(phase, step, message):
+    policy = RKVServing.from_serving_config({})
+    with pytest.raises(ValueError, match=message):
+        policy.should_observe_token_queries(phase, step)

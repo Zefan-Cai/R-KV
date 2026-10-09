@@ -1,7 +1,7 @@
 """Serving integration for R-KV, separate from the legacy compression algorithm."""
 
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, Literal
 
 from .compression.r1_kv import R1KV
 
@@ -75,3 +75,17 @@ class RKVServing(R1KV):
         instance._serving_query_history = {}
         instance._serving_layer_order = None
         return instance
+
+    def should_observe_token_queries(
+        self, phase: Literal["prefill", "decode"], decoded_tokens_before_step: int
+    ) -> int:
+        """Capture the last prefill queries or the final steps of each decode buffer."""
+        if phase == "prefill":
+            return self.window_size
+        if phase != "decode":
+            raise ValueError(f"Unknown token-drop phase: {phase!r}")
+        if decoded_tokens_before_step < 0:
+            raise ValueError("decoded_tokens_before_step must be nonnegative")
+        return int(
+            decoded_tokens_before_step % self.buffer >= self.buffer - self.window_size
+        )
