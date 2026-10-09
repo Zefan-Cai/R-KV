@@ -83,4 +83,6 @@ class RKVServing(R1KV):
         if phase == "prefill":
             return self.window_size
         step_in_buffer = decoded_tokens_before_step % self.buffer
-        return int(step_in_buffer >= self.buffer - self.window_size)
+        if step_in_buffer >= self.buffer - self.window_size:
+            return 1
+        return 0
