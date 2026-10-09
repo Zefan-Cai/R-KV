@@ -133,7 +133,7 @@ class RKVServing(R1KV):
             queries = self._serving_query_history[layer]
             keys = view.get_keys()
             query_window = queries.permute(1, 0, 2).unsqueeze(0)
-            scores = self.score_kv(query_window, keys)
+            scores, _ = self._compute_scores(query_window, keys)
             past = scores.topk(self.budget - self.window_size, dim=-1).indices[0]
             recent = torch.arange(
                 keys.shape[2] - self.window_size, keys.shape[2], device=keys.device
