@@ -110,7 +110,7 @@ def test_rkv_legacy_update_kv_stays_available():
     assert new_values.shape == (1, 2, 12, 8)
 
 
-def test_serving_config_defaults_match_vllm_port_without_changing_legacy_defaults():
+def test_serving_defaults_preserve_legacy_algorithm_defaults():
     legacy = R1KV()
     serving = RKVServing.from_serving_config(
         {
