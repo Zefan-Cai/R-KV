@@ -52,13 +52,11 @@ class RKVServing(R1KV):
             raise ValueError("buffer must be >= window_size")
         if type(kernel_size) is not int or kernel_size <= 0 or kernel_size % 2 == 0:
             raise ValueError("kernel_size must be a positive odd integer")
-        if not isinstance(mix_lambda, (int, float)) or isinstance(mix_lambda, bool):
+        if type(mix_lambda) not in (int, float):
             raise ValueError("mix_lambda must be numeric")
         if not 0.0 <= float(mix_lambda) <= 1.0:
             raise ValueError("mix_lambda must be in [0, 1]")
-        if not isinstance(retain_ratio, (int, float)) or isinstance(
-            retain_ratio, bool
-        ):
+        if type(retain_ratio) not in (int, float):
             raise ValueError("retain_ratio must be numeric")
         if not 0.0 < float(retain_ratio) <= 1.0:
             raise ValueError("retain_ratio must be in (0, 1]")
