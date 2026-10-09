@@ -1,19 +1,11 @@
 """Serving integration for R-KV, separate from the legacy compression algorithm."""
 
 from collections.abc import Mapping
-from typing import Any, Literal, Protocol
+from typing import Any, Literal
 
 import torch
 
 from .compression.r1_kv import R1KV
-
-
-class KVView(Protocol):
-    """Read-only GPU KV access supplied by the serving backend."""
-
-    def get_keys(self) -> torch.Tensor: ...
-
-    def get_values(self) -> torch.Tensor: ...
 
 
 class RKVServing(R1KV):
@@ -133,9 +125,9 @@ class RKVServing(R1KV):
         return resident_kv_tokens >= self.budget + self.buffer
 
     def select_kept_token_positions(
-        self, kv_by_layer: Mapping[str, KVView]
+        self, kv_by_layer: Mapping[str, Any]
     ) -> Mapping[str, torch.Tensor]:
-        """Select positions per layer and KV head in R-KV's retention order."""
+        """Select per-head positions from views exposing get_keys()."""
         kept_by_layer = {}
         for layer, view in kv_by_layer.items():
             queries = self._serving_query_history[layer]
