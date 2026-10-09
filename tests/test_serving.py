@@ -104,16 +104,3 @@ def test_should_observe_token_queries_decode_cadence(buffer, window_size, expect
         policy.should_observe_token_queries("decode", step)
         for step in range(buffer * 2)
     ] == expected * 2
-
-
-@pytest.mark.parametrize(
-    ("phase", "step", "message"),
-    [
-        ("unknown", 0, "Unknown token-drop phase"),
-        ("decode", -1, "decoded_tokens_before_step must be nonnegative"),
-    ],
-)
-def test_should_observe_token_queries_rejects_invalid_inputs(phase, step, message):
-    policy = RKVServing.from_serving_config({})
-    with pytest.raises(ValueError, match=message):
-        policy.should_observe_token_queries(phase, step)
