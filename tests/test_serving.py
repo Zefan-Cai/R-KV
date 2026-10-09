@@ -1,4 +1,5 @@
 import pytest
+import torch
 
 from rkv import R1KV
 from rkv.serving import RKVServing
@@ -104,3 +105,45 @@ def test_should_observe_token_queries_decode_cadence(buffer, window_size, expect
         policy.should_observe_token_queries("decode", step)
         for step in range(buffer * 2)
     ] == expected * 2
+
+
+def test_observe_token_queries_keeps_last_prefill_rows_per_layer():
+    policy = RKVServing.from_serving_config({"window_size": 3})
+    queries = {
+        "layer0": torch.arange(5.0).reshape(5, 1, 1),
+        "layer1": torch.arange(10.0, 15.0).reshape(5, 1, 1),
+    }
+    policy.observe_token_queries(queries)
+
+    assert policy._serving_layer_order == ("layer0", "layer1")
+    assert policy._serving_query_history["layer0"][:, 0, 0].tolist() == [2, 3, 4]
+    assert policy._serving_query_history["layer1"][:, 0, 0].tolist() == [12, 13, 14]
+
+
+def test_observe_token_queries_rolling_window_and_source_reuse():
+    policy = RKVServing.from_serving_config({"window_size": 3})
+    source = torch.tensor([[[1.0]]], requires_grad=True)
+    policy.observe_token_queries({"layer0": source})
+    with torch.no_grad():
+        source.fill_(99.0)
+    assert policy._serving_query_history["layer0"][0, 0, 0].item() == 1.0
+    policy.observe_token_queries({"layer0": torch.tensor([[[2.0]]])})
+    policy.observe_token_queries({"layer0": torch.tensor([[[3.0]], [[4.0]]])})
+
+    history = policy._serving_query_history["layer0"]
+    assert history[:, 0, 0].tolist() == [2, 3, 4]
+    assert not history.requires_grad
+
+
+def test_observe_token_queries_layer_mapping_order_does_not_matter():
+    policy = RKVServing.from_serving_config({"window_size": 2})
+    policy.observe_token_queries({
+        "layer0": torch.tensor([[[1.0]]]),
+        "layer1": torch.tensor([[[2.0]]]),
+    })
+    policy.observe_token_queries({
+        "layer1": torch.tensor([[[4.0]]]),
+        "layer0": torch.tensor([[[3.0]]]),
+    })
+    assert policy._serving_query_history["layer0"][:, 0, 0].tolist() == [1, 3]
+    assert policy._serving_query_history["layer1"][:, 0, 0].tolist() == [2, 4]
