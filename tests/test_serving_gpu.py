@@ -64,15 +64,18 @@ def test_select_kept_positions_cuda_bf16_matches_legacy_kv():
     }
     policy.observe_token_queries(queries_by_layer)
     result = policy.select_kept_token_positions(
-        {layer: KeyView(keys) for layer, keys in keys_by_layer.items()}
+        {
+            layer: KeyView(keys[0].permute(1, 0, 2))
+            for layer, keys in keys_by_layer.items()
+        }
     )
 
     for layer, keys in keys_by_layer.items():
         positions = result[layer]
-        assert positions.shape == (2, 12)
+        assert positions.shape == (12, 2)
         assert positions.is_cuda and positions.dtype == torch.long
         values = torch.randn_like(keys)
-        gather = positions[None, :, :, None].expand(1, 2, 12, 8)
+        gather = positions.T[None, :, :, None].expand(1, 2, 12, 8)
         reference_k, reference_v = policy.update_kv(
             keys, queries_by_layer[layer].permute(1, 0, 2).unsqueeze(0), values
         )
