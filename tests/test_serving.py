@@ -22,7 +22,6 @@ def test_serving_config_defaults_do_not_change_legacy_algorithm():
     assert policy.retain_direction == "last"
     assert R1KV().mix_lambda == 0.07
     assert policy._serving_query_history == {}
-    assert policy._serving_layer_order is None
 
 
 def test_serving_config_overrides():
@@ -115,7 +114,6 @@ def test_observe_token_queries_keeps_last_prefill_rows_per_layer():
     }
     policy.observe_token_queries(queries)
 
-    assert policy._serving_layer_order == ("layer0", "layer1")
     assert policy._serving_query_history["layer0"][:, 0, 0].tolist() == [2, 3, 4]
     assert policy._serving_query_history["layer1"][:, 0, 0].tolist() == [12, 13, 14]
 
@@ -221,20 +219,23 @@ def test_select_kept_positions_matches_legacy_kv_order(resident_tokens):
     }
     policy.observe_token_queries(queries_by_layer)
     kept = policy.select_kept_token_positions(
-        {layer: _ReadOnlyKVView(keys) for layer, keys in keys_by_layer.items()}
+        {
+            layer: _ReadOnlyKVView(keys[0].permute(1, 0, 2))
+            for layer, keys in keys_by_layer.items()
+        }
     )
 
     assert set(kept) == set(keys_by_layer)
     for layer, keys in keys_by_layer.items():
         positions = kept[layer]
-        assert positions.shape == (2, 12)
+        assert positions.shape == (12, 2)
         assert positions.dtype == torch.long
         assert torch.equal(
-            positions[:, -4:],
-            torch.arange(resident_tokens - 4, resident_tokens).expand(2, -1),
+            positions[-4:],
+            torch.arange(resident_tokens - 4, resident_tokens)[:, None].expand(-1, 2),
         )
 
-        gather = positions[None, :, :, None].expand(1, 2, 12, 8)
+        gather = positions.T[None, :, :, None].expand(1, 2, 12, 8)
         selected_k = keys.gather(2, gather)
         selected_v = values_by_layer[layer].gather(2, gather)
         reference_k, reference_v = policy.update_kv(
@@ -252,9 +253,9 @@ def test_select_kept_positions_reuses_history_after_compaction():
     policy = RKVServing.from_serving_config(
         {"budget": 12, "buffer": 8, "window_size": 4}
     )
-    view = {"layer0": _ReadOnlyKVView(torch.randn(1, 2, 20, 8))}
+    view = {"layer0": _ReadOnlyKVView(torch.randn(20, 2, 8))}
     for _ in range(2):
         policy.observe_token_queries({"layer0": torch.randn(4, 4, 8)})
         positions = policy.select_kept_token_positions(view)["layer0"]
-        assert positions.shape == (2, 12)
+        assert positions.shape == (12, 2)
         assert policy._serving_query_history == {}
