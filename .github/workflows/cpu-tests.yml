@@ -39,3 +39,4 @@ jobs:
           python FlashInfer/tests/test_rkv_algo.py
           python FlashInfer/tests/test_cross_repo_parity.py
           python FlashInfer/tests/test_fa3_engine.py
+          python FlashInfer/tests/test_loader.py

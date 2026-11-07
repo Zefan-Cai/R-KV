@@ -21,7 +21,23 @@ def _shard_files(model_path: str) -> list[str]:
     if os.path.exists(index_path):
         with open(index_path) as f:
             weight_map = json.load(f)["weight_map"]
-        return sorted({os.path.join(model_path, shard) for shard in weight_map.values()})
+        # The index is untrusted input: a shard entry must be a bare file name
+        # inside ``model_path``. The check is lexical on purpose -- hub snapshots
+        # symlink their files to ``../../blobs/<sha>``, so resolve()-based
+        # containment would reject legitimate ``snapshot_download`` checkpoints.
+        shards = set()
+        for shard in weight_map.values():
+            if (
+                not isinstance(shard, str)
+                or shard in ("", ".", "..")
+                or os.path.basename(shard) != shard
+            ):
+                raise ValueError(
+                    f"invalid shard name {shard!r} in {index_path!r}: "
+                    "index entries must be bare file names under the model directory"
+                )
+            shards.add(os.path.join(model_path, shard))
+        return sorted(shards)
     single = os.path.join(model_path, "model.safetensors")
     if os.path.exists(single):
         return [single]
